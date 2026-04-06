@@ -1,0 +1,39 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "fast-acbf"
+dynamic = ["version"]
+authors = [
+  { name="Chia-Hao Lee", email="cl2696@cornell.edu" },
+]
+description = "GPU-based Bright-field Ptychography Solver for tcBF and acBF built on PtyRAD"
+keywords = ["Ptychography"]
+readme = "README.md"
+requires-python = ">=3.10"
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Programming Language :: Python :: 3",
+    "Operating System :: OS Independent",
+]
+dependencies = [
+    "matplotlib",
+    "numpy",
+    "torch>=2.4",
+    "torchvision",
+    "ptyrad"
+]
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.dynamic]
+version = {attr = "fast_acbf.__version__"}
+
+[project.urls]
+Repository = "https://github.com/chiahao3/fast-acbf"
+"PtyRAD" = "https://github.com/chiahao3/ptyrad"
