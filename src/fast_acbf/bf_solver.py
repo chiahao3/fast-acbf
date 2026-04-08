@@ -356,8 +356,22 @@ class BFSolver:
         self.ab_state = AberrationState(self.parsed_aberrations, self.max_order, device=device)
         self.device = device
         
-        # Coordinate transform follows Python indexing convention: y first, then x.
-        # We keep the transform intentionally simple and unambiguous for now.
+        # Coordinate transform — maps acBF k-space orientation to the PtyRAD pipeline.
+        #
+        # flipud / fliplr / transpose:
+        #   Correct discrete 90°-class detector orientation differences.
+        #   These map 1-to-1 to PtyRAD's `meas_flipT = [flipud, fliplr, transpose]`.
+        #   The same flag values should be used in both tools.
+        #   Operations are applied in the same order as PtyRAD's `_meas_flipT`:
+        #   flipud first, fliplr second, transpose last.
+        #   Note that we flip the ky/kx coordinate, instead of the diffraction pattern
+        #   for performance.
+        #
+        # rotation_deg:
+        #   Corrects for a continuous scan rotation angle (the angle between the scan
+        #   fast-axis and the detector kX axis). Positive = CCW rotation of k-vectors.
+        #   Maps to PtyRAD's `pos_scan_affine = [1, 0, rotation_deg, 0]` (same value,
+        #   same sign).
         self.coord_transform = coord_transform or {
             'flipud': False,
             'fliplr': False,
@@ -395,46 +409,66 @@ class BFSolver:
         fliplr = self.coord_transform.get('fliplr', self.coord_transform.get('flip_x', False))
         transpose = self.coord_transform.get('transpose', False)
         rotation_deg = self.coord_transform.get('rotation_deg', 0.0)
-        
-        if abs(rotation_deg) > 1e-9:
-            logger.warning("rotation_deg is currently ignored in BFSolver. Use flipud/fliplr/transpose for now.")
-        
-        return flipud, fliplr, transpose
+               
+        return flipud, fliplr, transpose, rotation_deg
 
     def _get_transformed_bf_coordinates(self):
         """
         Returns transformed reciprocal-space BF coordinates as (kX, kY).
+
+        Operations are applied in the same order as PtyRAD's `_meas_flipT`:
+        flipud → fliplr → transpose
+        This ensures that the same flag values passed here and to PtyRAD's
+        `meas_flipT` produce a consistent orientation.
         
-        Internally we think in y/x order when applying transpose / flips, then
-        convert back to the explicit (kX, kY) tensors expected by the analytical math.
+        The rotation_deg is passed with consistent convention with PtyRAD's
+        `pos_scan_affine` as well with positive means CCW.
         """
-        # Start from (y, x) ordering because that matches the rest of the image code.
+
         ky = self.kY_centers.clone()
         kx = self.kX_centers.clone()
-        flipud, fliplr, transpose = self._get_transform_flags()
-        
-        if transpose:
-            ky, kx = kx, ky
+        flipud, fliplr, transpose, rotation_deg = self._get_transform_flags()
+
         if flipud:
             ky = -ky
         if fliplr:
             kx = -kx
-        
+        if transpose:
+            ky, kx = kx, ky
+        if rotation_deg:
+            theta = np.deg2rad(rotation_deg)
+            kx_old = kx.clone()
+            ky_old = ky.clone()
+            kx = kx_old * np.cos(theta) - ky_old * np.sin(theta)
+            ky = kx_old * np.sin(theta) + ky_old * np.cos(theta)
+
         return kx, ky
 
     def _get_transformed_k_grids(self):
-        """Returns transformed reciprocal-space grids as (kX_grid, kY_grid)."""
+        """
+        Returns transformed reciprocal-space grids as (kX_grid, kY_grid).
+
+        Same operation order as `_get_transformed_bf_coordinates`:
+        flipud → fliplr → transpose → rotation_deg, 
+        matching PtyRAD's `_meas_flipT` and `_pos_scan_affine`.
+        """
         ky = self.kY_grid.clone()
         kx = self.kX_grid.clone()
-        flipud, fliplr, transpose = self._get_transform_flags()
-        
-        if transpose:
-            ky, kx = kx, ky
+        flipud, fliplr, transpose, rotation_deg = self._get_transform_flags()
+
         if flipud:
             ky = -ky
         if fliplr:
             kx = -kx
-        
+        if transpose:
+            ky, kx = kx, ky
+        if rotation_deg:
+            theta = np.deg2rad(rotation_deg)
+            kx_old = kx.clone()
+            ky_old = ky.clone()
+            kx = kx_old * np.cos(theta) - ky_old * np.sin(theta)
+            ky = kx_old * np.sin(theta) + ky_old * np.cos(theta)
+
         return kx, ky
 
     def _init_vBF(self):
@@ -675,6 +709,23 @@ class BFSolver:
         return Aberrations(self.ab_state.get_cartesian_dict()).export(notation=notation, style=style, layout=layout)
 
     def print_aberrations(self):
+        # TODO: Replace this with a flag to return the rotated / unrotated aberrations
+        rotation_deg = self.coord_transform.get('rotation_deg', 0.0)
+        if rotation_deg:
+            ab_dict = self.ab_state.get_cartesian_dict()
+            has_non_symmetric = any(
+                ab_dict.get(k, 0.0) != 0.0
+                for k in ab_dict
+                if k[-1] != 0
+            )
+            if has_non_symmetric:
+                logger.warning(
+                    f"rotation_deg = {rotation_deg} is set and non-symmetric aberrations (C12, C23, ...) are nonzero. "
+                    "The exported coefficients encode angular orientation in the rotated k-frame used during fitting. "
+                    "When passing these to PtyRAD's `probe_aberrations`, the non-symmetric terms will be interpreted "
+                    "in the unrotated detector k-frame, so their angular orientation will differ by rotation_deg. "
+                    "For symmetric aberrations (C10, C30, ...) there is no issue."
+                )
         print(Aberrations(self.get_aberrations_dict()))
 
     def get_chi_surface(self):
