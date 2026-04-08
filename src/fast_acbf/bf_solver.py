@@ -10,7 +10,8 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torchvision.transforms.functional import gaussian_blur
+from torchvision.transforms.functional import gaussian_blur, rotate as tv_rotate
+from torchvision.transforms import InterpolationMode
 
 from ptyrad.core.functional import fftshift2, ifftshift2, torch_phasor
 from ptyrad.optics.aberrations import Aberrations
@@ -330,16 +331,17 @@ def generate_aberration_basis(max_order: int, order_keys: list, kX: torch.Tensor
 
 class BFSolver:
     def __init__(
-        self, 
-        dataset: np.ndarray, 
-        max_alpha: float, 
-        scan_step_size: float, 
-        dk: float, 
-        wavelength: float, 
-        max_order: int, 
+        self,
+        dataset: np.ndarray,
+        max_alpha: float,
+        scan_step_size: float,
+        dk: float,
+        wavelength: float,
+        max_order: int,
         aberrations: dict,
         device='cuda',
-        coord_transform=None
+        coord_transform=None,
+        output_frame: str = 'scan',
     ):
         """
         Initializes the solver. Dataset loading/parsing is assumed to be handled 
@@ -378,6 +380,28 @@ class BFSolver:
             'transpose': False,
             'rotation_deg': 0.0,
         }
+
+        # Output frame selector — controls which k-space frame public outputs are
+        # expressed in.  Two frames are defined:
+        #
+        #   'scan' (default):
+        #     All coord_transform operations applied: flipud → fliplr → transpose →
+        #     rotation_deg.  Outputs are expressed in the scan frame — the k-frame
+        #     aligned with the scan fast-axis — which is the frame the aberrations
+        #     were fitted in.
+        #
+        #   'detector':
+        #     Only the discrete flips applied: flipud → fliplr → transpose.
+        #     rotation_deg is excluded.  Outputs are expressed in the detector frame
+        #     — the k-frame defined by the (flip-corrected) detector pixel grid.
+        #     This frame is what PtyRAD uses internally: meas_flipT brings data into
+        #     it, and probe_aberrations / chi are evaluated in it.  Use this frame
+        #     when exporting aberration coefficients or chi/probe for PtyRAD.
+        #
+        # Individual methods also accept a per-call `output_frame` keyword that
+        # overrides this global default (None → use global; 'scan'/'detector' →
+        # override for that call only).
+        self.output_frame = output_frame
         
         # Placeholders / caches
         self.reconstructed_image = None
@@ -400,31 +424,81 @@ class BFSolver:
 
     def _get_transform_flags(self):
         """
-        Returns the y/x-orientation flags.
-        
-        We support the new explicit names ('flipud', 'fliplr', 'transpose') and
-        also accept the older aliases ('flip_y', 'flip_x') for compatibility.
+        Returns the ky/kx transformation flags.
         """
-        flipud = self.coord_transform.get('flipud', self.coord_transform.get('flip_y', False))
-        fliplr = self.coord_transform.get('fliplr', self.coord_transform.get('flip_x', False))
+        flipud = self.coord_transform.get('flipud', False)
+        fliplr = self.coord_transform.get('fliplr', False)
         transpose = self.coord_transform.get('transpose', False)
         rotation_deg = self.coord_transform.get('rotation_deg', 0.0)
                
         return flipud, fliplr, transpose, rotation_deg
 
-    def _get_transformed_bf_coordinates(self):
+    def _resolve_output_frame(self, output_frame):
         """
-        Returns transformed reciprocal-space BF coordinates as (kX, kY).
-
-        Operations are applied in the same order as PtyRAD's `_meas_flipT`:
-        flipud → fliplr → transpose
-        This ensures that the same flag values passed here and to PtyRAD's
-        `meas_flipT` produce a consistent orientation.
-        
-        The rotation_deg is passed with consistent convention with PtyRAD's
-        `pos_scan_affine` as well with positive means CCW.
+        Return the effective output frame string.
+        None → defers to self.output_frame (global default).
+        'scan' or 'detector' → explicit per-call override.
         """
+        return self.output_frame if output_frame is None else output_frame
 
+    def _in_scan_frame(self, output_frame):
+        """Return True when output_frame resolves to 'scan'."""
+        return self._resolve_output_frame(output_frame) == 'scan'
+
+    def _get_detector_frame_cartesian_dict(self):
+        """
+        Return aberration coefficients converted from the scan frame back to the
+        detector frame.
+
+        The scan frame is the detector frame further rotated CCW by rotation_deg.
+        Inverting that rotation (rotating by +rotation_deg) recovers the detector-frame
+        representation.  For symmetric terms (m=0, e.g. C10, C30) the value is
+        invariant.  For asymmetric terms (m>0) the Cartesian (a, b) pair transforms as:
+            Ca_det = Ca_scan * cos(m·θ) - Cb_scan * sin(m·θ)
+            Cb_det = Ca_scan * sin(m·θ) + Cb_scan * cos(m·θ)
+        where θ = rotation_deg in radians.
+        """
+        theta = np.deg2rad(self.coord_transform.get('rotation_deg', 0.0))
+        ab_dict = self.ab_state.get_cartesian_dict()
+        if theta == 0:
+            return ab_dict
+        out = {}
+        for (n, m), val in ab_dict.items():
+            if m == 0:
+                out[(n, m)] = val
+            else:
+                ca, cb = val['a'], val['b']
+                c, s = np.cos(m * theta), np.sin(m * theta)
+                out[(n, m)] = {'a': ca * c - cb * s, 'b': ca * s + cb * c}
+        return out
+
+    def _get_effective_ab_state(self, in_scan_frame):
+        """
+        Return the AberrationState appropriate for the requested output frame.
+
+        in_scan_frame=True  → self.ab_state: coefficients as fitted in the scan frame.
+        in_scan_frame=False → temporary AberrationState with coefficients converted to
+                              the detector frame (rotation_deg un-applied).
+        """
+        if in_scan_frame or self.coord_transform.get('rotation_deg', 0.0) == 0:
+            return self.ab_state
+        return AberrationState(
+            self._get_detector_frame_cartesian_dict(),
+            max_order=self.ab_state.max_order,
+            device=str(self.device),
+        )
+
+    def _get_transformed_bf_coordinates(self, in_scan_frame=True):
+        """
+        Return transformed reciprocal-space BF coordinates as (kX, kY).
+
+        Operations are applied in the order: flipud → fliplr → transpose → rotation_deg.
+        The first three bring raw detector coordinates into the detector frame (matching
+        PtyRAD's `_meas_flipT` order).  The last step further rotates into the scan frame.
+
+        in_scan_frame=True  → all four steps applied; coordinates in the scan frame.
+        in_scan_frame=False → rotation_deg skipped; coordinates in the detector frame.
+        """
         ky = self.kY_centers.clone()
         kx = self.kX_centers.clone()
         flipud, fliplr, transpose, rotation_deg = self._get_transform_flags()
@@ -435,7 +509,7 @@ class BFSolver:
             kx = -kx
         if transpose:
             ky, kx = kx, ky
-        if rotation_deg:
+        if in_scan_frame and rotation_deg:
             theta = np.deg2rad(rotation_deg)
             kx_old = kx.clone()
             ky_old = ky.clone()
@@ -444,13 +518,15 @@ class BFSolver:
 
         return kx, ky
 
-    def _get_transformed_k_grids(self):
+    def _get_transformed_k_grids(self, in_scan_frame=True):
         """
-        Returns transformed reciprocal-space grids as (kX_grid, kY_grid).
+        Return transformed reciprocal-space full grids as (kX_grid, kY_grid).
 
         Same operation order as `_get_transformed_bf_coordinates`:
-        flipud → fliplr → transpose → rotation_deg, 
-        matching PtyRAD's `_meas_flipT` and `_pos_scan_affine`.
+        flipud → fliplr → transpose → rotation_deg.
+
+        in_scan_frame=True  → all four steps applied; grids in the scan frame.
+        in_scan_frame=False → rotation_deg skipped; grids in the detector frame.
         """
         ky = self.kY_grid.clone()
         kx = self.kX_grid.clone()
@@ -462,7 +538,7 @@ class BFSolver:
             kx = -kx
         if transpose:
             ky, kx = kx, ky
-        if rotation_deg:
+        if in_scan_frame and rotation_deg:
             theta = np.deg2rad(rotation_deg)
             kx_old = kx.clone()
             ky_old = ky.clone()
@@ -705,71 +781,120 @@ class BFSolver:
 
     # Public methods
     # Getter and Printing
-    def get_aberrations_dict(self, notation='krivanek', style='cartesian', layout='nested'):
-        return Aberrations(self.ab_state.get_cartesian_dict()).export(notation=notation, style=style, layout=layout)
+    def get_aberrations_dict(self, output_frame=None, notation='krivanek', style='cartesian', layout='nested'):
+        """
+        Return aberration coefficients in the requested notation/style/layout.
 
-    def print_aberrations(self):
-        # TODO: Replace this with a flag to return the rotated / unrotated aberrations
+        output_frame=None        → uses self.output_frame (global default).
+        output_frame='scan'      → coefficients in the scan frame (as fitted, includes
+                                   rotation_deg).  Non-symmetric terms encode orientation
+                                   relative to the scan fast-axis.
+        output_frame='detector'  → coefficients converted to the detector frame
+                                   (rotation_deg un-applied).  Pass these directly to
+                                   PtyRAD's `probe_aberrations`.
+        """
+        in_scan = self._in_scan_frame(output_frame)
+        ab_state = self._get_effective_ab_state(in_scan)
+        return Aberrations(ab_state.get_cartesian_dict()).export(notation=notation, style=style, layout=layout)
+
+    def print_aberrations(self, output_frame=None):
+        """
+        Print aberration coefficients.
+
+        output_frame=None        → uses self.output_frame (global default).
+        output_frame='scan'      → prints coefficients in the scan frame (as fitted).
+        output_frame='detector'  → prints coefficients in the detector frame, suitable
+                                   for direct export to PtyRAD.
+
+        A warning is emitted when output_frame='scan', rotation_deg != 0, and
+        non-symmetric aberrations are nonzero — because those orientation angles are
+        relative to the scan fast-axis, not the detector kX axis.  Use
+        output_frame='detector' (or set output_frame='detector' globally) to get
+        values that are directly compatible with PtyRAD's `probe_aberrations`.
+        """
+        in_scan = self._in_scan_frame(output_frame)
         rotation_deg = self.coord_transform.get('rotation_deg', 0.0)
-        if rotation_deg:
+        if in_scan and rotation_deg:
             ab_dict = self.ab_state.get_cartesian_dict()
             has_non_symmetric = any(
-                ab_dict.get(k, 0.0) != 0.0
-                for k in ab_dict
+                v.get('a', 0.0) != 0.0 or v.get('b', 0.0) != 0.0
+                for k, v in ab_dict.items()
                 if k[-1] != 0
             )
             if has_non_symmetric:
                 logger.warning(
-                    f"rotation_deg = {rotation_deg} is set and non-symmetric aberrations (C12, C23, ...) are nonzero. "
-                    "The exported coefficients encode angular orientation in the rotated k-frame used during fitting. "
-                    "When passing these to PtyRAD's `probe_aberrations`, the non-symmetric terms will be interpreted "
-                    "in the unrotated detector k-frame, so their angular orientation will differ by rotation_deg. "
-                    "For symmetric aberrations (C10, C30, ...) there is no issue."
+                    f"rotation_deg = {rotation_deg} is set and non-symmetric aberrations "
+                    "(C12, C23, ...) are nonzero. The displayed coefficients are in the "
+                    "scan frame — orientation angles are relative to the scan fast-axis. "
+                    "To get detector-frame values compatible with PtyRAD's "
+                    "`probe_aberrations`, use print_aberrations(output_frame='detector') "
+                    "or set output_frame='detector' on the solver."
                 )
-        print(Aberrations(self.get_aberrations_dict()))
+        print(Aberrations(self.get_aberrations_dict(output_frame=output_frame)))
 
-    def get_chi_surface(self):
-        """Return aberration surface chi, note that psi = exp(-1j*chi) so there's a negative sign between chi and k-space probe phase"""
-        kX_grid, kY_grid = self._get_transformed_k_grids()
-        
-        # Build the same polynomial basis structure used in the cached acBF path,
-        # then contract it with the flat aberration coefficients directly.
+    def get_chi_surface(self, output_frame=None):
+        """
+        Return aberration surface chi. Note: psi = exp(-1j*chi).
+
+        The chi surface is computed exactly in the requested frame — k-grids and
+        aberration coefficients are both expressed in the same frame, so no
+        interpolation or approximation is involved.
+
+        output_frame=None        → uses self.output_frame (global default).
+        output_frame='scan'      → chi in the scan frame (k-grid rotated by rotation_deg,
+                                   coefficients as fitted).
+        output_frame='detector'  → chi in the detector frame (flip-corrected k-grid,
+                                   coefficients converted back from the scan frame).
+                                   Ready to use as a probe seed in PtyRAD.
+        """
+        in_scan = self._in_scan_frame(output_frame)
+        kX_grid, kY_grid = self._get_transformed_k_grids(in_scan_frame=in_scan)
+        ab_state = self._get_effective_ab_state(in_scan)
+
         chi_basis = generate_aberration_basis(
             self.max_order,
-            self.ab_state.order_keys,
+            ab_state.order_keys,
             kX_grid,
             kY_grid,
             self.wavelength,
         )
-        
-        # chi_basis has shape (Num_Coeffs, Ny, Nx) for the full reciprocal-space grid.
-        coeffs = self.ab_state.get_flat_coeffs()
+
+        coeffs = ab_state.get_flat_coeffs()
         chi = torch.einsum('k,kij->ij', coeffs, chi_basis)
-        
+
         return chi
 
-    def get_yx_shifts_ang(self):
-        """ Return shifts in Ang as (Nb, 2) tensor, each row is (shift_y, shift_x) """
-        kX_centers, kY_centers = self._get_transformed_bf_coordinates()
-        
-        # Build the same analytical shift basis used in the cached tcBF path,
-        # then contract it with the flat aberration coefficients directly.
+    def get_yx_shifts_ang(self, output_frame=None):
+        """
+        Return image shifts in Angstroms as (Nb, 2) tensor, each row is (shift_y, shift_x).
+
+        Shifts are computed exactly in the requested frame — BF coordinates and
+        aberration coefficients are both expressed in the same frame.
+
+        output_frame=None        → uses self.output_frame (global default).
+        output_frame='scan'      → shifts in the scan frame (as fitted).
+        output_frame='detector'  → shifts in the detector frame (rotation_deg un-applied).
+        """
+        in_scan = self._in_scan_frame(output_frame)
+        kX_centers, kY_centers = self._get_transformed_bf_coordinates(in_scan_frame=in_scan)
+        ab_state = self._get_effective_ab_state(in_scan)
+
         b_dx, b_dy = generate_shift_basis(
-            self.ab_state.order_keys,
+            ab_state.order_keys,
             kX_centers,
             kY_centers,
             self.wavelength,
         )
-        
-        coeffs = self.ab_state.get_flat_coeffs()
+
+        coeffs = ab_state.get_flat_coeffs()
         shift_x_ang = torch.einsum('k,kb->b', coeffs, b_dx)
         shift_y_ang = torch.einsum('k,kb->b', coeffs, b_dy)
-        
-        return torch.stack([shift_y_ang, shift_x_ang], dim=-1) # Return shape (Nb, 2)
-    
-    def get_yx_shifts_px(self):
-        """ Return shifts in real-space px as (Nb, 2) tensor, each row is (shift_y, shift_x) """
-        return self.get_yx_shifts_ang() / self.scan_step_size
+
+        return torch.stack([shift_y_ang, shift_x_ang], dim=-1)  # shape (Nb, 2)
+
+    def get_yx_shifts_px(self, output_frame=None):
+        """Return image shifts in real-space pixels as (Nb, 2) tensor, each row is (shift_y, shift_x)."""
+        return self.get_yx_shifts_ang(output_frame=output_frame) / self.scan_step_size
 
     def reconstruct(self, mode='tcBF', **kwargs):
         """
@@ -796,23 +921,54 @@ class BFSolver:
         else:
             raise ValueError(f"Unsupported mode '{mode}'. Please choose between 'tcBF' and 'acBF'.")
 
-    def get_reconstructed_image(self, mode='tcBF', **kwargs):
+    def get_reconstructed_image(self, mode='tcBF', output_frame=None, **kwargs):
+        """
+        Return (and cache) the reconstructed image.
+
+        Note: the reconstruction itself is always computed in the scan frame (the frame
+        the aberrations were fitted in).  The internal cache stores this scan-frame result.
+        When output_frame='detector' and rotation_deg != 0, the cached image is
+        post-processed with a 2D image rotation of -rotation_deg (bilinear, torchvision)
+        to bring it into the detector frame for visualization.  This post-processed result
+        is NOT stored in the cache.
+
+        output_frame=None        → uses self.output_frame (global default).
+        output_frame='scan'      → image as reconstructed, in the scan frame.
+        output_frame='detector'  → image rotated back to the detector frame for display.
+        """
         cache_key = (mode.lower(), tuple(sorted(kwargs.items())))
-        
+
         if cache_key not in self._reconstructed_images:
             self._reconstructed_images[cache_key] = self.reconstruct(mode=mode, **kwargs)
-            
+
         self.reconstructed_image = self._reconstructed_images[cache_key]
-        return self.reconstructed_image
+        img = self.reconstructed_image
 
-    def get_tcBF(self, **kwargs):
-        return self.get_reconstructed_image(mode='tcBF', **kwargs)
+        rotation_deg = self.coord_transform.get('rotation_deg', 0.0)
+        if not self._in_scan_frame(output_frame) and rotation_deg:
+            # tv_rotate expects (..., H, W) and angle in degrees (CCW positive)
+            img = tv_rotate(img.unsqueeze(0), angle=-rotation_deg,
+                            interpolation=InterpolationMode.BILINEAR).squeeze(0)
 
-    def get_acBF(self, **kwargs):
-        return self.get_reconstructed_image(mode='acBF', **kwargs)
-    
-    def get_probe(self):
-        probe = make_probe_from_chi(self.get_chi_surface(), self.bf_mask)
+        return img
+
+    def get_tcBF(self, output_frame=None, **kwargs):
+        return self.get_reconstructed_image(mode='tcBF', output_frame=output_frame, **kwargs)
+
+    def get_acBF(self, output_frame=None, **kwargs):
+        return self.get_reconstructed_image(mode='acBF', output_frame=output_frame, **kwargs)
+
+    def get_probe(self, output_frame=None):
+        """
+        Return the complex probe wavefield.
+
+        The probe is computed exactly in the requested frame (same as get_chi_surface).
+
+        output_frame=None        → uses self.output_frame (global default).
+        output_frame='scan'      → probe in the scan frame (as fitted).
+        output_frame='detector'  → probe in the detector frame, ready for PtyRAD.
+        """
+        probe = make_probe_from_chi(self.get_chi_surface(output_frame=output_frame), self.bf_mask)
         return probe
     
     # Refinement
@@ -935,15 +1091,15 @@ class BFSolver:
         return self
 
     # Plotting   
-    def plot_reconstruction(self, title_str=None, desc_str=None, save_path=None, mode='tcBF', **kwargs):
+    def plot_reconstruction(self, title_str=None, desc_str=None, save_path=None, mode='tcBF', output_frame=None, **kwargs):
         if title_str is None:
             title_str = f"Reconstructed {mode} and Probe amplitude"
         if desc_str is None:
-            ab_dict = self.get_aberrations_dict(layout='flat')
+            ab_dict = self.get_aberrations_dict(output_frame=output_frame, layout='flat')
             desc_str = ", ".join(f"{ab}: {val:.2f}" for ab, val in ab_dict.items())
-            
-        img = self.get_reconstructed_image(mode=mode, **kwargs).detach().cpu().numpy()
-        probe = self.get_probe().abs().detach().cpu().numpy()
+
+        img = self.get_reconstructed_image(mode=mode, output_frame=output_frame, **kwargs).detach().cpu().numpy()
+        probe = self.get_probe(output_frame=output_frame).abs().detach().cpu().numpy()
         
         fig, axs = plt.subplots(1,2)
         fig.suptitle(title_str, y=0.9)
@@ -976,17 +1132,22 @@ class BFSolver:
         plt.colorbar()
         plt.show()
     
-    def plot_shift_quiver(self, subsample=None, scale=None, show=True):
+    def plot_shift_quiver(self, subsample=None, scale=None, show=True, output_frame=None):
         """
-        Plots a quiver vector field of the calculated real-space image shifts 
+        Plot a quiver vector field of the calculated real-space image shifts
         over the reciprocal-space Bright Field disk.
+
+        output_frame=None        → uses self.output_frame (global default).
+        output_frame='scan'      → shifts and k-coords displayed in the scan frame.
+        output_frame='detector'  → shifts and k-coords displayed in the detector frame.
         """
         if not hasattr(self, 'kX_centers') or self.kX_centers is None:
             raise RuntimeError("Coordinates not initialized. Run the initialization first.")
 
+        in_scan = self._in_scan_frame(output_frame)
         with torch.no_grad():
-            shift_yx_ang = self.get_yx_shifts_ang()
-            kx, ky = self._get_transformed_bf_coordinates()
+            shift_yx_ang = self.get_yx_shifts_ang(output_frame=output_frame)
+            kx, ky = self._get_transformed_bf_coordinates(in_scan_frame=in_scan)
         
         kx = kx.cpu().numpy()
         ky = ky.cpu().numpy()
