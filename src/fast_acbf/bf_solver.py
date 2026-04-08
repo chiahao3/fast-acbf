@@ -131,10 +131,18 @@ class QualityMetrics:
     @classmethod
     def evaluate(cls, img: torch.Tensor, metric='laplacian', blur=False, blur_kernel_size=5, blur_sigma=1) -> float:
         """
-        Calculates the focus score of a 2D image. Higher is more focused.
+        Calculates focus score(s). Higher is more focused.
+
+        Accepts either:
+            - 2D image of shape (Ny, Nx), returning a scalar tensor
+            - 3D stack of shape (Nz, Ny, Nx), returning a 1D tensor of length Nz
         """
-        
-        img = img.unsqueeze(0).unsqueeze(0) # Convert img to (N,B,H,W) for gaussian_blur and con2d
+        if img.ndim == 2:
+            img = img.unsqueeze(0)
+        elif img.ndim != 3:
+            raise ValueError(f"img must be 2D or 3D, got shape {tuple(img.shape)}.")
+
+        img = img.unsqueeze(1)  # Convert to (N, 1, H, W) for gaussian_blur and conv2d
         
         if blur:
             img = gaussian_blur(img, kernel_size=blur_kernel_size, sigma=blur_sigma)
@@ -143,7 +151,7 @@ class QualityMetrics:
             # Variance of Laplacian
             lap_kernel = torch.tensor([[[[0., 1., 0.], [1., -4., 1.], [0., 1., 0.]]]], device=img.device)
             lap = F.conv2d(img, lap_kernel, padding=1)
-            return lap.var()
+            scores = lap.flatten(start_dim=1).var(dim=1)
             
         elif metric == 'sobel':
             # Tenengrad (Sum of squared Sobel gradients)
@@ -151,14 +159,19 @@ class QualityMetrics:
             ky = torch.tensor([[[[-1., -2., -1.], [0., 0., 0.], [1., 2., 1.]]]], device=img.device)
             gx = F.conv2d(img, kx, padding=1)
             gy = F.conv2d(img, ky, padding=1)
-            return (gx**2 + gy**2).mean()
+            scores = (gx**2 + gy**2).flatten(start_dim=1).mean(dim=1)
             
         elif metric == 'normalized_std':
             # Normalized Image Std
-            return (img.std() / (img.mean() + 1e-6))
+            flat = img.flatten(start_dim=1)
+            scores = flat.std(dim=1) / (flat.mean(dim=1) + 1e-6)
             
         else:
             raise ValueError(f"Unknown metric '{metric}'. Choose 'laplacian', 'sobel', or 'normalized_std'.")
+
+        if scores.shape[0] == 1:
+            return scores.squeeze(0)
+        return scores
 
 class AberrationState(torch.nn.Module):
     def __init__(self, ab_dict: dict, max_order: int = None, device='cpu'):
@@ -407,6 +420,7 @@ class BFSolver:
         self.reconstructed_image = None
         self._reconstructed_images = {}
         self._cache_store = {}
+        self.last_c10_stack_axis = None
 
         # Initialize vBF dataset
         self._init_vBF()
@@ -779,6 +793,112 @@ class BFSolver:
             
         return acBF_total
 
+    def _build_c10_stack_axis(self, n_layers=None, z_top=None, z_bottom=None, slice_thickness=None):
+        """
+        Build a 1D absolute C10 axis in Angstroms for defocus-stack reconstruction.
+
+        Supported mutually exclusive modes:
+            1. n_layers + slice_thickness
+            2. z_top + z_bottom + slice_thickness
+        """
+        has_n_layers = n_layers is not None
+        has_range_arg = any(val is not None for val in (z_top, z_bottom))
+
+        if slice_thickness is None:
+            raise ValueError("slice_thickness is required for defocus-stack reconstruction.")
+
+        slice_thickness = float(slice_thickness)
+        if slice_thickness <= 0:
+            raise ValueError(f"slice_thickness must be positive, got {slice_thickness}.")
+
+        if has_n_layers and has_range_arg:
+            raise ValueError(
+                "Provide either n_layers or z_top/z_bottom with slice_thickness, not both."
+            )
+
+        if has_n_layers:
+            if z_top is not None or z_bottom is not None:
+                raise ValueError(
+                    "n_layers mode does not accept z_top or z_bottom."
+                )
+
+            if not isinstance(n_layers, (int, np.integer)):
+                raise ValueError(f"n_layers must be a positive integer, got {n_layers!r}.")
+
+            n_layers = int(n_layers)
+            if n_layers <= 0:
+                raise ValueError(f"n_layers must be positive, got {n_layers}.")
+
+            c10_center = float(self.ab_state.coeffs['C_1_0'].detach().item())
+            offsets = (torch.arange(n_layers, device=self.device, dtype=torch.float32) - ((n_layers - 1) / 2.0))
+            return c10_center + offsets * slice_thickness
+
+        if has_range_arg:
+            if z_top is None or z_bottom is None:
+                raise ValueError(
+                    "Range mode requires z_top, z_bottom, and slice_thickness together."
+                )
+
+            start = float(z_top)
+            stop = float(z_bottom)
+            delta = stop - start
+
+            if delta == 0:
+                return torch.tensor([start], dtype=torch.float32, device=self.device)
+
+            direction = 1.0 if delta > 0 else -1.0
+            steps = int(np.floor(abs(delta) / slice_thickness))
+            offsets = torch.arange(steps + 1, device=self.device, dtype=torch.float32)
+            return start + direction * slice_thickness * offsets
+
+        raise ValueError(
+            "Provide either n_layers with slice_thickness, or z_top, z_bottom, and slice_thickness."
+        )
+
+    def _sweep_c10_stack(self, c10_axis, mode='tcBF', output_frame=None, **kwargs):
+        """
+        Evaluate a read-only reconstruction stack over an absolute C10 axis.
+
+        Returns:
+            tuple[torch.Tensor, torch.Tensor]: (c10_axis, image_stack)
+        """
+        original_c10 = self.ab_state.coeffs['C_1_0'].detach().clone()
+        original_reconstructed_image = self.reconstructed_image
+        original_reconstructed_images = self._reconstructed_images
+        stack_images = []
+
+        try:
+            with torch.no_grad():
+                for c10 in c10_axis:
+                    self.ab_state.coeffs['C_1_0'].copy_(c10)
+
+                    # Rebuild only dynamic image caches so static tcBF/acBF caches can be reused.
+                    self.reconstructed_image = None
+                    self._reconstructed_images = {}
+
+                    img = self.reconstruct(mode=mode, **kwargs)
+
+                    rotation_deg = self.coord_transform.get('rotation_deg', 0.0)
+                    if not self._in_scan_frame(output_frame) and rotation_deg:
+                        img = tv_rotate(
+                            img.unsqueeze(0),
+                            angle=-rotation_deg,
+                            interpolation=InterpolationMode.BILINEAR,
+                        ).squeeze(0)
+
+                    stack_images.append(img)
+        finally:
+            with torch.no_grad():
+                self.ab_state.coeffs['C_1_0'].copy_(original_c10)
+
+            self.reconstructed_image = original_reconstructed_image
+            self._reconstructed_images = original_reconstructed_images
+
+        c10_axis = c10_axis.detach().clone()
+        stack = torch.stack(stack_images, dim=0)
+        self.last_c10_stack_axis = c10_axis
+        return c10_axis, stack
+
     # Public methods
     # Getter and Printing
     def get_aberrations_dict(self, output_frame=None, notation='krivanek', style='cartesian', layout='nested'):
@@ -958,6 +1078,35 @@ class BFSolver:
     def get_acBF(self, output_frame=None, **kwargs):
         return self.get_reconstructed_image(mode='acBF', output_frame=output_frame, **kwargs)
 
+    def get_defocus_stack(
+        self,
+        mode='tcBF',
+        output_frame=None,
+        n_layers=None,
+        z_top=None,
+        z_bottom=None,
+        slice_thickness=None,
+        **kwargs,
+    ):
+        """
+        Return a read-only defocus stack with shape (Nz, Ny, Nx).
+
+        The stack axis is absolute C10 in Angstroms. The exact axis used for the
+        returned stack is stored in self.last_c10_stack_axis.
+
+        Supported mutually exclusive modes:
+            1. n_layers + slice_thickness
+            2. z_top + z_bottom + slice_thickness
+        """
+        c10_axis = self._build_c10_stack_axis(
+            n_layers=n_layers,
+            z_top=z_top,
+            z_bottom=z_bottom,
+            slice_thickness=slice_thickness,
+        )
+        _, stack = self._sweep_c10_stack(c10_axis, mode=mode, output_frame=output_frame, **kwargs)
+        return stack
+
     def get_probe(self, output_frame=None):
         """
         Return the complex probe wavefield.
@@ -989,40 +1138,39 @@ class BFSolver:
         search_range = (min_def, max_def)
         print(f"Starting defocus line search: {num_points} points between {search_range[0]} and {search_range[1]} Ang")
         
-        c10_tests = np.linspace(search_range[0], search_range[1], num_points)
-        quality_scores = []
-        temp_images = []
+        c10_tests = torch.linspace(search_range[0], search_range[1], num_points, dtype=torch.float32, device=self.device)
         optimal_index = 0
-        
-        # 2. Evaluate each point
-        for c10 in c10_tests:
-            with torch.no_grad():
-                self.ab_state.coeffs['C_1_0'].copy_(torch.tensor(float(c10), dtype=torch.float32, device=self.device))
-            
-            with torch.no_grad():
-                self.clear_cache(clear_static_cache=False)
-                summed_img = self.reconstruct(mode=mode, **kwargs)
-                score = QualityMetrics.evaluate(summed_img, metric=metric, blur=blur, blur_kernel_size=blur_kernel_size, blur_sigma=blur_sigma).item()
-                quality_scores.append(score)
-                temp_images.append(summed_img)
+
+        # 2. Evaluate the full sweep first, then score each slice from the stack.
+        # Always sweep in scan frame: _reconstructed_images caches scan-frame images by contract
+        # (output_frame rotation is applied lazily in get_reconstructed_image, never in the cache).
+        c10_axis, temp_stack = self._sweep_c10_stack(c10_tests, mode=mode, output_frame='scan', **kwargs)
+        quality_scores = QualityMetrics.evaluate(
+            temp_stack,
+            metric=metric,
+            blur=blur,
+            blur_kernel_size=blur_kernel_size,
+            blur_sigma=blur_sigma,
+        ).detach().cpu().numpy()
+        c10_tests_np = c10_axis.detach().cpu().numpy()
         
         if method == 'fit_parabola':
-            coeffs = np.polyfit(c10_tests, quality_scores, 2)
+            coeffs = np.polyfit(c10_tests_np, quality_scores, 2)
             a, b, c = coeffs
             
             if a < 0:
                 optimal_c10 = -b / (2 * a)
                 optimal_c10 = np.clip(optimal_c10, search_range[0], search_range[1])
                 fit_type = "Parabolic vertex"
-                optimal_index = int(np.argmin(np.abs(c10_tests - optimal_c10)))
+                optimal_index = int(np.argmin(np.abs(c10_tests_np - optimal_c10)))
             else:
                 optimal_index = int(np.argmax(quality_scores))
-                optimal_c10 = c10_tests[optimal_index]
+                optimal_c10 = c10_tests_np[optimal_index]
                 fit_type = "Discrete max (fit inverted)"
                 
         elif method == 'max':
             optimal_index = int(np.argmax(quality_scores))
-            optimal_c10 = c10_tests[optimal_index]
+            optimal_c10 = c10_tests_np[optimal_index]
         else:
             raise ValueError(f"Unsupported method: {method}, please choose between 'fit_parabola' or 'max'")
             
@@ -1031,12 +1179,13 @@ class BFSolver:
         with torch.no_grad():
             self.ab_state.coeffs['C_1_0'].copy_(torch.tensor(float(optimal_c10), dtype=torch.float32, device=self.device))
         self.clear_cache(clear_static_cache=False)
-        self.reconstructed_image = temp_images[optimal_index]
-        self._reconstructed_images[(mode.lower(), tuple(sorted(kwargs.items())))] = temp_images[optimal_index]
+        # Store the optimal scan-frame image; get_reconstructed_image applies output_frame rotation on read.
+        self.reconstructed_image = temp_stack[optimal_index]
+        self._reconstructed_images[(mode.lower(), tuple(sorted(kwargs.items())))] = temp_stack[optimal_index]
         
         if plot_line_search:
             fig, ax = plt.subplots(figsize=(8, 5))
-            ax.scatter(c10_tests, quality_scores, color='dodgerblue', s=60, label='Tested Points', zorder=5)
+            ax.scatter(c10_tests_np, quality_scores, color='dodgerblue', s=60, label='Tested Points', zorder=5)
             
             if method == 'fit_parabola':
                 c10_smooth = np.linspace(search_range[0], search_range[1], 100)
