@@ -859,6 +859,14 @@ class BFSolver:
         """
         Evaluate a read-only reconstruction stack over an absolute C10 axis.
 
+        The returned stack is expressed in the requested output frame:
+            - output_frame='scan' stores scan-frame slices
+            - output_frame='detector' stores detector-frame slices with rotation applied eagerly per-slice
+
+        Unlike get_reconstructed_image(), this helper does not populate the normal
+        single-image reconstruction cache. It only updates self.last_c10_stack_axis
+        to record the most recent sweep axis used by the solver.
+
         Returns:
             tuple[torch.Tensor, torch.Tensor]: (c10_axis, image_stack)
         """
@@ -1094,6 +1102,9 @@ class BFSolver:
         The stack axis is absolute C10 in Angstroms. The exact axis used for the
         returned stack is stored in self.last_c10_stack_axis.
 
+        Note: self.last_c10_stack_axis records the most recent C10 sweep axis used
+        by the solver, including internal sweeps such as refine_defocus().
+
         Supported mutually exclusive modes:
             1. n_layers + slice_thickness
             2. z_top + z_bottom + slice_thickness
@@ -1138,39 +1149,39 @@ class BFSolver:
         search_range = (min_def, max_def)
         print(f"Starting defocus line search: {num_points} points between {search_range[0]} and {search_range[1]} Ang")
         
-        c10_tests = torch.linspace(search_range[0], search_range[1], num_points, dtype=torch.float32, device=self.device)
-        optimal_index = 0
+        c10_axis = torch.linspace(search_range[0], search_range[1], num_points, dtype=torch.float32, device=self.device)
 
         # 2. Evaluate the full sweep first, then score each slice from the stack.
-        # Always sweep in scan frame: _reconstructed_images caches scan-frame images by contract
-        # (output_frame rotation is applied lazily in get_reconstructed_image, never in the cache).
-        c10_axis, temp_stack = self._sweep_c10_stack(c10_tests, mode=mode, output_frame='scan', **kwargs)
+        # Always sweep in scan frame: quality metrics are frame-agnostic and the scan frame is
+        # the canonical reconstruction frame. The optimal image is stored in the scan-frame cache;
+        # get_reconstructed_image() applies output_frame rotation lazily on read.
+        c10_axis, scan_stack = self._sweep_c10_stack(c10_axis, mode=mode, output_frame='scan', **kwargs)
         quality_scores = QualityMetrics.evaluate(
-            temp_stack,
+            scan_stack,
             metric=metric,
             blur=blur,
             blur_kernel_size=blur_kernel_size,
             blur_sigma=blur_sigma,
         ).detach().cpu().numpy()
-        c10_tests_np = c10_axis.detach().cpu().numpy()
+        c10_axis_np = c10_axis.detach().cpu().numpy()
         
         if method == 'fit_parabola':
-            coeffs = np.polyfit(c10_tests_np, quality_scores, 2)
+            coeffs = np.polyfit(c10_axis_np, quality_scores, 2)
             a, b, c = coeffs
             
             if a < 0:
                 optimal_c10 = -b / (2 * a)
                 optimal_c10 = np.clip(optimal_c10, search_range[0], search_range[1])
                 fit_type = "Parabolic vertex"
-                optimal_index = int(np.argmin(np.abs(c10_tests_np - optimal_c10)))
+                optimal_index = int(np.argmin(np.abs(c10_axis_np - optimal_c10)))
             else:
                 optimal_index = int(np.argmax(quality_scores))
-                optimal_c10 = c10_tests_np[optimal_index]
+                optimal_c10 = c10_axis_np[optimal_index]
                 fit_type = "Discrete max (fit inverted)"
                 
         elif method == 'max':
             optimal_index = int(np.argmax(quality_scores))
-            optimal_c10 = c10_tests_np[optimal_index]
+            optimal_c10 = c10_axis_np[optimal_index]
         else:
             raise ValueError(f"Unsupported method: {method}, please choose between 'fit_parabola' or 'max'")
             
@@ -1180,12 +1191,12 @@ class BFSolver:
             self.ab_state.coeffs['C_1_0'].copy_(torch.tensor(float(optimal_c10), dtype=torch.float32, device=self.device))
         self.clear_cache(clear_static_cache=False)
         # Store the optimal scan-frame image; get_reconstructed_image applies output_frame rotation on read.
-        self.reconstructed_image = temp_stack[optimal_index]
-        self._reconstructed_images[(mode.lower(), tuple(sorted(kwargs.items())))] = temp_stack[optimal_index]
+        self.reconstructed_image = scan_stack[optimal_index]
+        self._reconstructed_images[(mode.lower(), tuple(sorted(kwargs.items())))] = scan_stack[optimal_index]
         
         if plot_line_search:
             fig, ax = plt.subplots(figsize=(8, 5))
-            ax.scatter(c10_tests_np, quality_scores, color='dodgerblue', s=60, label='Tested Points', zorder=5)
+            ax.scatter(c10_axis_np, quality_scores, color='dodgerblue', s=60, label='Tested Points', zorder=5)
             
             if method == 'fit_parabola':
                 c10_smooth = np.linspace(search_range[0], search_range[1], 100)
