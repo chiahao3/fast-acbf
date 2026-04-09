@@ -355,6 +355,7 @@ class BFSolver:
         device='cuda',
         coord_transform=None,
         output_frame: str = 'scan',
+        eps: float = 1e-3,
     ):
         """
         Initializes the solver. Dataset loading/parsing is assumed to be handled 
@@ -369,6 +370,7 @@ class BFSolver:
         self.orig_aberrations = aberrations
         self.parsed_aberrations = Aberrations(aberrations).export(notation='krivanek', style='cartesian', layout='nested')
         self.ab_state = AberrationState(self.parsed_aberrations, self.max_order, device=device)
+        self.eps = eps
         self.device = device
         
         # Coordinate transform — maps acBF k-space orientation to the PtyRAD pipeline.
@@ -781,11 +783,11 @@ class BFSolver:
             # Originally we were doing phasor = exp(-i*angle(ctf_t))
             # So phasor = conj(ctf_t) / |ctf_t|
             # Since ctf_t = -conj(0.5*i*D), we get phasor = -0.5*i*D / |0.5*i*D|
-            # So phasor is simply just -i * D/|D|, and D/|D| = sgn(D)
+            # So phasor is simply just -i * D/|D|
             term_mt = chunk['ap_mt'] * torch.exp(-j1 * (chi_tr_az - chi_mt))
             term_t  = chunk['ap_t']  * torch.exp(j1 * (chi_tr_az - chi_t))
             D = term_mt - term_t
-            phasor = (-j1) * torch.sgn(D) 
+            phasor = (-j1) * D / (D.abs() + self.eps)  # Avoid numerical instability when |D| ~ 0 especially on CUDA
             
             # 3. Apply phase correction and IFFT
             F_corr = chunk['img_fft'] * phasor
