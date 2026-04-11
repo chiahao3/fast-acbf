@@ -147,6 +147,7 @@ class QualityMetrics:
         if blur:
             img = gaussian_blur(img, kernel_size=blur_kernel_size, sigma=blur_sigma)
             
+        metric = metric.lower()
         if metric == 'laplacian':
             # Variance of Laplacian
             lap_kernel = torch.tensor([[[[0., 1., 0.], [1., -4., 1.], [0., 1., 0.]]]], device=img.device)
@@ -416,7 +417,7 @@ class BFSolver:
         # Individual methods also accept a per-call `output_frame` keyword that
         # overrides this global default (None → use global; 'scan'/'detector' →
         # override for that call only).
-        self.output_frame = output_frame
+        self.output_frame = output_frame.lower()
         
         # Placeholders / caches
         self.reconstructed_image = None
@@ -455,7 +456,7 @@ class BFSolver:
         None → defers to self.output_frame (global default).
         'scan' or 'detector' → explicit per-call override.
         """
-        return self.output_frame if output_frame is None else output_frame
+        return self.output_frame if output_frame is None else output_frame.lower()
 
     def _in_scan_frame(self, output_frame):
         """Return True when output_frame resolves to 'scan'."""
@@ -1066,7 +1067,8 @@ class BFSolver:
         output_frame='scan'      → image as reconstructed, in the scan frame.
         output_frame='detector'  → image rotated back to the detector frame for display.
         """
-        cache_key = (mode.lower(), tuple(sorted(kwargs.items())))
+        mode = mode.lower()
+        cache_key = (mode, tuple(sorted(kwargs.items())))
 
         if cache_key not in self._reconstructed_images:
             self._reconstructed_images[cache_key] = self.reconstruct(mode=mode, **kwargs)
@@ -1111,6 +1113,7 @@ class BFSolver:
             1. n_layers + slice_thickness
             2. z_top + z_bottom + slice_thickness
         """
+        mode = mode.lower()
         c10_axis = self._build_c10_stack_axis(
             n_layers=n_layers,
             z_top=z_top,
@@ -1146,6 +1149,7 @@ class BFSolver:
         Performs a brute-force line search for defocus (-C10) and fits a parabola 
         to estimate the optimal defocus value.
         """
+        mode = mode.lower()
         # 1. Setup the test array
         min_def, max_def = min(search_range), max(search_range)
         search_range = (min_def, max_def)
@@ -1167,6 +1171,7 @@ class BFSolver:
         ).detach().cpu().numpy()
         c10_axis_np = c10_axis.detach().cpu().numpy()
         
+        method = method.lower()
         if method == 'fit_parabola':
             coeffs = np.polyfit(c10_axis_np, quality_scores, 2)
             a, b, c = coeffs
@@ -1194,7 +1199,7 @@ class BFSolver:
         self.clear_cache(clear_static_cache=False)
         # Store the optimal scan-frame image; get_reconstructed_image applies output_frame rotation on read.
         self.reconstructed_image = scan_stack[optimal_index]
-        self._reconstructed_images[(mode.lower(), tuple(sorted(kwargs.items())))] = scan_stack[optimal_index]
+        self._reconstructed_images[(mode, tuple(sorted(kwargs.items())))] = scan_stack[optimal_index]
         
         if plot_line_search:
             fig, ax = plt.subplots(figsize=(8, 5))
@@ -1223,6 +1228,7 @@ class BFSolver:
 
     def refine_aberrations(self, lr=1, iters=50, metric='normalized_std', plot_recon_every_n_iter=None, save_dir=None, mode='tcBF', **kwargs):
         """ Refine aberration-induced image shifts by minimizing the quality metrics with a negative sign """
+        mode = mode.lower()
         optimizer = torch.optim.Adam(self.ab_state.parameters(), lr=lr)
 
         for i in range(iters):
@@ -1230,7 +1236,7 @@ class BFSolver:
             self.clear_cache(clear_static_cache=False)
             summed_img = self.reconstruct(mode=mode, **kwargs)
             self.reconstructed_image = summed_img
-            self._reconstructed_images[(mode.lower(), tuple(sorted(kwargs.items())))] = summed_img
+            self._reconstructed_images[(mode, tuple(sorted(kwargs.items())))] = summed_img
             loss = -1*QualityMetrics.evaluate(summed_img, metric=metric)
             loss.backward()
             optimizer.step()
@@ -1254,6 +1260,8 @@ class BFSolver:
 
     # Plotting   
     def plot_reconstruction(self, title_str=None, desc_str=None, save_path=None, mode='tcBF', output_frame=None, **kwargs):
+        mode = mode.lower()
+        
         if title_str is None:
             title_str = f"Reconstructed {mode} and Probe amplitude"
         if desc_str is None:
