@@ -431,6 +431,13 @@ class BFSolver:
 
     # Internal Methods
 
+    @staticmethod
+    def _normalize_acbf_algorithm(acbf_algorithm):
+        """Normalize the public acBF algorithm selector."""
+        if acbf_algorithm is None:
+            return 'phase_only'
+        return str(acbf_algorithm).strip().lower().replace('-', '_')
+
     def clear_cache(self, clear_static_cache=True):
         """Clears reconstructed image cache and, optionally, the static tcBF/acBF caches."""
         self.reconstructed_image = None
@@ -763,38 +770,111 @@ class BFSolver:
             
         return tcBF_total
 
-    def _get_acBF_from_cache(self, cache, out_shape):
+    def _compute_acbf_transfer(self, chunk, coeffs):
         """
-        Ultra-lean AD forward pass using Tensorized Einsum.
+        Compute the detector-wise complex transfer for acBF.
+
+        Returns:
+            torch.Tensor: Complex transfer T with shape (Nb, Ny, Nx).
         """
         j1 = torch.tensor(1.0j, dtype=torch.complex64, device=self.device)
+
+        chi_tr_az = torch.einsum('k, kbxy -> bxy', coeffs, chunk['b_tr'])
+        chi_t     = torch.einsum('k, kbxy -> bxy', coeffs, chunk['b_t'])
+        chi_mt    = torch.einsum('k, kbxy -> bxy', coeffs, chunk['b_mt'])
+
+        term_mt = chunk['ap_mt'] * torch.exp(-j1 * (chi_tr_az - chi_mt))
+        term_t  = chunk['ap_t']  * torch.exp(j1 * (chi_tr_az - chi_t))
+        D = term_mt - term_t
+
+        # T = -i * D. This keeps the transfer aligned with the current acBF phasor
+        # convention while also exposing the full complex transfer for matched filtering.
+        return (-j1) * D
+
+    def _get_acBF_from_cache(self, cache, out_shape):
+        """
+        Phase-only acBF reconstruction.
+
+        This is the legacy acBF path that aligns detector contributions by phase
+        before summation, preserving the original default behavior.
+        """
         acBF_total = torch.zeros(out_shape, dtype=torch.float32, device=self.device)
-        
-        # Extract the 1D coefficient tensor (Shape: Num_Coeffs)
-        C = self.ab_state.get_flat_coeffs()
-        
+        coeffs = self.ab_state.get_flat_coeffs()
+
         for chunk in cache:
-            # 1. Einsum: Matrix multiply the coefficients across the entire basis block instantly!
-            # 'k' = Coeff index, 'b' = Batch, 'x' = Nx, 'y' = Ny
-            chi_tr_az = torch.einsum('k, kbxy -> bxy', C, chunk['b_tr'])
-            chi_t     = torch.einsum('k, kbxy -> bxy', C, chunk['b_t'])
-            chi_mt    = torch.einsum('k, kbxy -> bxy', C, chunk['b_mt'])
-            
-            # 2. Rose CTF Interference Waves
-            # Originally we were doing phasor = exp(-i*angle(ctf_t))
-            # So phasor = conj(ctf_t) / |ctf_t|
-            # Since ctf_t = -conj(0.5*i*D), we get phasor = -0.5*i*D / |0.5*i*D|
-            # So phasor is simply just -i * D/|D|
-            term_mt = chunk['ap_mt'] * torch.exp(-j1 * (chi_tr_az - chi_mt))
-            term_t  = chunk['ap_t']  * torch.exp(j1 * (chi_tr_az - chi_t))
-            D = term_mt - term_t
-            phasor = (-j1) * D / (D.abs() + self.eps)  # Avoid numerical instability when |D| ~ 0 especially on CUDA
-            
-            # 3. Apply phase correction and IFFT
+            transfer = self._compute_acbf_transfer(chunk, coeffs)
+            phasor = transfer / (transfer.abs() + self.eps)
             F_corr = chunk['img_fft'] * phasor
             acBF_total += torch.sum(torch.fft.ifft2(F_corr, dim=(-2, -1)).real, dim=0)
-            
+
         return acBF_total
+
+    def _get_acBF_complex_inversion_from_cache(
+        self,
+        cache,
+        out_shape,
+        regularization=1e-3,
+        support_threshold=1e-6,
+        return_diagnostics=False,
+    ):
+        """
+        Complex-inversion acBF reconstruction via regularized transfer inversion.
+
+        The estimator solves a regularized matched-filter inversion of the detector-wise
+        complex transfer. The current phase-only acBF path implicitly uses the forward
+        model I_b(q) = conj(T_b(q)) * V(q), so the matched-filter numerator must apply
+        T_b (not conj(T_b)) to recover a phase-aligned estimate.
+
+            V_hat(q) = M(q) / (S(q) + lambda * S_ref)
+
+        where:
+            M(q) = sum_b T_b(q) * I_b(q)
+            S(q) = sum_b |T_b(q)|^2
+        """
+        if regularization < 0:
+            raise ValueError(f"regularization must be non-negative, got {regularization}.")
+        if support_threshold < 0:
+            raise ValueError(f"support_threshold must be non-negative, got {support_threshold}.")
+
+        coeffs = self.ab_state.get_flat_coeffs()
+        numerator = torch.zeros(out_shape, dtype=torch.complex64, device=self.device)
+        transfer_power = torch.zeros(out_shape, dtype=torch.float32, device=self.device)
+
+        for chunk in cache:
+            transfer = self._compute_acbf_transfer(chunk, coeffs)
+            numerator += torch.sum(transfer * chunk['img_fft'], dim=0)
+            transfer_power += torch.sum(transfer.abs().square(), dim=0)
+
+        positive_power = transfer_power[transfer_power > 0]
+        if positive_power.numel() == 0:
+            transfer_reference = torch.tensor(1.0, dtype=torch.float32, device=self.device)
+        else:
+            transfer_reference = positive_power.median()
+
+        support = transfer_power > (support_threshold * transfer_reference)
+        denom = transfer_power + (regularization * transfer_reference)
+        fourier_estimate = torch.where(
+            support,
+            numerator / denom.to(torch.complex64),
+            torch.zeros_like(numerator),
+        )
+
+        complex_image = torch.fft.ifft2(fourier_estimate, dim=(-2, -1))
+        reconstructed = complex_image.real
+
+        if not return_diagnostics:
+            return reconstructed
+
+        return {
+            'image': reconstructed,
+            'complex_image': complex_image,
+            'real_channel': complex_image.real,
+            'imag_channel': complex_image.imag,
+            'fourier_estimate': fourier_estimate,
+            'transfer_power': transfer_power,
+            'support_mask': support,
+            'support_reference': transfer_reference,
+        }
 
     def _build_c10_stack_axis(self, n_layers=None, z_top=None, z_bottom=None, slice_thickness=None):
         """
@@ -1033,6 +1113,8 @@ class BFSolver:
         
         Notes:
             - tcBF is the default mode.
+            - acBF supports `acbf_algorithm='phase_only'` (default) and
+              `acbf_algorithm='complex_inversion'`.
         """
         mode_key = mode.lower()
         
@@ -1046,8 +1128,24 @@ class BFSolver:
             upscale = kwargs.get('upscale', 1)
             rolloff = kwargs.get('rolloff', 0)
             chunk_size = kwargs.get('chunk_size', 64)
+            acbf_algorithm = self._normalize_acbf_algorithm(kwargs.get('acbf_algorithm', 'phase_only'))
+            regularization = kwargs.get('regularization', 1e-3)
+            support_threshold = kwargs.get('support_threshold', 1e-6)
             cache, out_shape = self._get_acBF_cache(upscale=upscale, rolloff=rolloff, chunk_size=chunk_size)
-            return self._get_acBF_from_cache(cache, out_shape)
+
+            if acbf_algorithm == 'phase_only':
+                return self._get_acBF_from_cache(cache, out_shape)
+            if acbf_algorithm == 'complex_inversion':
+                return self._get_acBF_complex_inversion_from_cache(
+                    cache,
+                    out_shape,
+                    regularization=regularization,
+                    support_threshold=support_threshold,
+                )
+            raise ValueError(
+                f"Unsupported acBF algorithm '{acbf_algorithm}'. "
+                "Choose between 'phase_only' and 'complex_inversion'."
+            )
         
         else:
             raise ValueError(f"Unsupported mode '{mode}'. Please choose between 'tcBF' and 'acBF'.")
@@ -1090,6 +1188,34 @@ class BFSolver:
     def get_acBF(self, output_frame=None, **kwargs):
         return self.get_reconstructed_image(mode='acBF', output_frame=output_frame, **kwargs)
 
+    def get_acBF_diagnostics(self, **kwargs):
+        """
+        Return transfer diagnostics for the complex-inversion acBF estimator.
+
+        Accepted kwargs mirror the acBF reconstruction path:
+            - upscale
+            - rolloff
+            - chunk_size
+            - regularization
+            - support_threshold
+
+        Returns a dictionary containing the complex estimate, real/imag channels,
+        and the transfer-power support used by the regularized inversion.
+        """
+        upscale = kwargs.get('upscale', 1)
+        rolloff = kwargs.get('rolloff', 0)
+        chunk_size = kwargs.get('chunk_size', 64)
+        regularization = kwargs.get('regularization', 1e-3)
+        support_threshold = kwargs.get('support_threshold', 1e-6)
+        cache, out_shape = self._get_acBF_cache(upscale=upscale, rolloff=rolloff, chunk_size=chunk_size)
+        return self._get_acBF_complex_inversion_from_cache(
+            cache,
+            out_shape,
+            regularization=regularization,
+            support_threshold=support_threshold,
+            return_diagnostics=True,
+        )
+
     def get_defocus_stack(
         self,
         mode='tcBF',
@@ -1105,6 +1231,11 @@ class BFSolver:
 
         The stack axis is absolute C10 in Angstroms. The exact axis used for the
         returned stack is stored in self.last_c10_stack_axis.
+
+        For acBF, callers may pass `acbf_algorithm='phase_only'` or
+        `acbf_algorithm='complex_inversion'`. The latter performs a regularized
+        complex transfer inversion intended to reduce depth-dependent contrast
+        modulation within the weak-phase approximation.
 
         Note: self.last_c10_stack_axis records the most recent C10 sweep axis used
         by the solver, including internal sweeps such as refine_defocus().
