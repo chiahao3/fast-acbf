@@ -359,6 +359,7 @@ class BFSolver:
         eps: float = 1e-3,
         cache_mode: str = 'full_gpu',
         upscale_method: str = 'real',
+        defer_upscale: bool = False,
     ):
         """
         Initializes the solver. Dataset loading/parsing is assumed to be handled
@@ -380,6 +381,13 @@ class BFSolver:
                 'fourier' — fft2 at native resolution, then zero-pad in Fourier space to the
                             target size.  Supports arbitrary (non-integer) upscale factors;
                             avoids the large intermediate spatial tensor.
+            defer_upscale: When True, img_fft and all cached grids/apertures are stored at
+                native scan resolution (Ry, Rx).  Upscaling to (Ny_out, Nx_out) is deferred
+                to a single Fourier zero-pad of the accumulated F_corr sum, immediately before
+                the final IFFT.  This reduces cache memory by upscale^2 and replaces per-chunk
+                IFFTs with one IFFT per reconstruction.  The result is mathematically identical
+                to upscaling upfront because all operations in the reconstruction loop are linear
+                and commute with zero-padding.  When upscale=1 this flag has no effect.
         """
         self.dataset = dataset
         self.max_alpha = max_alpha
@@ -408,7 +416,8 @@ class BFSolver:
                 f"upscale_method must be one of {_VALID_UPSCALE_METHODS}, got {upscale_method!r}."
             )
         self.upscale_method = upscale_method
-        
+        self.defer_upscale = bool(defer_upscale)
+
         # Coordinate transform — maps acBF k-space orientation to the PtyRAD pipeline.
         #
         # flipud / fliplr / transpose:
@@ -735,12 +744,18 @@ class BFSolver:
         kX_full, kY_full = self._get_transformed_bf_coordinates()
 
         # 3. Base Spatial Frequencies (For the sub-pixel Fourier phase ramp).
-        # Use the actual output pixel size rather than scan_step_size/upscale so that
-        # non-integer upscale factors are handled correctly.
-        dx = (Rx * self.scan_step_size) / Nx_out
-        dy = (Ry * self.scan_step_size) / Ny_out
-        qx_grid = torch.fft.fftfreq(Nx_out, d=dx, device=self.device).view(1, 1, Nx_out)
-        qy_grid = torch.fft.fftfreq(Ny_out, d=dy, device=self.device).view(1, Ny_out, 1)
+        # When deferring upscale, build the ramp grid at native resolution; the accumulated
+        # F_shifted will be zero-padded to (Ny_out, Nx_out) in _get_tcBF_from_cache.
+        # Otherwise, use the actual output pixel size so that non-integer upscale factors
+        # are handled correctly.
+        if self.defer_upscale:
+            qx_grid = torch.fft.fftfreq(Rx, d=self.scan_step_size, device=self.device).view(1, 1, Rx)
+            qy_grid = torch.fft.fftfreq(Ry, d=self.scan_step_size, device=self.device).view(1, Ry, 1)
+        else:
+            dx = (Rx * self.scan_step_size) / Nx_out
+            dy = (Ry * self.scan_step_size) / Ny_out
+            qx_grid = torch.fft.fftfreq(Nx_out, d=dx, device=self.device).view(1, 1, Nx_out)
+            qy_grid = torch.fft.fftfreq(Ny_out, d=dy, device=self.device).view(1, Ny_out, 1)
 
         cache = []
 
@@ -753,8 +768,11 @@ class BFSolver:
             # Generate unweighted analytic shift basis matrix [Num_Coeffs, ChunkSize]
             b_dx, b_dy = generate_shift_basis(self.ab_state.order_keys, kX_chunk, kY_chunk, self.wavelength)
 
-            # Compute img_fft at the target upscaled resolution
-            img_fft = self._compute_upscaled_img_fft(raw_stack[i:end], upscale, Ny_out, Nx_out)
+            # Compute img_fft — at native resolution when deferring, upscaled otherwise.
+            if self.defer_upscale:
+                img_fft = torch.fft.fft2(raw_stack[i:end], dim=(-2, -1))
+            else:
+                img_fft = self._compute_upscaled_img_fft(raw_stack[i:end], upscale, Ny_out, Nx_out)
 
             cache.append({
                 'b_dx': b_dx,
@@ -786,12 +804,21 @@ class BFSolver:
         kX_full = kX_full.view(Nb, 1, 1)
         kY_full = kY_full.view(Nb, 1, 1)
 
-        # 3. Base Spatial Frequencies at the (possibly upscaled) output resolution.
-        # Use actual output pixel size so non-integer upscale factors are handled correctly.
-        dx = (Rx * self.scan_step_size) / Nx_out
-        dy = (Ry * self.scan_step_size) / Ny_out
-        kx_base = torch.fft.fftfreq(Nx_out, d=dx, device=self.device).view(1, 1, Nx_out)
-        ky_base = torch.fft.fftfreq(Ny_out, d=dy, device=self.device).view(1, Ny_out, 1)
+        # 3. Base Spatial Frequencies.
+        # When deferring upscale, work at native resolution so that cached img_fft, apertures,
+        # and bases are all (chunk_size, Ry, Rx) — reducing VRAM by upscale^2.  The
+        # accumulated F_corr will be zero-padded to (Ny_out, Nx_out) in the reconstruction
+        # functions.  For fft_gpu mode the slow-path in _compute_acbf_transfer already reads
+        # the grid size from chunk['img_fft'].shape[-2:], so storing native img_fft is enough.
+        if self.defer_upscale:
+            kx_base = torch.fft.fftfreq(Rx, d=self.scan_step_size, device=self.device).view(1, 1, Rx)
+            ky_base = torch.fft.fftfreq(Ry, d=self.scan_step_size, device=self.device).view(1, Ry, 1)
+        else:
+            # Use actual output pixel size so non-integer upscale factors are handled correctly.
+            dx = (Rx * self.scan_step_size) / Nx_out
+            dy = (Ry * self.scan_step_size) / Ny_out
+            kx_base = torch.fft.fftfreq(Nx_out, d=dx, device=self.device).view(1, 1, Nx_out)
+            ky_base = torch.fft.fftfreq(Ny_out, d=dy, device=self.device).view(1, Ny_out, 1)
 
         cache = []
 
@@ -801,8 +828,11 @@ class BFSolver:
             kxt = kX_full[i:end]   # (chunk, 1, 1)
             kyt = kY_full[i:end]
 
-            # Compute img_fft at the target upscaled resolution
-            img_fft = self._compute_upscaled_img_fft(raw_stack[i:end], upscale, Ny_out, Nx_out)
+            # Compute img_fft — at native resolution when deferring, upscaled otherwise.
+            if self.defer_upscale:
+                img_fft = torch.fft.fft2(raw_stack[i:end], dim=(-2, -1))
+            else:
+                img_fft = self._compute_upscaled_img_fft(raw_stack[i:end], upscale, Ny_out, Nx_out)
 
             if self.cache_mode == 'fft_gpu':
                 # Lightweight cache: only img_fft on GPU + scalar k-coords for lazy recompute.
@@ -846,15 +876,15 @@ class BFSolver:
         return cache, (Ny_out, Nx_out)
 
     def _get_tcBF_cache(self, upscale=1, chunk_size=64):
-        key = ('tcBF', upscale, chunk_size)
-        
+        key = ('tcBF', upscale, chunk_size, self.defer_upscale)
+
         if key not in self._cache_store:
             self._cache_store[key] = self._build_tcBF_cache(upscale=upscale, chunk_size=chunk_size)
-            
+
         return self._cache_store[key]
 
     def _get_acBF_cache(self, upscale=1, rolloff=0, chunk_size=64):
-        key = ('acBF', upscale, rolloff, chunk_size)
+        key = ('acBF', upscale, rolloff, chunk_size, self.defer_upscale)
 
         if key not in self._cache_store:
             cache, out_shape = self._build_acBF_cache(upscale=upscale, rolloff=rolloff, chunk_size=chunk_size)
@@ -866,30 +896,47 @@ class BFSolver:
 
     def _get_tcBF_from_cache(self, cache, qx_grid, qy_grid, out_shape):
         """
-        Ultra-lean AD forward pass for tcBF. 
+        Ultra-lean AD forward pass for tcBF.
         Calculates exact analytical shifts instantly via Einstein summation.
+
+        When self.defer_upscale is True, phase ramps and img_fft are at native resolution.
+        F_shifted contributions are accumulated in native Fourier space, then zero-padded
+        to out_shape and inverse-transformed in a single IFFT at the end.
         """
         neg_two_pi_j = torch.tensor(-2.0j * torch.pi, dtype=torch.complex64, device=self.device)
-        tcBF_total = torch.zeros(out_shape, dtype=torch.float32, device=self.device)
-        
+
         # Extract the 1D coefficient tensor (Shape: Num_Coeffs)
         C = self.ab_state.get_flat_coeffs()
-        
-        for chunk in cache:
-            # 1. Instantly calculate physical shift vectors by dot-producing Coeffs and Basis
-            # 'k' = Coeff index, 'b' = Batch size of chunk. Result shaped for broadcasting: [Batch, 1, 1]
-            shift_dx = torch.einsum('k, kb -> b', C, chunk['b_dx']).view(-1, 1, 1)
-            shift_dy = torch.einsum('k, kb -> b', C, chunk['b_dy']).view(-1, 1, 1)
-            
-            # 2. Generate Sub-pixel Phase Ramp
-            ramp = shift_dx * qx_grid + shift_dy * qy_grid
-            shift_op = torch.exp(neg_two_pi_j * ramp)
-            
-            # 3. Apply to pre-computed image FFT and Reconstruct
-            F_shifted = chunk['img_fft'] * shift_op
-            tcBF_total += torch.sum(torch.fft.ifft2(F_shifted, dim=(-2, -1)).real, dim=0)
-            
-        return tcBF_total
+
+        if self.defer_upscale:
+            # Accumulate in native Fourier space; one zero-pad + IFFT at the end.
+            Ry_n, Rx_n = self.Ry, self.Rx
+            F_sum = torch.zeros((Ry_n, Rx_n), dtype=torch.complex64, device=self.device)
+            for chunk in cache:
+                shift_dx = torch.einsum('k, kb -> b', C, chunk['b_dx']).view(-1, 1, 1)
+                shift_dy = torch.einsum('k, kb -> b', C, chunk['b_dy']).view(-1, 1, 1)
+                ramp = shift_dx * qx_grid + shift_dy * qy_grid
+                shift_op = torch.exp(neg_two_pi_j * ramp)
+                F_sum += torch.sum(chunk['img_fft'] * shift_op, dim=0)
+            Ny_out, Nx_out = out_shape
+            return torch.fft.ifft2(self._zero_pad_fft2(F_sum, Ny_out, Nx_out), dim=(-2, -1)).real
+        else:
+            tcBF_total = torch.zeros(out_shape, dtype=torch.float32, device=self.device)
+            for chunk in cache:
+                # 1. Instantly calculate physical shift vectors by dot-producing Coeffs and Basis
+                # 'k' = Coeff index, 'b' = Batch size of chunk. Result shaped for broadcasting: [Batch, 1, 1]
+                shift_dx = torch.einsum('k, kb -> b', C, chunk['b_dx']).view(-1, 1, 1)
+                shift_dy = torch.einsum('k, kb -> b', C, chunk['b_dy']).view(-1, 1, 1)
+
+                # 2. Generate Sub-pixel Phase Ramp
+                ramp = shift_dx * qx_grid + shift_dy * qy_grid
+                shift_op = torch.exp(neg_two_pi_j * ramp)
+
+                # 3. Apply to pre-computed image FFT and Reconstruct
+                F_shifted = chunk['img_fft'] * shift_op
+                tcBF_total += torch.sum(torch.fft.ifft2(F_shifted, dim=(-2, -1)).real, dim=0)
+
+            return tcBF_total
 
     def _compute_acbf_transfer(self, chunk, coeffs, rolloff=0):
         """
@@ -963,34 +1010,69 @@ class BFSolver:
 
         For 'full_cpu' cache_mode, chunks are streamed from CPU pinned RAM with async
         prefetch so that the next chunk's H2D transfer overlaps with the current computation.
+
+        When self.defer_upscale is True, F_corr is accumulated in native Fourier space across
+        all chunks, then zero-padded to out_shape and inverse-transformed in a single IFFT.
         """
-        acBF_total = torch.zeros(out_shape, dtype=torch.float32, device=self.device)
         coeffs = self.ab_state.get_flat_coeffs()
+        Ny_out, Nx_out = out_shape
 
-        if self.cache_mode == 'full_cpu':
-            prefetch_stream = torch.cuda.Stream(device=self.device)
+        if self.defer_upscale:
+            # Accumulate in native Fourier space; one zero-pad + IFFT at the end.
+            Ry_n, Rx_n = self.Ry, self.Rx
+            F_sum = torch.zeros((Ry_n, Rx_n), dtype=torch.complex64, device=self.device)
 
-            def _to_gpu(cpu_chunk):
-                with torch.cuda.stream(prefetch_stream):
-                    return {k: v.to(self.device, non_blocking=True) for k, v in cpu_chunk.items()}
-
-            gpu_chunk = _to_gpu(cache[0])
-            for idx in range(len(cache)):
-                next_gpu = _to_gpu(cache[idx + 1]) if idx + 1 < len(cache) else None
-                torch.cuda.current_stream(self.device).wait_stream(prefetch_stream)
-                transfer = self._compute_acbf_transfer(gpu_chunk, coeffs, rolloff=rolloff)
+            def _accumulate_deferred(chunk_gpu):
+                transfer = self._compute_acbf_transfer(chunk_gpu, coeffs, rolloff=rolloff)
                 phasor = transfer / (transfer.abs() + self.eps)
-                F_corr = gpu_chunk['img_fft'] * phasor
-                acBF_total += torch.sum(torch.fft.ifft2(F_corr, dim=(-2, -1)).real, dim=0)
-                gpu_chunk = next_gpu
+                F_sum.add_(torch.sum(chunk_gpu['img_fft'] * phasor, dim=0))
+
+            if self.cache_mode == 'full_cpu':
+                prefetch_stream = torch.cuda.Stream(device=self.device)
+
+                def _to_gpu(cpu_chunk):
+                    with torch.cuda.stream(prefetch_stream):
+                        return {k: v.to(self.device, non_blocking=True) for k, v in cpu_chunk.items()}
+
+                gpu_chunk = _to_gpu(cache[0])
+                for idx in range(len(cache)):
+                    next_gpu = _to_gpu(cache[idx + 1]) if idx + 1 < len(cache) else None
+                    torch.cuda.current_stream(self.device).wait_stream(prefetch_stream)
+                    _accumulate_deferred(gpu_chunk)
+                    gpu_chunk = next_gpu
+            else:
+                for chunk in cache:
+                    _accumulate_deferred(chunk)
+
+            return torch.fft.ifft2(self._zero_pad_fft2(F_sum, Ny_out, Nx_out), dim=(-2, -1)).real
+
         else:
-            for chunk in cache:
-                transfer = self._compute_acbf_transfer(chunk, coeffs, rolloff=rolloff)
-                phasor = transfer / (transfer.abs() + self.eps)
-                F_corr = chunk['img_fft'] * phasor
-                acBF_total += torch.sum(torch.fft.ifft2(F_corr, dim=(-2, -1)).real, dim=0)
+            acBF_total = torch.zeros(out_shape, dtype=torch.float32, device=self.device)
 
-        return acBF_total
+            if self.cache_mode == 'full_cpu':
+                prefetch_stream = torch.cuda.Stream(device=self.device)
+
+                def _to_gpu(cpu_chunk):
+                    with torch.cuda.stream(prefetch_stream):
+                        return {k: v.to(self.device, non_blocking=True) for k, v in cpu_chunk.items()}
+
+                gpu_chunk = _to_gpu(cache[0])
+                for idx in range(len(cache)):
+                    next_gpu = _to_gpu(cache[idx + 1]) if idx + 1 < len(cache) else None
+                    torch.cuda.current_stream(self.device).wait_stream(prefetch_stream)
+                    transfer = self._compute_acbf_transfer(gpu_chunk, coeffs, rolloff=rolloff)
+                    phasor = transfer / (transfer.abs() + self.eps)
+                    F_corr = gpu_chunk['img_fft'] * phasor
+                    acBF_total += torch.sum(torch.fft.ifft2(F_corr, dim=(-2, -1)).real, dim=0)
+                    gpu_chunk = next_gpu
+            else:
+                for chunk in cache:
+                    transfer = self._compute_acbf_transfer(chunk, coeffs, rolloff=rolloff)
+                    phasor = transfer / (transfer.abs() + self.eps)
+                    F_corr = chunk['img_fft'] * phasor
+                    acBF_total += torch.sum(torch.fft.ifft2(F_corr, dim=(-2, -1)).real, dim=0)
+
+            return acBF_total
 
     def _get_acBF_complex_inversion_from_cache(
         self,
@@ -1021,8 +1103,16 @@ class BFSolver:
             raise ValueError(f"support_threshold must be non-negative, got {support_threshold}.")
 
         coeffs = self.ab_state.get_flat_coeffs()
-        numerator = torch.zeros(out_shape, dtype=torch.complex64, device=self.device)
-        transfer_power = torch.zeros(out_shape, dtype=torch.float32, device=self.device)
+        Ny_out, Nx_out = out_shape
+
+        # When deferring upscale, accumulate M(q) and S(q) at native resolution, compute
+        # the Fourier estimate at native resolution, then zero-pad before the final IFFT.
+        # Note: we zero-pad the *ratio* fourier_estimate, not numerator/denom separately,
+        # because zero_pad(A/B) ≠ zero_pad(A) / zero_pad(B).
+        acc_shape = (self.Ry, self.Rx) if self.defer_upscale else out_shape
+
+        numerator = torch.zeros(acc_shape, dtype=torch.complex64, device=self.device)
+        transfer_power = torch.zeros(acc_shape, dtype=torch.float32, device=self.device)
 
         def _accumulate(chunk_gpu):
             transfer = self._compute_acbf_transfer(chunk_gpu, coeffs, rolloff=rolloff)
@@ -1060,6 +1150,12 @@ class BFSolver:
             torch.zeros_like(numerator),
         )
 
+        if self.defer_upscale:
+            fourier_estimate = self._zero_pad_fft2(fourier_estimate, Ny_out, Nx_out)
+            transfer_power   = self._zero_pad_fft2(
+                transfer_power.to(torch.complex64), Ny_out, Nx_out
+            ).real
+
         complex_image = torch.fft.ifft2(fourier_estimate, dim=(-2, -1))
         reconstructed = complex_image.real
 
@@ -1073,7 +1169,7 @@ class BFSolver:
             'imag_channel': complex_image.imag,
             'fourier_estimate': fourier_estimate,
             'transfer_power': transfer_power,
-            'support_mask': support,
+            'support_mask': support if not self.defer_upscale else transfer_power > (support_threshold * transfer_reference),
             'support_reference': transfer_reference,
         }
 
