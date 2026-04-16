@@ -15,6 +15,7 @@ from torchvision.transforms import InterpolationMode
 
 from ptyrad.core.functional import fftshift2, ifftshift2, torch_phasor
 from ptyrad.optics.aberrations import Aberrations
+from ptyrad.utils.image_proc import mfft2
 
 logger = logging.getLogger(__name__)
 
@@ -1689,7 +1690,7 @@ class BFSolver:
         return self
 
     # Plotting   
-    def plot_reconstruction(self, title_str=None, desc_str=None, save_path=None, mode='tcBF', output_frame=None, **kwargs):
+    def plot_reconstruction(self, title_str=None, desc_str=None, save_path=None, mode='tcBF', output_frame=None, vmin_img=None, vmax_img=None, vmin_fft=None, vmax_fft=None, **kwargs):
         mode = mode.lower()
         
         if title_str is None:
@@ -1699,13 +1700,20 @@ class BFSolver:
             desc_str = ", ".join(f"{ab}: {val:.2f}" for ab, val in ab_dict.items())
 
         img = self.get_reconstructed_image(mode=mode, output_frame=output_frame, **kwargs).detach().cpu().numpy()
+        fft = np.log(np.abs(np.fft.fftshift(mfft2(img)[0])))
         probe = self.get_probe(output_frame=output_frame).abs().detach().cpu().numpy()
         
-        fig, axs = plt.subplots(1,2)
+        vmin_img = np.percentile(img, vmin_img or 0.001)
+        vmax_img = np.percentile(img, vmax_img or 99.99)
+        vmin_fft = np.percentile(fft, vmin_fft or 1)
+        vmax_fft = np.percentile(fft, vmax_fft or 99)
+        
+        fig, axs = plt.subplots(1,3, figsize=(12, 5.5))
         fig.suptitle(title_str, y=0.9)
         fig.text(x=0, y=0.8, s=desc_str)
-        axs[0].imshow(img)
-        axs[1].imshow(probe)
+        axs[0].imshow(img, vmin=vmin_img, vmax=vmax_img)
+        axs[1].imshow(fft, vmin=vmin_fft, vmax=vmax_fft)
+        axs[2].imshow(probe)
         plt.tight_layout()
         
         if save_path is not None:
