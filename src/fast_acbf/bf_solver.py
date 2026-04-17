@@ -176,37 +176,43 @@ class QualityMetrics:
         return scores
 
 class AberrationState(torch.nn.Module):
-    def __init__(self, ab_dict: dict, max_order: int = None, device='cpu'):
+    def __init__(self, ab_dict: dict, max_order: int = None, device='cpu', tolerance_factors: dict = None):
         super().__init__()
         self.orig_ab_dict = ab_dict.copy()
         self.device = torch.device(device)
         self.order_keys = []
-        
+        self.tolerance_factors = tolerance_factors
+        # tolerance_factors: dict {n: Tn_in_ang} — Kirkland tolerance for each order.
+        # https://doi.org/10.1016/j.ultramic.2017.12.002
+        # When set, parameters are stored in normalized (dimensionless) form internally;
+        # all external accessors (get_cartesian_dict, get_flat_coeffs, get_physical) return physical Å values.
+
         # If max_order is not provided, infer it from the highest 'n' in the input dict
         if max_order is None:
             max_order = max([n for (n, m) in ab_dict.keys()]) if ab_dict else 2
-            
+
         self.max_order = max_order
-        
+
         # Flat ParameterDict for optimizer access
         self.coeffs = nn.ParameterDict()
-        
+
         # Dynamically generate all valid (n, m) pairs up to max_order in ascending m
         for n in range(1, max_order + 1):
             # m starts at 0 if n is odd, 1 if n is even. Steps by 2 up to n+1.
             start_m = (n + 1) % 2
-            
+            Tn = tolerance_factors[n] if tolerance_factors is not None else 1.0
+
             for m in range(start_m, n + 2, 2):
                 self.order_keys.append((n, m))
-                
+
                 # Fetch user value if provided, otherwise default to 0.0
                 if m == 0:
                     val = ab_dict.get((n, m), 0.0)
                     val_clean = float(val) if isinstance(val, (int, float, np.number)) else 0.0
-                    
+
                     key = f"C_{n}_{m}"
-                    self.coeffs[key] = nn.Parameter(torch.tensor(val_clean, device=self.device))
-                    
+                    self.coeffs[key] = nn.Parameter(torch.tensor(val_clean / Tn, device=self.device))
+
                 else:
                     val = ab_dict.get((n, m), {'a': 0.0, 'b': 0.0})
                     if isinstance(val, (int, float, np.number)):
@@ -214,35 +220,80 @@ class AberrationState(torch.nn.Module):
                     else:
                         val_a = float(val.get('a', 0.0))
                         val_b = float(val.get('b', 0.0))
-                        
+
                     key_a = f"C_{n}_{m}_a"
                     key_b = f"C_{n}_{m}_b"
-                    self.coeffs[key_a] = nn.Parameter(torch.tensor(val_a, device=self.device))
-                    self.coeffs[key_b] = nn.Parameter(torch.tensor(val_b, device=self.device))
+                    self.coeffs[key_a] = nn.Parameter(torch.tensor(val_a / Tn, device=self.device))
+                    self.coeffs[key_b] = nn.Parameter(torch.tensor(val_b / Tn, device=self.device))
 
     def get_cartesian_dict(self):
-        """Reconstructs the nested dictionary format."""
+        """Reconstructs the nested dictionary format in physical Å units."""
         out = {}
         for (n, m) in self.order_keys:
+            Tn = self.tolerance_factors[n] if self.tolerance_factors is not None else 1.0
             if m == 0:
-                out[(n, m)] = self.coeffs[f"C_{n}_{m}"].item()
+                out[(n, m)] = self.coeffs[f"C_{n}_{m}"].item() * Tn
             else:
                 out[(n, m)] = {
-                    'a': self.coeffs[f"C_{n}_{m}_a"].item(),
-                    'b': self.coeffs[f"C_{n}_{m}_b"].item()
+                    'a': self.coeffs[f"C_{n}_{m}_a"].item() * Tn,
+                    'b': self.coeffs[f"C_{n}_{m}_b"].item() * Tn
                 }
         return out
-    
+
     def get_flat_coeffs(self):
-        """Returns all coefficients as a 1D tensor in a deterministic order."""
+        """Returns all coefficients as a 1D tensor in physical Å units."""
         coeffs_list = []
+        tn_list = []
         for (n, m) in self.order_keys:
+            Tn = self.tolerance_factors[n] if self.tolerance_factors is not None else 1.0
             if m == 0:
                 coeffs_list.append(self.coeffs[f"C_{n}_{m}"])
+                tn_list.append(Tn)
             else:
                 coeffs_list.append(self.coeffs[f"C_{n}_{m}_a"])
+                tn_list.append(Tn)
                 coeffs_list.append(self.coeffs[f"C_{n}_{m}_b"])
-        return torch.stack(coeffs_list)
+                tn_list.append(Tn)
+        stacked = torch.stack(coeffs_list)
+        if self.tolerance_factors is not None:
+            tn_tensor = stacked.new_tensor(tn_list)  # inherits dtype and device from stacked
+            stacked = stacked * tn_tensor
+        return stacked
+
+    def get_physical(self, key: str) -> float:
+        """Return the physical Å value for a single coefficient key."""
+        n = int(key.split('_')[1])
+        raw = self.coeffs[key].detach().item()
+        return raw * self.tolerance_factors[n] if self.tolerance_factors is not None else raw
+
+    def set_physical(self, key: str, phys_value):
+        """Write a physical Å value to a coefficient, normalizing internally."""
+        n = int(key.split('_')[1])
+        val = phys_value.item() if isinstance(phys_value, torch.Tensor) else float(phys_value)
+        norm_val = val / self.tolerance_factors[n] if self.tolerance_factors is not None else val
+        with torch.no_grad():
+            self.coeffs[key].copy_(torch.tensor(norm_val, dtype=torch.float32, device=self.device))
+
+    def rebuild_normalization(self, new_tolerance_factors: dict):
+        """Re-normalize all parameters under a new set of tolerance factors.
+
+        Reads current physical values, updates self.tolerance_factors, then stores
+        parameters normalized by the new Tₙ values.  Use this after overriding
+        individual entries in tolerance_factors to keep physical ↔ internal mapping
+        consistent.
+        """
+        phys = self.get_cartesian_dict()  # de-normalizes with old Tn → physical values
+        self.tolerance_factors = new_tolerance_factors
+        with torch.no_grad():
+            for (n, m), val in phys.items():
+                Tn = new_tolerance_factors[n]
+                if m == 0:
+                    key = f"C_{n}_{m}"
+                    self.coeffs[key].copy_(torch.tensor(val / Tn, dtype=torch.float32, device=self.device))
+                else:
+                    for suffix, v in [('_a', val['a']), ('_b', val['b'])]:
+                        key = f"C_{n}_{m}{suffix}"
+                        self.coeffs[key].copy_(torch.tensor(v / Tn, dtype=torch.float32, device=self.device))
 
 # tcBF
 
@@ -398,7 +449,15 @@ class BFSolver:
         self.max_order = max_order
         self.orig_aberrations = aberrations
         self.parsed_aberrations = Aberrations(aberrations).export(notation='krivanek', style='cartesian', layout='nested')
-        self.ab_state = AberrationState(self.parsed_aberrations, self.max_order, device=device)
+        # Kirkland tolerance factors: T_n = (n+1)·lambda / (8·alpha_max^(n+1))
+        # Normalizing internal parameters by T_n equalizes gradient scales across all orders.
+        alpha_rad = float(self.max_alpha) / 1e3  # mrad -> rad; cast to Python float to prevent numpy float64 propagation
+        self.tolerance_factors = {
+            n: float((n + 1) * self.wavelength / (8 * alpha_rad ** (n + 1)))
+            for n in range(1, max_order + 1)
+        }
+        self.ab_state = AberrationState(self.parsed_aberrations, self.max_order, device=device,
+                                        tolerance_factors=self.tolerance_factors)
         self.eps = eps
         self.device = device
 
@@ -1210,7 +1269,7 @@ class BFSolver:
             if n_layers <= 0:
                 raise ValueError(f"n_layers must be positive, got {n_layers}.")
 
-            c10_center = float(self.ab_state.coeffs['C_1_0'].detach().item())
+            c10_center = self.ab_state.get_physical('C_1_0')
             offsets = (torch.arange(n_layers, device=self.device, dtype=torch.float32) - ((n_layers - 1) / 2.0))
             return c10_center + offsets * slice_thickness
 
@@ -1259,7 +1318,7 @@ class BFSolver:
         try:
             with torch.no_grad():
                 for c10 in c10_axis:
-                    self.ab_state.coeffs['C_1_0'].copy_(c10)
+                    self.ab_state.set_physical('C_1_0', c10)
 
                     # Rebuild only dynamic image caches so static tcBF/acBF caches can be reused.
                     self.reconstructed_image = None
@@ -1626,7 +1685,7 @@ class BFSolver:
         print(f"Optimal C10 found at {optimal_c10:.2f} Ang ({method})")
         
         with torch.no_grad():
-            self.ab_state.coeffs['C_1_0'].copy_(torch.tensor(float(optimal_c10), dtype=torch.float32, device=self.device))
+            self.ab_state.set_physical('C_1_0', float(optimal_c10))
         self.clear_cache(clear_static_cache=False)
         # Store the optimal scan-frame image; get_reconstructed_image applies output_frame rotation on read.
         self.reconstructed_image = scan_stack[optimal_index]
@@ -1657,10 +1716,23 @@ class BFSolver:
         
         return self
 
-    def refine_aberrations(self, lr=1, iters=50, metric='normalized_std', plot_recon_every_n_iter=None, save_dir=None, mode='tcBF', **kwargs):
+    def refine_aberrations(self, lr=1, lr_scales=None, iters=50, metric='normalized_std', plot_recon_every_n_iter=None, save_dir=None, mode='tcBF', **kwargs):
         """ Refine aberration-induced image shifts by minimizing the quality metrics with a negative sign """
         mode = mode.lower()
-        optimizer = torch.optim.Adam(self.ab_state.parameters(), lr=lr)
+        if lr_scales is None:
+            lr_scales = [1.0] * self.max_order
+        lr_scales = list(lr_scales)
+        if len(lr_scales) != self.max_order:
+            raise ValueError(f"lr_scales must have length max_order={self.max_order}, got {len(lr_scales)}")
+        param_groups = []
+        for idx, n in enumerate(range(1, self.max_order + 1)):
+            order_params = [
+                self.ab_state.coeffs[key]
+                for key in self.ab_state.coeffs
+                if int(key.split('_')[1]) == n
+            ]
+            param_groups.append({'params': order_params, 'lr': lr * lr_scales[idx]})
+        optimizer = torch.optim.Adam(param_groups, lr=lr)
 
         for i in range(iters):
             optimizer.zero_grad()
