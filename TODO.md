@@ -29,7 +29,7 @@
 
 ## Pipeline & Integration
 - Add the scan rotation fitting / refinement routine with flipping / transpose determination, probably via Optuna as well
-- Automate the data loading and calibration part (i.e., dk calculation)
+- Automate the data loading part
 - Wrap this as a py4DGUI plugin and push to Muller repo
 - Consider add an export method to output necessary output for downstream PtyRAD (3D object, probe aberrations, meas_flipT, scan_rotation)
 
