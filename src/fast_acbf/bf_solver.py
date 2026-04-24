@@ -15,7 +15,7 @@ from torchvision.transforms import InterpolationMode
 
 from ptyrad.core.functional import fftshift2, ifftshift2, torch_phasor
 from ptyrad.optics.aberrations import Aberrations
-from ptyrad.utils.image_proc import mfft2
+from ptyrad.utils.image_proc import mfft2, guess_radius_of_bright_field_disk
 
 logger = logging.getLogger(__name__)
 
@@ -1866,5 +1866,372 @@ class BFSolver:
         
         if show:
             plt.show()
-            
+
         return fig, ax
+
+
+class ProbeFitter:
+    """
+    Fit aberrations (and optionally k-space amplitude and beam tilt) to a reference
+    complex probe retrieved from experimental data, using automatic differentiation.
+
+    The forward model generates a simulated probe from an AberrationState and minimizes
+    a chosen loss against the reference probe's dominant mode (mode 0).
+
+    Args:
+        reference_probe: (pmode, Ny, Nx) or (Ny, Nx) complex array. Mode 0 is used.
+        max_alpha: BF aperture semi-angle in mrad.
+        wavelength: Electron wavelength in Å.
+        dk: k-space sampling in Å⁻¹. Auto-estimated from the aperture disk if None.
+        max_order: Highest aberration order to model.
+        aberrations: Initial aberration dict {(n,m): val or {'a':val,'b':val}}.
+                     Uses Krivanek/Haider notation via Aberrations parser.
+        rolloff_mrad: Soft-aperture cosine rolloff width in mrad.
+        device: PyTorch device string.
+        optimize_kspace_amplitude: If True, the k-space amplitude envelope becomes
+            a learnable nn.Parameter (initialized to the soft aperture).
+        optimize_beam_tilt: If True, a 2D real-space probe shift (in pixel units)
+            is added as a learnable nn.Parameter and applied via Fourier-domain
+            phase modulation to the simulated probe.
+    """
+
+    def __init__(
+        self,
+        reference_probe,
+        max_alpha: float,
+        wavelength: float,
+        dk: float = None,
+        max_order: int = 4,
+        aberrations: dict = None,
+        rolloff_mrad: float = 0.5,
+        device: str = 'cpu',
+        optimize_kspace_amplitude: bool = False,
+        optimize_beam_tilt: bool = False,
+    ):
+        self.max_alpha = float(max_alpha)
+        self.wavelength = float(wavelength)
+        self.max_order = max_order
+        self.device = device
+        self.optimize_kspace_amplitude = optimize_kspace_amplitude
+        self.optimize_beam_tilt = optimize_beam_tilt
+
+        # Convert reference probe to complex tensor and extract mode 0
+        if not isinstance(reference_probe, torch.Tensor):
+            reference_probe = torch.as_tensor(np.asarray(reference_probe), dtype=torch.complex64)
+        if reference_probe.ndim == 3:
+            reference_probe = reference_probe[0]
+        self.probe_ref = reference_probe.to(torch.complex64).to(device)
+
+        Ny, Nx = self.probe_ref.shape
+
+        # Auto-estimate dk from k-space disk radius if not provided
+        if dk is None:
+            with torch.no_grad():
+                probe_k_power = fftshift2(torch.fft.fft2(self.probe_ref)).abs().pow(2).cpu().numpy()
+            radius_px = guess_radius_of_bright_field_disk(probe_k_power, thresh=0.5)
+            dk = self.max_alpha * 1e-3 / self.wavelength / float(radius_px)
+            logger.info(f"ProbeFitter: estimated dk = {dk:.6f} Å⁻¹ from disk radius {radius_px:.1f} px")
+        self.dk = float(dk)
+
+        # Centered k-space grids (Å⁻¹), shape (Ny, Nx)
+        ky_1d = torch.fft.fftshift(torch.fft.fftfreq(Ny, d=1.0, device=device)) * Ny * self.dk
+        kx_1d = torch.fft.fftshift(torch.fft.fftfreq(Nx, d=1.0, device=device)) * Nx * self.dk
+        self.kY_grid, self.kX_grid = torch.meshgrid(ky_1d, kx_1d, indexing='ij')  # (Ny, Nx)
+
+        # Scattering angle and soft-aperture mask
+        self.alpha = torch.sqrt(self.kX_grid ** 2 + self.kY_grid ** 2) * self.wavelength
+        self.bf_mask = make_soft_aperture_torch(self.alpha, self.max_alpha, rolloff_mrad)
+
+        # Kirkland tolerance factors: T_n = (n+1)*lambda / (8*alpha_max^(n+1))
+        alpha_rad = self.max_alpha / 1e3
+        self.tolerance_factors = {
+            n: float((n + 1) * self.wavelength / (8 * alpha_rad ** (n + 1)))
+            for n in range(1, max_order + 1)
+        }
+
+        # AberrationState
+        if aberrations is None:
+            aberrations = {}
+        parsed = Aberrations(aberrations).export(notation='krivanek', style='cartesian', layout='nested')
+        self.ab_state = AberrationState(
+            parsed, max_order, device=device, tolerance_factors=self.tolerance_factors
+        )
+
+        # Pre-compute aberration basis (Num_Coeffs, Ny, Nx); detached — only coeffs get grad
+        self.chi_basis = generate_aberration_basis(
+            max_order, self.ab_state.order_keys, self.kX_grid, self.kY_grid, self.wavelength
+        ).detach()
+
+        # Learnable k-space amplitude (optional)
+        if optimize_kspace_amplitude:
+            self.kspace_amplitude = nn.Parameter(self.bf_mask.clone())
+        else:
+            self.kspace_amplitude = self.bf_mask  # fixed
+
+        # Beam tilt as real-space sub-pixel shift (ty_px, tx_px); applied post-probe via FFT phase
+        if optimize_beam_tilt:
+            self.beam_tilt = nn.Parameter(torch.zeros(2, device=device))
+        else:
+            self.beam_tilt = torch.zeros(2, device=device)
+
+    # ------------------------------------------------------------------
+    # Preprocessing
+    # ------------------------------------------------------------------
+
+    def center_aperture(self):
+        """Shift probe_ref so its k-space power centroid is at (0, 0).
+
+        Multiplies the real-space probe by a carrier exp(+2πi*(cy*ry/Ny + cx*rx/Nx)),
+        which shifts the k-space disk from (cy, cx) to the center. This does not
+        change |probe_ref|² so it is a no-op for intensity/amplitude losses, but it
+        aligns the k-space phase structure for the 'complex' and '3d_stack' metrics.
+
+        Returns self for method chaining.
+        """
+        Ny, Nx = self.probe_ref.shape
+        with torch.no_grad():
+            probe_k = fftshift2(torch.fft.fft2(self.probe_ref))  # centered k-space
+            power = probe_k.abs().pow(2)
+
+            y_idx = torch.arange(Ny, dtype=torch.float32, device=self.device) - Ny / 2.0
+            x_idx = torch.arange(Nx, dtype=torch.float32, device=self.device) - Nx / 2.0
+            Y_idx, X_idx = torch.meshgrid(y_idx, x_idx, indexing='ij')
+
+            total = power.sum()
+            cy = (power * Y_idx).sum() / total  # centroid y, pixels from center
+            cx = (power * X_idx).sum() / total  # centroid x, pixels from center
+
+            # Carrier that shifts k-space from (cy, cx) to (0, 0)
+            # DFT shift theorem: multiply by exp(+2πi*(cy*ry/Ny + cx*rx/Nx)) to shift FFT by (-cy, -cx)
+            ry = torch.arange(Ny, dtype=torch.float32, device=self.device)
+            rx = torch.arange(Nx, dtype=torch.float32, device=self.device)
+            Ry, Rx = torch.meshgrid(ry, rx, indexing='ij')
+            carrier = torch_phasor(2 * torch.pi * (cy / Ny * Ry + cx / Nx * Rx))
+            self.probe_ref = (self.probe_ref * carrier).to(torch.complex64)
+
+        logger.info(
+            f"ProbeFitter.center_aperture: centroid was ({cy.item():.2f}, {cx.item():.2f}) px from center"
+        )
+        return self
+
+    # ------------------------------------------------------------------
+    # Forward model
+    # ------------------------------------------------------------------
+
+    def get_chi_surface(self):
+        """Compute aberration surface chi (Ny, Nx) in radians, differentiable w.r.t. ab_state."""
+        flat_coeffs = self.ab_state.get_flat_coeffs()  # (Num_Coeffs,) in physical Å
+        return torch.einsum('k,kij->ij', flat_coeffs, self.chi_basis)
+
+    def get_probe(self):
+        """Forward model: AberrationState → simulated complex probe (Ny, Nx).
+
+        Applies optional beam tilt as a Fourier-domain real-space sub-pixel shift
+        (beam_tilt[0] = shift_y in px, beam_tilt[1] = shift_x in px).
+        """
+        chi = self.get_chi_surface()
+        amplitude = (self.bf_mask * self.kspace_amplitude) if self.optimize_kspace_amplitude else self.bf_mask
+        probe_sim = make_probe_from_chi(chi, amplitude)
+
+        if self.optimize_beam_tilt:
+            Ny, Nx = probe_sim.shape
+            ky_f = torch.fft.fftfreq(Ny, device=probe_sim.device)
+            kx_f = torch.fft.fftfreq(Nx, device=probe_sim.device)
+            KY, KX = torch.meshgrid(ky_f, kx_f, indexing='ij')
+            # Shift probe in real space by (beam_tilt[0], beam_tilt[1]) pixels
+            phase = -2 * torch.pi * (self.beam_tilt[0] * KY + self.beam_tilt[1] * KX)
+            probe_sim = torch.fft.ifft2(torch.fft.fft2(probe_sim) * torch_phasor(phase))
+
+        return probe_sim
+
+    # ------------------------------------------------------------------
+    # 3D propagation
+    # ------------------------------------------------------------------
+
+    def _propagate_probe_3d(self, probe, dz_arr, dx):
+        """Propagate complex probe through z-slices using Angular Spectrum Method.
+
+        Implements the same algorithm as ptyrad's near_field_evolution_torch but
+        inlined so it works regardless of which ptyrad version is installed.
+
+        Args:
+            probe: (Ny, Nx) complex tensor.
+            dz_arr: 1D tensor of z positions in Å.
+            dx: Real-space pixel size in Å (isotropic).
+
+        Returns:
+            (Nz, Ny, Nx) real tensor of intensities at each z-slice.
+        """
+        Ny, Nx = probe.shape
+        device = probe.device
+        ygrid = (torch.arange(-Ny // 2, Ny // 2, device=device) + 0.5) / Ny
+        xgrid = (torch.arange(-Nx // 2, Nx // 2, device=device) + 0.5) / Nx
+        k = 2 * torch.pi / self.wavelength
+        ky = 2 * torch.pi * ygrid / dx
+        kx = 2 * torch.pi * xgrid / dx
+        Ky, Kx = torch.meshgrid(ky, kx, indexing='ij')          # (Ny, Nx)
+        kz = torch.sqrt((k ** 2 - Kx ** 2 - Ky ** 2).to(probe.dtype))  # (Ny, Nx)
+        dz_t = dz_arr[:, None, None]                             # (Nz, 1, 1) for broadcasting
+        H = ifftshift2(torch.exp(1j * dz_t * kz))               # (Nz, Ny, Nx), zero-freq at corner
+        probe_k = torch.fft.fft2(probe)                          # (Ny, Nx), unshifted — matches H
+        propagated = torch.fft.ifft2(probe_k[None] * H)          # (Nz, Ny, Nx) complex
+        return propagated.abs().pow(2)
+
+    # ------------------------------------------------------------------
+    # Optimization
+    # ------------------------------------------------------------------
+
+    def fit(
+        self,
+        lr: float = 1.0,
+        lr_scales=None,
+        lr_kspace_amp: float = 0.01,
+        lr_tilt: float = 0.1,
+        iters: int = 100,
+        metric: str = 'intensity',
+        dz_range: tuple = (-200, 200),
+        Nz: int = 41,
+        plot_every_n_iter: int = None,
+        save_dir: str = None,
+    ):
+        """Optimize aberrations to match the reference probe.
+
+        Args:
+            lr: Base learning rate for Adam.
+            lr_scales: Per-order LR scales, list of length max_order (default: all 1.0).
+            lr_kspace_amp: LR for k-space amplitude if optimize_kspace_amplitude=True.
+            lr_tilt: LR for beam tilt if optimize_beam_tilt=True.
+            iters: Number of optimization iterations.
+            metric: 'intensity' | 'amplitude' | 'complex' | '3d_stack'.
+            dz_range: (z_min, z_max) in Å for '3d_stack' metric.
+            Nz: Number of z-slices for '3d_stack' metric.
+            plot_every_n_iter: Plot comparison every N iterations if set.
+            save_dir: Save plot figures to this directory if set.
+
+        Returns:
+            self (for method chaining).
+        """
+        metric = metric.lower()
+        _VALID = ('intensity', 'amplitude', 'complex', '3d_stack')
+        if metric not in _VALID:
+            raise ValueError(f"metric must be one of {_VALID}, got {metric!r}")
+
+        if lr_scales is None:
+            lr_scales = [1.0] * self.max_order
+        lr_scales = list(lr_scales)
+        if len(lr_scales) != self.max_order:
+            raise ValueError(
+                f"lr_scales must have length max_order={self.max_order}, got {len(lr_scales)}"
+            )
+
+        # Per-order param groups (mirrors BFSolver.refine_aberrations)
+        param_groups = []
+        for idx, n in enumerate(range(1, self.max_order + 1)):
+            order_params = [
+                self.ab_state.coeffs[key]
+                for key in self.ab_state.coeffs
+                if int(key.split('_')[1]) == n
+            ]
+            param_groups.append({'params': order_params, 'lr': lr * lr_scales[idx]})
+        if self.optimize_kspace_amplitude:
+            param_groups.append({'params': [self.kspace_amplitude], 'lr': lr_kspace_amp})
+        if self.optimize_beam_tilt:
+            param_groups.append({'params': [self.beam_tilt], 'lr': lr_tilt})
+
+        optimizer = torch.optim.Adam(param_groups, lr=lr)
+
+        # Precompute fixed reference targets (no grad required)
+        with torch.no_grad():
+            probe_ref_amp = self.probe_ref.abs()
+            probe_ref_int = probe_ref_amp.pow(2)
+
+            if metric == '3d_stack':
+                dx = 1.0 / (self.probe_ref.shape[0] * self.dk)
+                dz_arr = torch.linspace(dz_range[0], dz_range[1], Nz, device=self.device)
+                ref_stack_3d = self._propagate_probe_3d(self.probe_ref, dz_arr, dx)
+
+        for i in range(iters):
+            optimizer.zero_grad()
+            probe_sim = self.get_probe()
+
+            if metric == 'intensity':
+                loss = F.mse_loss(probe_sim.abs().pow(2), probe_ref_int)
+            elif metric == 'amplitude':
+                loss = F.mse_loss(probe_sim.abs(), probe_ref_amp)
+            elif metric == 'complex':
+                # Phase-invariant: minimize ||ref||² + ||sim||² - 2|<ref, sim>|
+                # Equivalent to minimizing min_φ ||ref - e^(iφ)*sim||²
+                inner = (self.probe_ref.conj() * probe_sim).sum()
+                loss = probe_ref_int.sum() + probe_sim.abs().pow(2).sum() - 2 * inner.abs()
+            else:  # '3d_stack'
+                dx = 1.0 / (self.probe_ref.shape[0] * self.dk)
+                sim_stack_3d = self._propagate_probe_3d(probe_sim, dz_arr, dx)
+                loss = F.mse_loss(sim_stack_3d, ref_stack_3d)
+
+            loss.backward()
+            optimizer.step()
+
+            if plot_every_n_iter is not None and i % plot_every_n_iter == 0:
+                with torch.no_grad():
+                    ab_str = ", ".join(
+                        f"{k}: {v:.2f}" for k, v in self.get_aberrations_dict(layout='flat').items()
+                    )
+                    logger.info(f"Iter {i:4d} | loss={loss.item():.6g} | {ab_str}")
+                    save_path = (
+                        os.path.join(save_dir, f'probe_fit_iter_{str(i).zfill(4)}.png')
+                        if save_dir is not None else None
+                    )
+                    self.plot_fit(
+                        title_str=f'Iter {i} | Loss ({metric}): {loss.item():.4g}',
+                        save_path=save_path,
+                    )
+
+        return self
+
+    # ------------------------------------------------------------------
+    # Output
+    # ------------------------------------------------------------------
+
+    def get_aberrations_dict(self, notation='krivanek', style='cartesian', layout='nested'):
+        """Return fitted aberration coefficients.
+
+        Args:
+            notation: 'krivanek' or 'haider'.
+            style: 'cartesian' or 'polar'.
+            layout: 'nested' (dict of dicts) or 'flat' (flat dict with string keys).
+        """
+        return Aberrations(self.ab_state.get_cartesian_dict()).export(
+            notation=notation, style=style, layout=layout
+        )
+
+    def print_aberrations(self):
+        """Print the current fitted aberration coefficients."""
+        for k, v in self.get_aberrations_dict(layout='flat').items():
+            print(f"  {k}: {v:.4f} Å")
+
+    def plot_fit(self, title_str=None, save_path=None):
+        """4-panel comparison: reference and fitted probe in real and k-space amplitude."""
+        with torch.no_grad():
+            probe_sim = self.get_probe()
+
+        ref_r = self.probe_ref.abs().detach().cpu().numpy()
+        sim_r = probe_sim.abs().detach().cpu().numpy()
+        ref_k = fftshift2(torch.fft.fft2(self.probe_ref)).abs().detach().cpu().numpy()
+        sim_k = fftshift2(torch.fft.fft2(probe_sim)).abs().detach().cpu().numpy()
+
+        fig, axs = plt.subplots(1, 4, figsize=(16, 4))
+        if title_str is not None:
+            fig.suptitle(title_str)
+
+        axs[0].imshow(ref_r);  axs[0].set_title('Ref |probe|')
+        axs[1].imshow(sim_r);  axs[1].set_title('Sim |probe|')
+        axs[2].imshow(ref_k);  axs[2].set_title('Ref |FFT(probe)|')
+        axs[3].imshow(sim_k);  axs[3].set_title('Sim |FFT(probe)|')
+        for ax in axs:
+            ax.axis('off')
+        plt.tight_layout()
+
+        if save_path is not None:
+            os.makedirs(os.path.dirname(os.path.abspath(save_path)), exist_ok=True)
+            plt.savefig(save_path)
+        plt.show()
