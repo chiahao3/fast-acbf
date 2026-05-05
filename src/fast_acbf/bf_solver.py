@@ -13,7 +13,7 @@ import torch.nn.functional as F
 from torchvision.transforms.functional import gaussian_blur, rotate as tv_rotate
 from torchvision.transforms import InterpolationMode
 
-from ptyrad.core.functional import fftshift2, ifftshift2, torch_phasor
+from ptyrad.core.functional import fftshift2, ifftshift2, near_field_evolution_torch, torch_phasor
 from ptyrad.optics.aberrations import Aberrations
 from ptyrad.utils.image_proc import mfft2, guess_radius_of_bright_field_disk
 
@@ -2051,9 +2051,6 @@ class ProbeFitter:
     def _propagate_probe_3d(self, probe, dz_arr, dx):
         """Propagate complex probe through z-slices using Angular Spectrum Method.
 
-        Implements the same algorithm as ptyrad's near_field_evolution_torch but
-        inlined so it works regardless of which ptyrad version is installed.
-
         Args:
             probe: (Ny, Nx) complex tensor.
             dz_arr: 1D tensor of z positions in Å.
@@ -2062,19 +2059,10 @@ class ProbeFitter:
         Returns:
             (Nz, Ny, Nx) real tensor of intensities at each z-slice.
         """
-        Ny, Nx = probe.shape
-        device = probe.device
-        ygrid = (torch.arange(-Ny // 2, Ny // 2, device=device) + 0.5) / Ny
-        xgrid = (torch.arange(-Nx // 2, Nx // 2, device=device) + 0.5) / Nx
-        k = 2 * torch.pi / self.wavelength
-        ky = 2 * torch.pi * ygrid / dx
-        kx = 2 * torch.pi * xgrid / dx
-        Ky, Kx = torch.meshgrid(ky, kx, indexing='ij')          # (Ny, Nx)
-        kz = torch.sqrt((k ** 2 - Kx ** 2 - Ky ** 2).to(probe.dtype))  # (Ny, Nx)
-        dz_t = dz_arr[:, None, None]                             # (Nz, 1, 1) for broadcasting
-        H = ifftshift2(torch.exp(1j * dz_t * kz))               # (Nz, Ny, Nx), zero-freq at corner
-        probe_k = torch.fft.fft2(probe)                          # (Ny, Nx), unshifted — matches H
-        propagated = torch.fft.ifft2(probe_k[None] * H)          # (Nz, Ny, Nx) complex
+        H = near_field_evolution_torch(probe.shape, dx, dz_arr, self.wavelength,
+                                       dtype=probe.dtype, device=probe.device)
+        probe_k = torch.fft.fft2(probe)                  # (Ny, Nx), corner-centered
+        propagated = torch.fft.ifft2(probe_k[None] * H)  # (Nz, Ny, Nx) complex
         return propagated.abs().pow(2)
 
     # ------------------------------------------------------------------
