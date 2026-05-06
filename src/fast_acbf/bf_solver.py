@@ -449,6 +449,23 @@ class BFSolver:
         self.max_order = max_order
         self.orig_aberrations = aberrations
         self.parsed_aberrations = Aberrations(aberrations).export(notation='krivanek', style='cartesian', layout='nested')
+
+        # Input aberrations are in the detector frame (same frame as rotation_deg and
+        # PtyRAD's probe_aberrations).  Internally ab_state lives in the scan frame, so
+        # we rotate asymmetric (m>0) Cartesian pairs by R(+m·θ) to convert det → scan.
+        _init_rotation = (coord_transform or {}).get('rotation_deg', 0.0)
+        if _init_rotation:
+            _theta = np.deg2rad(_init_rotation)
+            _scan_ab = {}
+            for (n, m), val in self.parsed_aberrations.items():
+                if m == 0:
+                    _scan_ab[(n, m)] = val
+                else:
+                    ca, cb = val['a'], val['b']
+                    c, s = np.cos(m * _theta), np.sin(m * _theta)
+                    _scan_ab[(n, m)] = {'a': ca * c - cb * s, 'b': ca * s + cb * c}
+            self.parsed_aberrations = _scan_ab
+
         # Kirkland tolerance factors: T_n = (n+1)·lambda / (8·alpha_max^(n+1))
         # Normalizing internal parameters by T_n equalizes gradient scales across all orders.
         alpha_rad = float(self.max_alpha) / 1e3  # mrad -> rad; cast to Python float to prevent numpy float64 propagation
@@ -490,10 +507,11 @@ class BFSolver:
         #   for performance.
         #
         # rotation_deg:
-        #   Corrects for a continuous scan rotation angle (the angle between the scan
-        #   fast-axis and the detector kX axis). Positive = CCW rotation of k-vectors.
+        #   Scan rotation angle in the detector frame (the angle between the scan
+        #   fast-axis and the detector kX axis, CCW positive as seen on screen).
         #   Maps to PtyRAD's `pos_scan_affine = [1, 0, rotation_deg, 0]` (same value,
-        #   same sign).
+        #   same sign).  Input `aberrations` are also expected in the detector frame and
+        #   are converted to the scan frame internally during initialisation.
         self.coord_transform = coord_transform or {
             'flipud': False,
             'fliplr': False,
@@ -575,15 +593,15 @@ class BFSolver:
 
     def _get_detector_frame_cartesian_dict(self):
         """
-        Return aberration coefficients converted from the scan frame back to the
-        detector frame.
+        Return aberration coefficients converted from the internal scan frame back to
+        the detector frame (inverting the det→scan rotation applied at initialisation).
 
         The scan frame is the detector frame further rotated CCW by rotation_deg.
-        Inverting that rotation (rotating by +rotation_deg) recovers the detector-frame
-        representation.  For symmetric terms (m=0, e.g. C10, C30) the value is
-        invariant.  For asymmetric terms (m>0) the Cartesian (a, b) pair transforms as:
-            Ca_det = Ca_scan * cos(m·θ) - Cb_scan * sin(m·θ)
-            Cb_det = Ca_scan * sin(m·θ) + Cb_scan * cos(m·θ)
+        Inverting that rotation recovers the detector-frame representation via R(−m·θ).
+        For symmetric terms (m=0, e.g. C10, C30) the value is invariant.
+        For asymmetric terms (m>0) the Cartesian (a, b) pair transforms as:
+            Ca_det =  Ca_scan * cos(m·θ) + Cb_scan * sin(m·θ)
+            Cb_det = −Ca_scan * sin(m·θ) + Cb_scan * cos(m·θ)
         where θ = rotation_deg in radians.
         """
         theta = np.deg2rad(self.coord_transform.get('rotation_deg', 0.0))
@@ -597,7 +615,7 @@ class BFSolver:
             else:
                 ca, cb = val['a'], val['b']
                 c, s = np.cos(m * theta), np.sin(m * theta)
-                out[(n, m)] = {'a': ca * c - cb * s, 'b': ca * s + cb * c}
+                out[(n, m)] = {'a': ca * c + cb * s, 'b': -ca * s + cb * c}
         return out
 
     def _get_effective_ab_state(self, in_scan_frame):
@@ -1330,7 +1348,7 @@ class BFSolver:
                     if not self._in_scan_frame(output_frame) and rotation_deg:
                         img = tv_rotate(
                             img.unsqueeze(0),
-                            angle=-rotation_deg,
+                            angle=rotation_deg,
                             interpolation=InterpolationMode.BILINEAR,
                         ).squeeze(0)
 
@@ -1535,7 +1553,7 @@ class BFSolver:
         rotation_deg = self.coord_transform.get('rotation_deg', 0.0)
         if not self._in_scan_frame(output_frame) and rotation_deg:
             # tv_rotate expects (..., H, W) and angle in degrees (CCW positive)
-            img = tv_rotate(img.unsqueeze(0), angle=-rotation_deg,
+            img = tv_rotate(img.unsqueeze(0), angle=rotation_deg,
                             interpolation=InterpolationMode.BILINEAR).squeeze(0)
 
         return img
