@@ -1422,19 +1422,23 @@ class BFSolver:
         """
         Return aberration surface chi. Note: psi = exp(-1j*chi).
 
-        The chi surface is computed exactly in the requested frame — k-grids and
-        aberration coefficients are both expressed in the same frame, so no
-        interpolation or approximation is involved.
+        The chi/probe raster is always the canonical flip/transpose-corrected
+        detector raster.  ``output_frame`` selects which coefficient frame is
+        evaluated on that raster.  This avoids rotating both the k-grid and the
+        asymmetric aberration coefficients, which would cancel the visual frame
+        change in probe/chi plots.
 
         output_frame=None        → uses self.output_frame (global default).
-        output_frame='scan'      → chi in the scan frame (k-grid rotated by rotation_deg,
-                                   coefficients as fitted).
-        output_frame='detector'  → chi in the detector frame (flip-corrected k-grid,
-                                   coefficients converted back from the scan frame).
+        output_frame='scan'      → scan-frame coefficients as fitted, sampled on the
+                                   canonical output raster for visualization.
+        output_frame='detector'  → detector-frame coefficients converted back from the
+                                   scan frame, sampled on the canonical output raster.
                                    Ready to use as a probe seed in PtyRAD.
         """
         in_scan = self._in_scan_frame(output_frame)
-        kX_grid, kY_grid = self._get_transformed_k_grids(in_scan_frame=in_scan)
+        # Keep the raster fixed so the chosen coefficient frame controls the visual
+        # orientation instead of being canceled by an equal k-grid rotation.
+        kX_grid, kY_grid = self._get_transformed_k_grids(in_scan_frame=False)
         ab_state = self._get_effective_ab_state(in_scan)
 
         chi_basis = generate_aberration_basis(
@@ -1635,11 +1639,15 @@ class BFSolver:
         """
         Return the complex probe wavefield.
 
-        The probe is computed exactly in the requested frame (same as get_chi_surface).
+        The probe is built from ``get_chi_surface(output_frame=...)``.  The returned
+        array is sampled on the canonical flip/transpose-corrected detector raster;
+        ``output_frame`` selects whether scan-frame or detector-frame aberration
+        coefficients are used.
 
         output_frame=None        → uses self.output_frame (global default).
-        output_frame='scan'      → probe in the scan frame (as fitted).
-        output_frame='detector'  → probe in the detector frame, ready for PtyRAD.
+        output_frame='scan'      → probe from fitted scan-frame coefficients, useful
+                                   for visualizing orientation relative to the scan.
+        output_frame='detector'  → probe from detector-frame coefficients, ready for PtyRAD.
         """
         probe = make_probe_from_chi(self.get_chi_surface(output_frame=output_frame), self.bf_mask)
         return probe
