@@ -97,6 +97,37 @@ class TestFlatCoeffs:
         assert flat[2].item() == pytest.approx(float(cart[(1, 2)]['b']), abs=1e-4)
 
 
+# ── to_scan_frame ─────────────────────────────────────────────────────────────
+
+class TestToScanFrame:
+
+    def test_zero_rotation_matches_flat(self, full_ab_dict):
+        state = AberrationState(full_ab_dict, max_order=2, device='cpu')
+        torch.testing.assert_close(state.to_scan_frame(0.0), state.get_flat_coeffs())
+
+    def test_asymmetric_pair_rotates_by_m_theta(self, full_ab_dict):
+        state = AberrationState(full_ab_dict, max_order=2, device='cpu')
+        flat = state.get_flat_coeffs()
+        scan = state.to_scan_frame(30.0)
+
+        theta = torch.tensor(2 * 30.0 * torch.pi / 180.0, dtype=torch.float32)
+        expected_a = flat[1] * torch.cos(theta) - flat[2] * torch.sin(theta)
+        expected_b = flat[1] * torch.sin(theta) + flat[2] * torch.cos(theta)
+
+        torch.testing.assert_close(scan[0], flat[0])
+        torch.testing.assert_close(scan[1], expected_a)
+        torch.testing.assert_close(scan[2], expected_b)
+
+    def test_gradients_flow_to_detector_parameters(self, full_ab_dict):
+        state = AberrationState(full_ab_dict, max_order=2, device='cpu')
+        loss = state.to_scan_frame(17.0).square().sum()
+        loss.backward()
+
+        grads = [param.grad for param in state.coeffs.values()]
+        assert all(grad is not None for grad in grads)
+        assert any(torch.any(grad != 0) for grad in grads)
+
+
 # ── get_cartesian_dict ────────────────────────────────────────────────────────
 
 class TestCartesianDict:

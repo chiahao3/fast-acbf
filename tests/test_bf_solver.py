@@ -68,6 +68,22 @@ class TestBFSolverInit:
                 upscale_method="bilinear",
             )
 
+    def test_no_global_output_frame_state(self, solver_zero_ab):
+        assert not hasattr(solver_zero_ab, "output_frame")
+
+    def test_rotation_deg_is_updated_via_setter(self, solver_zero_ab):
+        with pytest.raises(AttributeError):
+            solver_zero_ab.rotation_deg = 12.0
+
+        solver_zero_ab.set_rotation_deg(12.0)
+        assert solver_zero_ab.rotation_deg == pytest.approx(12.0)
+        assert solver_zero_ab.coord_transform["rotation_deg"] == pytest.approx(12.0)
+        solver_zero_ab.set_rotation_deg(0.0)
+
+    def test_invalid_reconstruction_frame_raises(self, solver_zero_ab):
+        with pytest.raises(ValueError, match="frame"):
+            solver_zero_ab.get_tcBF(frame="detetor")
+
 
 # ── get_chi_surface ───────────────────────────────────────────────────────────
 
@@ -253,6 +269,116 @@ class TestGetAberrationsDict:
         ab_dict = solver_nonzero_ab.get_aberrations_dict()
         for key in ab_dict.keys():
             assert isinstance(key, tuple) and len(key) == 2
+
+    def test_detector_frame_export_ignores_scan_rotation(self, synth_dataset, synth_params, device):
+        p = synth_params
+        aberrations = {"C10": 50.0, "C12": 10.0, "phi12": 30.0}
+        kwargs = dict(
+            dataset=synth_dataset,
+            max_alpha=p["max_alpha"],
+            scan_step_size=p["scan_step_size"],
+            dk=p["dk"],
+            wavelength=p["wavelength"],
+            max_order=2,
+            aberrations=aberrations,
+            device=device,
+        )
+        reference = BFSolver(**kwargs).get_aberrations_dict(layout='flat')
+        rotated = BFSolver(
+            **kwargs,
+            coord_transform={'rotation_deg': 37.0},
+        ).get_aberrations_dict(frame='detector', layout='flat')
+
+        assert rotated.keys() == reference.keys()
+        for key in reference:
+            assert rotated[key] == pytest.approx(reference[key], abs=1e-4)
+
+    def test_scan_frame_export_matches_rotated_detector_coefficients(self, synth_dataset, synth_params, device):
+        p = synth_params
+        solver = BFSolver(
+            dataset=synth_dataset,
+            max_alpha=p["max_alpha"],
+            scan_step_size=p["scan_step_size"],
+            dk=p["dk"],
+            wavelength=p["wavelength"],
+            max_order=2,
+            aberrations={"C10": 50.0, "C12": 10.0, "phi12": 30.0},
+            coord_transform={'rotation_deg': 37.0},
+            device=device,
+        )
+
+        det_flat = solver.ab_state.get_flat_coeffs()
+        scan_flat = solver.ab_state.to_scan_frame(solver.rotation_deg)
+
+        # Locate the C12 (n=1, m=2) pair in the flat layout.
+        idx = 0
+        for (n, m) in solver.ab_state.order_keys:
+            if (n, m) == (1, 2):
+                break
+            idx += 1 if m == 0 else 2
+
+        theta = 2 * solver.rotation_deg * np.pi / 180.0
+        ca, cb = det_flat[idx].item(), det_flat[idx + 1].item()
+
+        # C10 is symmetric; scan frame must equal detector frame.
+        assert scan_flat[0].item() == pytest.approx(det_flat[0].item(), abs=1e-5)
+        # C12a/b rotate by m*theta.
+        assert scan_flat[idx].item()     == pytest.approx(ca * np.cos(theta) - cb * np.sin(theta), abs=1e-4)
+        assert scan_flat[idx + 1].item() == pytest.approx(ca * np.sin(theta) + cb * np.cos(theta), abs=1e-4)
+
+    def test_scan_frame_public_export_uses_rotated_coefficients(self, synth_dataset, synth_params, device):
+        p = synth_params
+        solver = BFSolver(
+            dataset=synth_dataset,
+            max_alpha=p["max_alpha"],
+            scan_step_size=p["scan_step_size"],
+            dk=p["dk"],
+            wavelength=p["wavelength"],
+            max_order=2,
+            aberrations={"C10": 50.0, "C12": 10.0, "phi12": 30.0},
+            coord_transform={'rotation_deg': 37.0},
+            device=device,
+        )
+
+        exported = solver.get_aberrations_dict(frame='scan', layout='nested')
+        expected = solver._flat_to_cartesian_dict(solver.ab_state.to_scan_frame(solver.rotation_deg))
+
+        assert exported[(1, 0)] == pytest.approx(expected[(1, 0)], abs=1e-4)
+        assert exported[(1, 2)]['a'] == pytest.approx(expected[(1, 2)]['a'], abs=1e-3)
+        assert exported[(1, 2)]['b'] == pytest.approx(expected[(1, 2)]['b'], abs=1e-3)
+
+    def test_invalid_frame_raises(self, solver_nonzero_ab):
+        with pytest.raises(ValueError, match="frame"):
+            solver_nonzero_ab.get_aberrations_dict(frame='detetor')
+
+
+# ── Frame cache behavior ─────────────────────────────────────────────────────
+
+class TestFrameCacheBehavior:
+
+    def test_rotation_change_misses_static_cache_and_clears_image_cache(self, synth_dataset, synth_params, device):
+        p = synth_params
+        solver = BFSolver(
+            dataset=synth_dataset,
+            max_alpha=p["max_alpha"],
+            scan_step_size=p["scan_step_size"],
+            dk=p["dk"],
+            wavelength=p["wavelength"],
+            max_order=2,
+            aberrations={"C10": 0.0},
+            device=device,
+        )
+
+        solver.get_tcBF(chunk_size=8)
+        assert len(solver._cache_store) == 1
+        assert len(solver._reconstructed_images) == 1
+
+        solver.set_rotation_deg(15.0)
+        assert len(solver._reconstructed_images) == 0
+
+        solver.get_tcBF(chunk_size=8)
+        assert len(solver._cache_store) == 2
+        assert len(solver._reconstructed_images) == 1
 
 
 # ── QualityMetrics ────────────────────────────────────────────────────────────
