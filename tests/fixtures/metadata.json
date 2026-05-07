@@ -1,0 +1,14 @@
+{
+  "zarr_path": "/home/cl2696/scratch/test_1_static_cell_30_30_5_80kv_coherent_probe_ca_25_cl_139_C10_0_t_1_Nscans_64_64_dp_200/cbed.zarr",
+  "max_alpha_mrad": 25.0,
+  "wavelength_ang": 0.04176,
+  "scan_step_ang": 0.2,
+  "npix": 200,
+  "dk": 0.03328544061302682,
+  "aberrations": {
+    "C10": 2.5
+  },
+  "max_order": 2,
+  "device_used": "cuda",
+  "fast_acbf_version": "0.0.1"
+}

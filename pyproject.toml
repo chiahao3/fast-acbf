@@ -34,6 +34,21 @@ where = ["src"]
 [tool.setuptools.dynamic]
 version = {attr = "fast_acbf.__version__"}
 
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+    "pytest-cov>=5.0",
+    "zarr>=3.0",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-v --tb=short"
+markers = [
+    "regression: tests requiring real data fixtures (skip with -m 'not regression')",
+]
+filterwarnings = ["ignore::UserWarning"]
+
 [project.urls]
 Repository = "https://github.com/chiahao3/fast-acbf"
 "PtyRAD" = "https://github.com/chiahao3/ptyrad"
