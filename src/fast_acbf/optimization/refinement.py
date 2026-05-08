@@ -327,7 +327,7 @@ def refine_flips(
 
 
 # ---------------------------------------------------------------------------
-# O(2) orientation helpers — used by refine_params
+# O(2) orientation helpers — used by refine_all_params
 # ---------------------------------------------------------------------------
 
 # D4 lookup table: maps (is_flipped, q) -> (flipud, fliplr, transpose).
@@ -477,7 +477,7 @@ def _orientation_grid_search(
 # High-level orchestrator
 # ---------------------------------------------------------------------------
 
-def refine_params(
+def refine_all_params(
     solver,
     targets=('orientation_defocus', 'coarse_aberrations', 'fine_rotation', 'fine_aberrations'),
     metric: str = 'normalized_std',

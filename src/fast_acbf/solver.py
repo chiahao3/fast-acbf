@@ -507,7 +507,7 @@ class BFSolver:
         from fast_acbf.optimization import refinement
         return refinement.refine_flips(self, **kwargs)
 
-    def refine_params(
+    def refine_all_params(
         self,
         targets=('orientation_defocus', 'coarse_aberrations', 'fine_rotation', 'fine_aberrations'),
         metric: str = 'normalized_std',
@@ -522,9 +522,9 @@ class BFSolver:
         aberration_iters: int = 50,
         **kwargs,
     ) -> 'BFSolver':
-        """Coarse-to-fine parameter orchestration. See optimization.refinement.refine_params."""
+        """Coarse-to-fine parameter orchestration. See optimization.refinement.refine_all_params."""
         from fast_acbf.optimization import refinement
-        refinement.refine_params(
+        refinement.refine_all_params(
             self,
             targets=targets,
             metric=metric,
