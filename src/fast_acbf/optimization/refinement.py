@@ -107,7 +107,7 @@ def refine_defocus(
     blur: bool = True,
     blur_kernel_size: int = 5,
     blur_sigma: float = 1,
-    plot_line_search: bool = True,
+    plot_search: bool = True,
     mode: str = 'tcBF',
     **kwargs,
 ) -> None:
@@ -127,7 +127,7 @@ def refine_defocus(
         blur:             Pre-blur images before scoring.
         blur_kernel_size: Kernel size for Gaussian blur.
         blur_sigma:       Sigma for Gaussian blur.
-        plot_line_search: Show matplotlib line-search summary.
+        plot_search:      Show matplotlib line-search summary.
         mode:             Reconstruction mode ('tcBF' or 'acBF').
     """
     mode = mode.lower()
@@ -172,7 +172,7 @@ def refine_defocus(
         solver.ab_state.set_physical('C_1_0', float(optimal_c10))
     solver.reconstructed_image = scan_stack[optimal_index]
 
-    if plot_line_search:
+    if plot_search:
         from fast_acbf.vis.plotting import plot_defocus_line_search
         plot_defocus_line_search(
             c10_axis_np=c10_axis_np,
@@ -294,6 +294,7 @@ def refine_scan_rotation(
     search_range: tuple,
     num_points: int = 9,
     metric: str = 'laplacian',
+    plot_search: bool = True,
     mode: str = 'tcBF',
     **kwargs,
 ) -> None:
@@ -309,6 +310,7 @@ def refine_scan_rotation(
         search_range: (min_deg, max_deg) rotation range to search.
         num_points:   Number of angles to sample.
         metric:       Focus metric for QualityMetrics.evaluate.
+        plot_search:  Show matplotlib line-search summary.
         mode:         Reconstruction mode.
     """
     mode = mode.lower()
@@ -318,6 +320,8 @@ def refine_scan_rotation(
 
     original_rotation = solver.rotation_deg
     scores = []
+    best_score = -np.inf
+    best_image = None
 
     try:
         with torch.no_grad():
@@ -328,7 +332,11 @@ def refine_scan_rotation(
                 # needed at a time.
                 solver.set_rotation_deg(float(angle), clear_basis=True)
                 img = solver.reconstruct(mode=mode, **kwargs)
-                scores.append(QualityMetrics.evaluate(img, metric=metric).item())
+                score = QualityMetrics.evaluate(img, metric=metric).item()
+                scores.append(score)
+                if score > best_score:
+                    best_score = score
+                    best_image = img.detach().clone()
     finally:
         solver.set_rotation_deg(original_rotation)
 
@@ -338,17 +346,28 @@ def refine_scan_rotation(
 
     print(f"Optimal rotation found at {optimal_rotation:.2f} deg")
     solver.set_rotation_deg(optimal_rotation, clear_basis=True)
-    solver.reconstructed_image = None # Clear stale image from last swept angle
+    solver.reconstructed_image = best_image
+
+    if plot_search:
+        from fast_acbf.vis.plotting import plot_rotation_line_search
+        plot_rotation_line_search(
+            angles_deg=angles,
+            quality_scores=scores,
+            optimal_rotation=optimal_rotation,
+            metric=metric,
+            mode=mode,
+        )
 
 
 def refine_flips(
     solver,
     metric: str = 'laplacian',
+    plot_search: bool = True,
     mode: str = 'tcBF',
     **kwargs,
 ) -> dict:
     """
-    Exhaustive search over all 4 flip/transpose combinations.
+    Exhaustive search over all 8 flip/transpose combinations.
 
     Tests all combinations of (flipud, fliplr, transpose) using the current
     rotation_deg, then sets the best combination via solver.coord_transform
@@ -357,6 +376,7 @@ def refine_flips(
     Args:
         solver: Solver-like object.
         metric: Focus metric for QualityMetrics.evaluate.
+        plot_search: Show 2×4 reconstruction panel summary.
         mode:   Reconstruction mode.
 
     Returns:
@@ -378,6 +398,9 @@ def refine_flips(
     }
 
     results = {}
+    plot_images = []
+    best_score = -np.inf
+    best_image = None
     try:
         with torch.no_grad():
             for (flipud, fliplr, transpose) in combos:
@@ -388,6 +411,11 @@ def refine_flips(
                 img = solver.reconstruct(mode=mode, **kwargs)
                 score = QualityMetrics.evaluate(img, metric=metric).item()
                 results[(flipud, fliplr, transpose)] = score
+                if score > best_score:
+                    best_score = score
+                    best_image = img.detach().clone()
+                if plot_search:
+                    plot_images.append(img.detach().cpu().numpy())
     finally:
         solver.coord_transform.update(original)
         solver.clear_basis_cache()
@@ -402,6 +430,17 @@ def refine_flips(
     solver.coord_transform['fliplr']    = best_combo[1]
     solver.coord_transform['transpose'] = best_combo[2]
     solver.clear_basis_cache()
+    solver.reconstructed_image = best_image
+
+    if plot_search:
+        from fast_acbf.vis.plotting import plot_flips_grid_search
+        plot_flips_grid_search(
+            images=plot_images,
+            scores={combo: results[combo] for combo in combos},
+            best_combo=best_combo,
+            metric=metric,
+            mode=mode,
+        )
 
     return results
 
@@ -640,3 +679,8 @@ def refine_all_params(
             scan_roi=refinement_scan_roi,
             **kwargs,
         )
+    
+    # Save the final image based on the retrieved params
+    solver.reconstructed_image = solver.reconstruct(
+        mode=mode, requires_grad=False, **kwargs,
+    ).detach()

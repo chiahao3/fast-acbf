@@ -291,22 +291,78 @@ class TestAutogradBoundary:
         solver.refine_defocus(
             search_range=(40.0, 60.0),
             num_points=3,
-            plot_line_search=False,
+            plot_search=False,
             chunk_size=8,
         )
         assert solver.reconstructed_image is not None
         assert not solver.reconstructed_image.requires_grad
 
-        solver.refine_flips(chunk_size=8)
+        solver.refine_flips(chunk_size=8, plot_search=False)
         assert solver.reconstructed_image is not None
         assert not solver.reconstructed_image.requires_grad
+        torch.testing.assert_close(
+            solver.reconstructed_image,
+            solver.reconstruct(mode='tcBF', chunk_size=8),
+            atol=1e-6,
+            rtol=1e-6,
+        )
+
+        solver.refine_scan_rotation(
+            search_range=(-1.0, 1.0),
+            num_points=3,
+            plot_search=False,
+            chunk_size=8,
+        )
+        assert solver.reconstructed_image is not None
+        assert not solver.reconstructed_image.requires_grad
+        torch.testing.assert_close(
+            solver.reconstructed_image,
+            solver.reconstruct(mode='tcBF', chunk_size=8),
+            atol=1e-6,
+            rtol=1e-6,
+        )
+
+    def test_refine_scan_rotation_plot_receives_scores(self, synth_dataset, synth_params, device, monkeypatch):
+        from fast_acbf.vis import plotting
+
+        solver = self._make_solver(synth_dataset, synth_params, device)
+        captured = {}
+
+        def fake_plot(**kwargs):
+            captured.update(kwargs)
+
+        monkeypatch.setattr(plotting, "plot_rotation_line_search", fake_plot)
 
         solver.refine_scan_rotation(
             search_range=(-1.0, 1.0),
             num_points=3,
             chunk_size=8,
         )
-        assert solver.reconstructed_image is None
+
+        assert captured["angles_deg"].shape == (3,)
+        assert captured["quality_scores"].shape == (3,)
+        assert captured["optimal_rotation"] in captured["angles_deg"]
+        assert captured["metric"] == "laplacian"
+        assert captured["mode"] == "tcbf"
+
+    def test_refine_flips_plot_receives_eight_panels(self, synth_dataset, synth_params, device, monkeypatch):
+        from fast_acbf.vis import plotting
+
+        solver = self._make_solver(synth_dataset, synth_params, device)
+        captured = {}
+
+        def fake_plot(**kwargs):
+            captured.update(kwargs)
+
+        monkeypatch.setattr(plotting, "plot_flips_grid_search", fake_plot)
+
+        results = solver.refine_flips(chunk_size=8)
+
+        assert len(captured["images"]) == 8
+        assert len(captured["scores"]) == 8
+        assert captured["best_combo"] == results["best"]
+        assert captured["best_combo"] in captured["scores"]
+        assert captured["images"][0].shape == synth_dataset.shape[:2]
 
     def test_roi_refine_aberrations_updates_full_solver_no_grad(self, synth_dataset, synth_params, device):
         solver = self._make_solver(
@@ -334,6 +390,28 @@ class TestAutogradBoundary:
         assert any(after[key] != pytest.approx(before[key]) for key in before)
         assert solver.reconstructed_image.shape == synth_dataset.shape[:2]
         assert not solver.reconstructed_image.requires_grad
+
+    def test_refine_all_params_always_refreshes_final_image(self, synth_dataset, synth_params, device):
+        solver = self._make_solver(synth_dataset, synth_params, device)
+
+        solver.refine_all_params(
+            targets=('orientation_defocus',),
+            defocus_range=(40.0, 60.0),
+            rotation_num_points=2,
+            defocus_num_points=2,
+            mode='tcBF',
+            metric='laplacian',
+            chunk_size=8,
+        )
+
+        assert solver.reconstructed_image is not None
+        assert not solver.reconstructed_image.requires_grad
+        torch.testing.assert_close(
+            solver.reconstructed_image,
+            solver.reconstruct(mode='tcBF', chunk_size=8),
+            atol=1e-6,
+            rtol=1e-6,
+        )
 
 
 # ── get_defocus_stack ─────────────────────────────────────────────────────────
@@ -768,7 +846,7 @@ class TestBFImageCacheSplit:
         solver.get_tcBF(chunk_size=8)
         fft_obj = solver._fft_cache
 
-        refine_flips(solver, mode='tcBF', metric='laplacian')
+        refine_flips(solver, mode='tcBF', metric='laplacian', plot_search=False)
 
         assert solver._fft_cache is fft_obj
 
@@ -784,6 +862,7 @@ class TestBFImageCacheSplit:
             num_points=3,
             mode='tcBF',
             metric='laplacian',
+            plot_search=False,
             chunk_size=8,
         )
 

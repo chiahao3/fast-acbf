@@ -128,3 +128,63 @@ def plot_defocus_line_search(
     ax.grid(True, linestyle=':', alpha=0.7)
     plt.tight_layout()
     plt.show()
+
+
+def plot_rotation_line_search(
+    angles_deg: np.ndarray,
+    quality_scores: np.ndarray,
+    optimal_rotation: float,
+    metric: str,
+    mode: str,
+):
+    """Scatter plot for scan-rotation line search results."""
+    optimal_index = int(np.argmax(quality_scores))
+
+    fig, ax = plt.subplots(figsize=(8, 5))
+    ax.plot(angles_deg, quality_scores, color='dodgerblue', linewidth=1.5, zorder=4)
+    ax.scatter(angles_deg, quality_scores, color='dodgerblue', s=55,
+               label='Tested Points', zorder=5)
+    ax.scatter(
+        [optimal_rotation], [quality_scores[optimal_index]],
+        color='crimson', s=150, marker='*',
+        label=f'Optimal ({optimal_rotation:.2f} deg)', zorder=6,
+    )
+    ax.set_xlabel('Scan Rotation (deg)', fontsize=12)
+    ax.set_ylabel(f'Focus Score ({metric.capitalize()})', fontsize=12)
+    ax.set_title(f'Scan Rotation Line Search ({mode}, {metric})', fontsize=14)
+    ax.legend()
+    ax.grid(True, linestyle=':', alpha=0.7)
+    plt.tight_layout()
+    plt.show()
+
+
+def plot_flips_grid_search(
+    images: list,
+    scores: dict,
+    best_combo: tuple,
+    metric: str,
+    mode: str,
+):
+    """2×4 reconstruction panel grid for flip/transpose exhaustive search."""
+    stack = np.stack(images, axis=0)
+    vmin = np.percentile(stack, 0.001)
+    vmax = np.percentile(stack, 99.99)
+
+    combos = list(scores.keys())
+    fig, axs = plt.subplots(2, 4, figsize=(14, 7))
+    for ax, combo, img in zip(axs.flat, combos, images):
+        flipud, fliplr, transpose = combo
+        ax.imshow(img, vmin=vmin, vmax=vmax)
+        score = scores[combo]
+        winner = "BEST | " if combo == best_combo else ""
+        ax.set_title(
+            f"{winner}ud={int(flipud)} lr={int(fliplr)} T={int(transpose)}\n"
+            f"{metric}: {score:.4g}",
+            fontsize=10,
+        )
+        ax.set_xticks([])
+        ax.set_yticks([])
+
+    fig.suptitle(f'Flip/Transpose Search ({mode}, {metric})', fontsize=14)
+    plt.tight_layout()
+    plt.show()

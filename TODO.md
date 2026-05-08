@@ -7,11 +7,6 @@
   boolean flags to enable/disable each step. Should accept a shared `mode` and `metric` and
   handle cache invalidation between steps automatically.
 
-- **Visualization for `refine_scan_rotation` and `refine_flips`** — `refine_scan_rotation`
-  needs a score-vs-angle plot (analogous to the defocus line-search plot). `refine_flips`
-  needs a 2×4 panel grid showing the reconstructed image for each of the 8 flip/transpose
-  permutations with its focus score in the title, so the user can visually confirm the winner.
-
 - **Improve `normalized_std` metric for acBF** — acBF images can have inverted contrast
   relative to tcBF; `normalized_std` is sign-agnostic but maximizing it can converge to the
   wrong polarity. Options: (a) detect and flip sign before scoring, (b) score on
@@ -76,7 +71,7 @@
 - soft aperture with cosine rolloff (`rolloff` param in `reconstruct()`)
 - multiple focus quality metrics: `laplacian` (variance of Laplacian), `sobel` (Tenengrad), `normalized_std`
 - coordinate transform flags (flipud, fliplr, transpose, rotation_deg) matching PtyRAD's `meas_flipT`; used when computing scan-frame vs detector-frame outputs
-- visualization: shift quiver over BF disk (`plot_shift_quiver`), chi surface (`plot_chi_surface`), reconstruction + probe side-by-side (`plot_reconstruction`)
+- visualization: shift quiver over BF disk (`plot_shift_quiver`), chi surface (`plot_chi_surface`), reconstruction + probe side-by-side (`plot_reconstruction`), defocus/rotation line searches, flip/transpose search grid
 - `get_acBF_diagnostics`: returns transfer power map, support mask, and complex image channels for complex-inversion debugging
 - Export 3D defocus volume stack (`get_defocus_stack`)
 - Modular package structure: `core/` (portable physics), `pipeline.py` (caching), `optimization/` (metrics + refinement), `vis/` (plotting)
