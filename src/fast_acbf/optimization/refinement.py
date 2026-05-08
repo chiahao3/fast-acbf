@@ -246,7 +246,11 @@ def refine_scan_rotation(
     try:
         with torch.no_grad():
             for angle in angles:
-                solver.set_rotation_deg(float(angle))
+                # clear_static_cache=True: each angle produces a distinct cache key; without
+                # clearing, all num_points entries accumulate in _cache_store simultaneously.
+                # This sweep is sequential and never revisits angles, so only one entry is
+                # needed at a time.
+                solver.set_rotation_deg(float(angle), clear_static_cache=True)
                 img = solver.reconstruct(mode=mode, **kwargs)
                 scores.append(QualityMetrics.evaluate(img, metric=metric).item())
     finally:
@@ -442,8 +446,9 @@ def _orientation_grid_search(
                 solver.clear_cache()
 
                 for angle in angles:
-                    # Rotation change: updates cache key without clearing old entries
-                    solver.set_rotation_deg(float(angle))
+                    # clear_static_cache=True: sequential search never revisits old angles,
+                    # so accumulating per-angle cache entries only wastes memory.
+                    solver.set_rotation_deg(float(angle), clear_static_cache=True)
                     for c10 in c10_values:
                         solver.ab_state.set_physical('C_1_0', float(c10))
                         img = solver.reconstruct(mode=mode, **kwargs)
