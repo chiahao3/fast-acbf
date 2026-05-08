@@ -15,7 +15,6 @@ attribute writes, so that BFSolver's cache invalidation logic stays intact.
 
 from __future__ import annotations
 
-import contextlib
 import os
 
 import numpy as np
@@ -262,7 +261,7 @@ def refine_scan_rotation(
 
     print(f"Optimal rotation found at {optimal_rotation:.2f} deg")
     solver.set_rotation_deg(optimal_rotation)
-    solver.reconstructed_image = None  # invalidate stale cache
+    solver.reconstructed_image = None # Clear stale image from last swept angle
 
 
 def refine_flips(
@@ -379,25 +378,6 @@ def map_to_ptyrad_state(if_transposed: bool, opt_angle_deg: float) -> dict:
     }
 
 
-@contextlib.contextmanager
-def _chirality_state(solver, if_transposed: bool):
-    """Temporarily set chirality (transpose flag only, flipud/fliplr reset); restore on exit."""
-    original = {k: solver.coord_transform.get(k) for k in ('flipud', 'fliplr', 'transpose')}
-    original_rotation = solver.rotation_deg
-    try:
-        solver.coord_transform['flipud'] = False
-        solver.coord_transform['fliplr'] = False
-        solver.coord_transform['transpose'] = if_transposed
-        solver.clear_cache()
-        yield
-    finally:
-        solver.coord_transform['flipud']    = original['flipud']
-        solver.coord_transform['fliplr']    = original['fliplr']
-        solver.coord_transform['transpose'] = original['transpose']
-        solver.set_rotation_deg(original_rotation)
-        solver.clear_cache()
-
-
 def _orientation_grid_search(
     solver,
     defocus_range: tuple,
@@ -412,8 +392,9 @@ def _orientation_grid_search(
     defocus values. Applies the best (chirality, angle, C_1_0) state to solver, decomposed
     to PtyRAD D4 flags via map_to_ptyrad_state.
 
-    Only 2 full cache clears occur (one per chirality); rotation changes accumulate cache
-    entries without clearing, keeping the static geometry tensors alive across the sweep.
+    Cache discipline: chirality changes call clear_cache() (2 total); each rotation angle
+    calls set_rotation_deg(..., clear_static_cache=True) so only one cache entry exists at
+    a time. Defocus sweeps reuse the same cache entry since C_1_0 is not part of the key.
     """
     angles = np.linspace(0.0, 360.0, rotation_num_points, endpoint=False)
     c10_values = np.linspace(defocus_range[0], defocus_range[1], defocus_num_points)
