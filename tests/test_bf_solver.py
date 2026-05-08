@@ -415,22 +415,29 @@ class TestFrameCacheBehavior:
         )
 
         solver.get_tcBF(chunk_size=8)
-        assert len(solver._cache_store) == 1
+        assert len(solver._basis_cache) == 1
+        assert solver._fft_cache is not None
+        fft_tensor_id = id(solver._fft_cache.img_fft)
 
         solver.set_rotation_deg(15.0)
 
         solver.get_tcBF(chunk_size=8)
-        assert len(solver._cache_store) == 2
+        assert len(solver._basis_cache) == 2
+        # FFT cache is untouched — same tensor object
+        assert solver._fft_cache is not None
+        assert id(solver._fft_cache.img_fft) == fft_tensor_id
 
-    def test_clear_cache_only_clears_static_cache(self, solver_zero_ab):
+    def test_clear_cache_clears_all_caches(self, solver_zero_ab):
         img = solver_zero_ab.get_tcBF(chunk_size=8)
         assert solver_zero_ab.reconstructed_image is img
-        assert len(solver_zero_ab._cache_store) >= 1
+        assert len(solver_zero_ab._basis_cache) >= 1
+        assert solver_zero_ab._fft_cache is not None
 
         solver_zero_ab.clear_cache()
 
         assert solver_zero_ab.reconstructed_image is img
-        assert len(solver_zero_ab._cache_store) == 0
+        assert len(solver_zero_ab._basis_cache) == 0
+        assert solver_zero_ab._fft_cache is None
 
 
 # ── Cache mode parity ────────────────────────────────────────────────────────
@@ -566,6 +573,114 @@ def real_solver(device):
         coord_transform=REAL_COORD_TRANSFORM,
         device=device,
     )
+
+
+# ── BFImageCache split behavior ───────────────────────────────────────────────
+
+class TestBFImageCacheSplit:
+
+    def _make_solver(self, synth_dataset, synth_params, device, **ab_kwargs):
+        p = synth_params
+        return BFSolver(
+            dataset=synth_dataset,
+            max_alpha=p["max_alpha"],
+            scan_step_size=p["scan_step_size"],
+            dk=p["dk"],
+            wavelength=p["wavelength"],
+            max_order=2,
+            aberrations={"C10": 0.0, **ab_kwargs},
+            device=device,
+        )
+
+    def test_fft_cache_shared_across_rotations(self, synth_dataset, synth_params, device):
+        solver = self._make_solver(synth_dataset, synth_params, device)
+        solver.get_tcBF(chunk_size=8)
+        fft_id = id(solver._fft_cache.img_fft)
+
+        solver.set_rotation_deg(15.0, clear_basis=True)
+        solver.get_tcBF(chunk_size=8)
+
+        # Same underlying tensor — no copy made
+        assert id(solver._fft_cache.img_fft) == fft_id
+
+    def test_tcbf_and_acbf_share_same_fft_tensor(self, synth_dataset, synth_params, device):
+        solver = self._make_solver(synth_dataset, synth_params, device)
+        tcbf_cache = solver._get_tcBF_cache(chunk_size=8)
+        acbf_cache = solver._get_acBF_cache(chunk_size=8)
+        assert tcbf_cache.img_fft is acbf_cache.img_fft
+
+    def test_clear_basis_cache_preserves_fft(self, synth_dataset, synth_params, device):
+        solver = self._make_solver(synth_dataset, synth_params, device)
+        solver.get_tcBF(chunk_size=8)
+        fft_obj = solver._fft_cache
+
+        solver.clear_basis_cache()
+
+        assert len(solver._basis_cache) == 0
+        assert solver._fft_cache is fft_obj
+
+    def test_clear_cache_resets_both(self, synth_dataset, synth_params, device):
+        solver = self._make_solver(synth_dataset, synth_params, device)
+        solver.get_tcBF(chunk_size=8)
+        assert solver._fft_cache is not None
+        assert len(solver._basis_cache) >= 1
+
+        solver.clear_cache()
+
+        assert solver._fft_cache is None
+        assert len(solver._basis_cache) == 0
+
+    def test_set_rotation_clear_basis_preserves_fft(self, synth_dataset, synth_params, device):
+        solver = self._make_solver(synth_dataset, synth_params, device)
+        solver.get_tcBF(chunk_size=8)
+        fft_obj = solver._fft_cache
+
+        solver.set_rotation_deg(20.0, clear_basis=True)
+
+        assert solver._fft_cache is fft_obj
+        assert len(solver._basis_cache) == 0
+
+    def test_tcbf_output_unchanged_after_split(self, synth_dataset, synth_params, device):
+        solver = self._make_solver(synth_dataset, synth_params, device, C10=50.0, C12=10.0)
+        r1 = solver.get_tcBF(chunk_size=8).detach().clone()
+        solver.clear_cache()
+        r2 = solver.get_tcBF(chunk_size=8)
+        torch.testing.assert_close(r1, r2, atol=1e-5, rtol=1e-5)
+
+    def test_acbf_output_unchanged_after_split(self, synth_dataset, synth_params, device):
+        solver = self._make_solver(synth_dataset, synth_params, device, C10=50.0, C12=10.0)
+        r1 = solver.get_acBF(chunk_size=8).detach().clone()
+        solver.clear_cache()
+        r2 = solver.get_acBF(chunk_size=8)
+        torch.testing.assert_close(r1, r2, atol=1e-5, rtol=1e-5)
+
+    def test_refine_flips_preserves_fft_cache(self, synth_dataset, synth_params, device):
+        from fast_acbf.optimization.refinement import refine_flips
+        solver = self._make_solver(synth_dataset, synth_params, device)
+        solver.get_tcBF(chunk_size=8)
+        fft_obj = solver._fft_cache
+
+        refine_flips(solver, mode='tcBF', metric='laplacian')
+
+        assert solver._fft_cache is fft_obj
+
+    def test_refine_scan_rotation_preserves_fft_and_clears_basis(self, synth_dataset, synth_params, device):
+        from fast_acbf.optimization.refinement import refine_scan_rotation
+        solver = self._make_solver(synth_dataset, synth_params, device)
+        solver.get_tcBF(chunk_size=8)
+        fft_obj = solver._fft_cache
+
+        refine_scan_rotation(
+            solver,
+            search_range=(-5.0, 5.0),
+            num_points=3,
+            mode='tcBF',
+            metric='laplacian',
+            chunk_size=8,
+        )
+
+        assert solver._fft_cache is fft_obj
+        assert len(solver._basis_cache) == 0
 
 
 @pytest.mark.regression

@@ -4,7 +4,9 @@ All functions accept a solver-like object via duck typing (no BFSolver import).
 Required solver interface:
     .ab_state          — AberrationState with set_physical / get_physical
     .reconstruct(mode, **kwargs) -> Tensor
-    .set_rotation_deg(deg)       — handles cache invalidation internally
+    .set_rotation_deg(deg, clear_basis=False) — handles cache invalidation internally
+    .clear_basis_cache()         — clears orientation-dependent caches, preserves FFT cache
+    .clear_cache()               — full reset (both basis and FFT caches)
     .coord_transform             — dict with flipud/fliplr/transpose flags
     .reconstructed_image         — writable attribute for caching last result
     .last_c10_stack_axis         — writable attribute
@@ -245,11 +247,11 @@ def refine_scan_rotation(
     try:
         with torch.no_grad():
             for angle in angles:
-                # clear_static_cache=True: each angle produces a distinct cache key; without
-                # clearing, all num_points entries accumulate in _cache_store simultaneously.
+                # clear_basis=True: each angle produces a distinct cache key; without
+                # clearing, all num_points entries accumulate in _basis_cache simultaneously.
                 # This sweep is sequential and never revisits angles, so only one entry is
                 # needed at a time.
-                solver.set_rotation_deg(float(angle), clear_static_cache=True)
+                solver.set_rotation_deg(float(angle), clear_basis=True)
                 img = solver.reconstruct(mode=mode, **kwargs)
                 scores.append(QualityMetrics.evaluate(img, metric=metric).item())
     finally:
@@ -260,7 +262,7 @@ def refine_scan_rotation(
     optimal_rotation = float(angles[optimal_index])
 
     print(f"Optimal rotation found at {optimal_rotation:.2f} deg")
-    solver.set_rotation_deg(optimal_rotation)
+    solver.set_rotation_deg(optimal_rotation, clear_basis=True)
     solver.reconstructed_image = None # Clear stale image from last swept angle
 
 
@@ -307,13 +309,13 @@ def refine_flips(
                 solver.coord_transform['flipud']    = flipud
                 solver.coord_transform['fliplr']    = fliplr
                 solver.coord_transform['transpose'] = transpose
-                solver.clear_cache()
+                solver.clear_basis_cache()
                 img = solver.reconstruct(mode=mode, **kwargs)
                 score = QualityMetrics.evaluate(img, metric=metric).item()
                 results[(flipud, fliplr, transpose)] = score
     finally:
         solver.coord_transform.update(original)
-        solver.clear_cache()
+        solver.clear_basis_cache()
 
     best_combo = max(results, key=results.__getitem__)
     results['best'] = best_combo
@@ -324,7 +326,7 @@ def refine_flips(
     solver.coord_transform['flipud']    = best_combo[0]
     solver.coord_transform['fliplr']    = best_combo[1]
     solver.coord_transform['transpose'] = best_combo[2]
-    solver.clear_cache()
+    solver.clear_basis_cache()
 
     return results
 
@@ -392,8 +394,8 @@ def _orientation_grid_search(
     defocus values. Applies the best (chirality, angle, C_1_0) state to solver, decomposed
     to PtyRAD D4 flags via map_to_ptyrad_state.
 
-    Cache discipline: chirality changes call clear_cache() (2 total); each rotation angle
-    calls set_rotation_deg(..., clear_static_cache=True) so only one cache entry exists at
+    Cache discipline: chirality changes call clear_basis_cache() (2 total); each rotation angle
+    calls set_rotation_deg(..., clear_basis=True) so only one basis cache entry exists at
     a time. Defocus sweeps reuse the same cache entry since C_1_0 is not part of the key.
     """
     angles = np.linspace(0.0, 360.0, rotation_num_points, endpoint=False)
@@ -424,12 +426,12 @@ def _orientation_grid_search(
                 solver.coord_transform['fliplr'] = False
                 solver.coord_transform['transpose'] = if_transposed
                 solver.set_rotation_deg(0.0)
-                solver.clear_cache()
+                solver.clear_basis_cache()
 
                 for angle in angles:
-                    # clear_static_cache=True: sequential search never revisits old angles,
-                    # so accumulating per-angle cache entries only wastes memory.
-                    solver.set_rotation_deg(float(angle), clear_static_cache=True)
+                    # clear_basis=True: sequential search never revisits old angles,
+                    # so accumulating per-angle basis cache entries only wastes memory.
+                    solver.set_rotation_deg(float(angle), clear_basis=True)
                     for c10 in c10_values:
                         solver.ab_state.set_physical('C_1_0', float(c10))
                         img = solver.reconstruct(mode=mode, **kwargs)
@@ -443,7 +445,7 @@ def _orientation_grid_search(
         solver.ab_state.set_physical('C_1_0', original_c10)
         for k, v in original_non_sym.items():
             solver.ab_state.set_physical(k, v)
-        solver.clear_cache()
+        solver.clear_basis_cache()
 
     ptyrad_state = map_to_ptyrad_state(best_if_transposed, best_angle)
     solver.coord_transform['flipud']    = ptyrad_state['flipud']
@@ -451,7 +453,7 @@ def _orientation_grid_search(
     solver.coord_transform['transpose'] = ptyrad_state['transpose']
     solver.set_rotation_deg(ptyrad_state['rotation_deg'])
     solver.ab_state.set_physical('C_1_0', best_c10)
-    solver.clear_cache()
+    solver.clear_basis_cache()
 
     print(f"Best: if_transposed={best_if_transposed}, angle={best_angle:.1f}°, C10={best_c10:.2f}Å "
           f"(score={best_score:.4g})")

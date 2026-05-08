@@ -42,11 +42,8 @@ def compute_transfer(
     else:
         kxt = chunk['kxt'].to(device)
         kyt = chunk['kyt'].to(device)
-        Ny, Nx = chunk['img_fft'].shape[-2:]
-        dx = (cache.Rx * cache.scan_step_size) / Nx
-        dy = (cache.Ry * cache.scan_step_size) / Ny
-        kx_base = torch.fft.fftfreq(Nx, d=dx, device=device).view(1, 1, Nx)
-        ky_base = torch.fft.fftfreq(Ny, d=dy, device=device).view(1, Ny, 1)
+        kx_base = cache.qx_grid
+        ky_base = cache.qy_grid
         kx_t,  ky_t  = kx_base + kxt, ky_base + kyt
         kx_mt, ky_mt = kx_base - kxt, ky_base - kyt
         ap_t  = make_soft_aperture_torch(
@@ -94,10 +91,10 @@ def reconstruct_acbf(
     """
     acBF_total = torch.zeros(cache.out_shape, dtype=torch.float32, device=device)
     for chunk in cache.chunks:
+        img_fft_chunk = cache.img_fft[chunk['start']:chunk['end']]
         transfer = compute_transfer(chunk, coeffs, cache, device)
         phasor = transfer / (transfer.abs() + eps)
-        F_corr = chunk['img_fft'] * phasor
-        acBF_total += torch.sum(torch.fft.ifft2(F_corr, dim=(-2, -1)).real, dim=0)
+        acBF_total += torch.sum(torch.fft.ifft2(img_fft_chunk * phasor, dim=(-2, -1)).real, dim=0)
     return acBF_total
 
 
@@ -141,8 +138,9 @@ def reconstruct_acbf_complex_inversion(
     transfer_power = torch.zeros(cache.out_shape, dtype=torch.float32, device=device)
 
     for chunk in cache.chunks:
+        img_fft_chunk = cache.img_fft[chunk['start']:chunk['end']]
         transfer = compute_transfer(chunk, coeffs, cache, device)
-        numerator.add_(torch.sum(transfer * chunk['img_fft'], dim=0))
+        numerator.add_(torch.sum(transfer * img_fft_chunk, dim=0))
         transfer_power.add_(torch.sum(transfer.abs().square(), dim=0))
 
     positive_power = transfer_power[transfer_power > 0]

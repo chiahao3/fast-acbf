@@ -18,8 +18,10 @@ from fast_acbf.core.functional import generate_aberration_basis, generate_shift_
 from fast_acbf.core.tcbf import reconstruct_tcbf
 from fast_acbf.pipeline import (
     ACBFCache,
+    BFImageCache,
     TCBFCache,
     build_acbf_cache,
+    build_bf_image_cache,
     build_c10_axis,
     build_tcbf_cache,
     init_grid,
@@ -106,7 +108,8 @@ class BFSolver:
         self._rotation_deg = float(self.coord_transform.get('rotation_deg', 0.0))
 
         self.reconstructed_image = None
-        self._cache_store = {}
+        self._basis_cache: dict = {}
+        self._fft_cache: BFImageCache | None = None
         self.last_c10_stack_axis = None
 
         # One-time pipeline setup
@@ -133,10 +136,19 @@ class BFSolver:
         """Scan rotation angle in degrees. Use set_rotation_deg() to update."""
         return self._rotation_deg
 
-    def clear_cache(self, clear_static_cache=True):
-        """Clear static tcBF/acBF caches."""
-        if clear_static_cache:
-            self._cache_store = {}
+    def clear_basis_cache(self):
+        """Clear orientation-dependent basis caches. FFT cache is preserved."""
+        self._basis_cache = {}
+
+    def clear_fft_cache(self):
+        """Clear the FFT image cache. Also clears basis cache (entries reference FFT data)."""
+        self._fft_cache = None
+        self._basis_cache = {}
+
+    def clear_cache(self):
+        """Full reset — clears both basis and FFT caches."""
+        self._basis_cache = {}
+        self._fft_cache = None
 
     def _get_transform_flags(self):
         flipud = self.coord_transform.get('flipud', False)
@@ -169,17 +181,18 @@ class BFSolver:
                 idx += 2
         return out
 
-    def set_rotation_deg(self, rotation_deg: float, clear_static_cache: bool = False):
+    def set_rotation_deg(self, rotation_deg: float, clear_basis: bool = False):
         """
         Update scan rotation metadata.
 
-        Static tcBF/acBF caches include rotation in their keys so they do not need
-        to be cleared for correctness. Set clear_static_cache=True to release old
-        rotation caches.
+        Basis caches include rotation in their keys so they do not need to be cleared
+        for correctness. Set clear_basis=True to release the old rotation's basis cache.
+        The FFT cache is orientation-independent and is never cleared here.
         """
         self._rotation_deg = float(rotation_deg)
         self.coord_transform['rotation_deg'] = self._rotation_deg
-        self.clear_cache(clear_static_cache=clear_static_cache)
+        if clear_basis:
+            self.clear_basis_cache()
         return self
 
     def _get_transformed_bf_coordinates(self, in_scan_frame=True):
@@ -237,28 +250,39 @@ class BFSolver:
     # Cache management — lazy-build wrappers
     # ------------------------------------------------------------------
 
+    def _get_fft_cache(self) -> BFImageCache:
+        """Return the orientation-independent FFT image cache, building it on first call."""
+        if self._fft_cache is None:
+            self._fft_cache = build_bf_image_cache(
+                self.vbf_images, self.scan_step_size, self.device,
+            )
+        return self._fft_cache
+
     def _get_tcBF_cache(self, chunk_size=64) -> TCBFCache:
         key = ('tcBF', chunk_size, *self._frame_cache_key())
-        if key not in self._cache_store:
+        if key not in self._basis_cache:
             kX_full, kY_full = self._get_transformed_bf_coordinates()
-            self._cache_store[key] = build_tcbf_cache(
-                self.vbf_images, kX_full, kY_full,
-                self.ab_state.order_keys, self.scan_step_size,
-                self.wavelength, self.device, chunk_size,
+            ic = self._get_fft_cache()
+            self._basis_cache[key] = build_tcbf_cache(
+                kX_full, kY_full,
+                self.ab_state.order_keys, self.wavelength, self.device, chunk_size,
+                img_fft=ic.img_fft, qx_grid=ic.qx_grid, qy_grid=ic.qy_grid, out_shape=ic.out_shape,
             )
-        return self._cache_store[key]
+        return self._basis_cache[key]
 
     def _get_acBF_cache(self, rolloff=0, chunk_size=64) -> ACBFCache:
         key = ('acBF', rolloff, chunk_size, self.cache_mode, *self._frame_cache_key())
-        if key not in self._cache_store:
+        if key not in self._basis_cache:
             kX_full, kY_full = self._get_transformed_bf_coordinates()
-            self._cache_store[key] = build_acbf_cache(
-                self.vbf_images, kX_full, kY_full,
+            ic = self._get_fft_cache()
+            self._basis_cache[key] = build_acbf_cache(
+                kX_full, kY_full,
                 self.ab_state.order_keys, self.max_alpha,
-                self.scan_step_size, self.wavelength, self.max_order,
+                self.wavelength, self.max_order,
                 self.device, self.cache_mode, rolloff, chunk_size,
+                img_fft=ic.img_fft, qx_grid=ic.qx_grid, qy_grid=ic.qy_grid, out_shape=ic.out_shape,
             )
-        return self._cache_store[key]
+        return self._basis_cache[key]
 
     # ------------------------------------------------------------------
     # Reconstruction orchestration
