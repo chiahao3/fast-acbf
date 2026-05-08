@@ -100,15 +100,18 @@ def _sweep_c10(solver, c10_axis: torch.Tensor, mode: str, **kwargs):
 
 def refine_defocus(
     solver,
-    search_range: tuple,
+    *,
+    search_range: tuple | None = None,
     num_points: int = 5,
     metric: str = 'laplacian',
-    method: str = 'fit_parabola',
+    method: str = 'max',
     blur: bool = True,
     blur_kernel_size: int = 5,
     blur_sigma: float = 1,
     plot_search: bool = True,
     mode: str = 'tcBF',
+    search_halfwidth: float | None = None,
+    defocus_range_tolerance_factor: float = 24.0,
     **kwargs,
 ) -> None:
     """
@@ -120,17 +123,40 @@ def refine_defocus(
 
     Args:
         solver:           Solver-like object (see module docstring).
-        search_range:     (min_c10, max_c10) in Angstroms.
+        search_range:     Literal (min_c10, max_c10) bounds in Angstroms. If None,
+                          uses search_halfwidth or defocus_range_tolerance_factor.
         num_points:       Number of C10 values to sample.
         metric:           Focus metric for QualityMetrics.evaluate.
-        method:           'fit_parabola' or 'max'.
+        method:           'fit_parabola' or 'max'. Default is 'max'.
         blur:             Pre-blur images before scoring.
         blur_kernel_size: Kernel size for Gaussian blur.
         blur_sigma:       Sigma for Gaussian blur.
         plot_search:      Show matplotlib line-search summary.
         mode:             Reconstruction mode ('tcBF' or 'acBF').
+        search_halfwidth: Current-centered half-width in Angstroms. Mutually
+                          exclusive with search_range.
+        defocus_range_tolerance_factor:
+                          Multiplier on the 1st-order Kirkland tolerance T₁
+                          for the auto defocus range when neither search_range
+                          nor search_halfwidth is provided.
     """
     mode = mode.lower()
+    if search_range is not None and search_halfwidth is not None:
+        raise ValueError("Provide either search_range or search_halfwidth, not both.")
+
+    if search_range is None:
+        c10 = solver.ab_state.get_physical('C_1_0')
+        if search_halfwidth is None:
+            T1 = solver.tolerance_factors[1]
+            half = defocus_range_tolerance_factor * T1
+            range_source = f"{defocus_range_tolerance_factor:.0f}×T₁"
+        else:
+            half = float(search_halfwidth)
+            range_source = f"{half:.1f} Å half-width"
+        search_range = (c10 - half, c10 + half)
+        print(f"Auto defocus search_range: ({search_range[0]:.1f}, {search_range[1]:.1f}) Å "
+              f"(C10={c10:.1f} ± {half:.1f} Å from {range_source})")
+
     min_def, max_def = min(search_range), max(search_range)
     search_range = (min_def, max_def)
     print(f"Starting defocus line search: {num_points} points between {search_range[0]} and {search_range[1]} Ang")
@@ -291,11 +317,13 @@ def refine_aberrations(
 
 def refine_scan_rotation(
     solver,
-    search_range: tuple,
+    *,
+    search_range: tuple | None = None,
     num_points: int = 9,
     metric: str = 'laplacian',
     plot_search: bool = True,
     mode: str = 'tcBF',
+    search_halfwidth: float | None = None,
     **kwargs,
 ) -> None:
     """
@@ -307,13 +335,27 @@ def refine_scan_rotation(
 
     Args:
         solver:       Solver-like object.
-        search_range: (min_deg, max_deg) rotation range to search.
+        search_range: Literal (min_deg, max_deg) rotation bounds to search.
+                      Defaults to (-45°, +45°).
         num_points:   Number of angles to sample.
         metric:       Focus metric for QualityMetrics.evaluate.
         plot_search:  Show matplotlib line-search summary.
         mode:         Reconstruction mode.
+        search_halfwidth:
+                      Current-centered rotation half-width in degrees. Mutually
+                      exclusive with search_range.
     """
     mode = mode.lower()
+    if search_range is not None and search_halfwidth is not None:
+        raise ValueError("Provide either search_range or search_halfwidth, not both.")
+
+    if search_range is None:
+        if search_halfwidth is None:
+            search_range = (-45.0, 45.0)
+        else:
+            half = float(search_halfwidth)
+            search_range = (solver.rotation_deg - half, solver.rotation_deg + half)
+
     min_rot, max_rot = min(search_range), max(search_range)
     angles = np.linspace(min_rot, max_rot, num_points)
     print(f"Starting rotation line search: {num_points} points between {min_rot:.1f} and {max_rot:.1f} deg")
@@ -659,12 +701,12 @@ def refine_all_params(
         )
 
     if 'fine_rotation' in targets:
-        rot = solver.rotation_deg
         refine_scan_rotation(
             solver,
-            search_range=(rot - fine_rotation_halfwidth, rot + fine_rotation_halfwidth),
+            search_halfwidth=fine_rotation_halfwidth,
             num_points=fine_rotation_num_points,
             metric=metric,
+            plot_search=False,
             mode=mode,
             **kwargs,
         )

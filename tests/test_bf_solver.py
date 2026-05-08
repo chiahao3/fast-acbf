@@ -322,6 +322,112 @@ class TestAutogradBoundary:
             rtol=1e-6,
         )
 
+    def test_refine_defocus_defaults_to_tolerance_window(self, synth_dataset, synth_params, device, monkeypatch):
+        from fast_acbf.vis import plotting
+
+        solver = self._make_solver(synth_dataset, synth_params, device)
+        captured = {}
+
+        def fake_plot(**kwargs):
+            captured.update(kwargs)
+
+        monkeypatch.setattr(plotting, "plot_defocus_line_search", fake_plot)
+
+        solver.refine_defocus(
+            num_points=3,
+            method='max',
+            chunk_size=8,
+        )
+
+        c10 = 50.0
+        half = 24.0 * solver.tolerance_factors[1]
+        assert captured["search_range"] == pytest.approx((c10 - half, c10 + half))
+        assert captured["c10_axis_np"] == pytest.approx(np.linspace(c10 - half, c10 + half, 3))
+
+    def test_refine_defocus_uses_literal_search_range(self, synth_dataset, synth_params, device):
+        solver = self._make_solver(synth_dataset, synth_params, device)
+
+        solver.refine_defocus(
+            search_range=(40.0, 60.0),
+            num_points=3,
+            method='max',
+            plot_search=False,
+            chunk_size=8,
+        )
+
+        assert solver.last_c10_stack_axis.shape == (3,)
+        torch.testing.assert_close(
+            solver.last_c10_stack_axis.cpu(),
+            torch.tensor([40.0, 50.0, 60.0]),
+        )
+
+    def test_refine_wrappers_reject_positional_options(self, synth_dataset, synth_params, device):
+        solver = self._make_solver(synth_dataset, synth_params, device)
+
+        with pytest.raises(TypeError):
+            solver.refine_defocus((40.0, 60.0))
+
+        with pytest.raises(TypeError):
+            solver.refine_scan_rotation((-1.0, 1.0))
+
+    def test_refine_defocus_halfwidth_centers_on_current_value(self, synth_dataset, synth_params, device, monkeypatch):
+        from fast_acbf.vis import plotting
+
+        solver = self._make_solver(synth_dataset, synth_params, device)
+        captured = {}
+
+        def fake_plot(**kwargs):
+            captured.update(kwargs)
+
+        monkeypatch.setattr(plotting, "plot_defocus_line_search", fake_plot)
+
+        solver.refine_defocus(
+            search_halfwidth=5.0,
+            num_points=3,
+            method='max',
+            chunk_size=8,
+        )
+
+        assert captured["search_range"] == pytest.approx((45.0, 55.0))
+
+    def test_refine_scan_rotation_defaults_to_plus_minus_45_deg(self, synth_dataset, synth_params, device, monkeypatch):
+        from fast_acbf.vis import plotting
+
+        solver = self._make_solver(synth_dataset, synth_params, device)
+        captured = {}
+
+        def fake_plot(**kwargs):
+            captured.update(kwargs)
+
+        monkeypatch.setattr(plotting, "plot_rotation_line_search", fake_plot)
+
+        solver.refine_scan_rotation(
+            num_points=3,
+            chunk_size=8,
+        )
+
+        assert captured["angles_deg"] == pytest.approx(np.array([-45.0, 0.0, 45.0]))
+
+    def test_refine_scan_rotation_halfwidth_centers_on_current_value(self, synth_dataset, synth_params, device, monkeypatch):
+        from fast_acbf.vis import plotting
+
+        solver = self._make_solver(synth_dataset, synth_params, device)
+        solver.set_rotation_deg(20.0)
+        captured = {}
+
+        def fake_plot(**kwargs):
+            captured.update(kwargs)
+
+        monkeypatch.setattr(plotting, "plot_rotation_line_search", fake_plot)
+
+        solver.refine_scan_rotation(
+            search_halfwidth=5.0,
+            num_points=3,
+            chunk_size=8,
+        )
+
+        assert captured["angles_deg"] == pytest.approx(np.array([15.0, 20.0, 25.0]))
+
     def test_refine_scan_rotation_plot_receives_scores(self, synth_dataset, synth_params, device, monkeypatch):
         from fast_acbf.vis import plotting
 

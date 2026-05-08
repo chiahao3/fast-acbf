@@ -524,10 +524,10 @@ class BFSolver:
         print("Executed: Rigid Registration Refinement")
         return self
 
-    def refine_defocus(self, search_range: tuple, **kwargs):
+    def refine_defocus(self, *, search_range: tuple | None = None, **kwargs):
         """Line search for optimal C10 (defocus). See optimization.refinement.refine_defocus."""
         from fast_acbf.optimization import refinement
-        refinement.refine_defocus(self, search_range, **kwargs)
+        refinement.refine_defocus(self, search_range=search_range, **kwargs)
         return self
 
     def refine_aberrations(self, **kwargs):
@@ -536,10 +536,10 @@ class BFSolver:
         refinement.refine_aberrations(self, **kwargs)
         return self
 
-    def refine_scan_rotation(self, search_range: tuple, **kwargs):
+    def refine_scan_rotation(self, *, search_range: tuple | None = None, **kwargs):
         """Line search for optimal scan rotation. See optimization.refinement.refine_scan_rotation."""
         from fast_acbf.optimization import refinement
-        refinement.refine_scan_rotation(self, search_range, **kwargs)
+        refinement.refine_scan_rotation(self, search_range=search_range, **kwargs)
         return self
 
     def refine_flips(self, **kwargs):
