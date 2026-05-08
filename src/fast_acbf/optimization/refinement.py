@@ -101,7 +101,7 @@ def refine_defocus(
     method = method.lower()
     if method == 'fit_parabola':
         fit_coeffs = np.polyfit(c10_axis_np, quality_scores, 2)
-        a, b, c = fit_coeffs
+        a, b, _ = fit_coeffs
         if a < 0:
             optimal_c10 = -b / (2 * a)
             optimal_c10 = np.clip(optimal_c10, search_range[0], search_range[1])
@@ -284,10 +284,10 @@ def refine_flips(
     """
     mode = mode.lower()
     combos = [
-        (False, False, False),
-        (True,  False, False),
-        (False, True,  False),
-        (False, False, True),
+        (flipud, fliplr, transpose)
+        for flipud    in (False, True)
+        for fliplr    in (False, True)
+        for transpose in (False, True)
     ]
 
     original = {
