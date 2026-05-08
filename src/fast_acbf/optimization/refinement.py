@@ -15,6 +15,7 @@ attribute writes, so that BFSolver's cache invalidation logic stays intact.
 
 from __future__ import annotations
 
+import contextlib
 import os
 
 import numpy as np
@@ -323,3 +324,252 @@ def refine_flips(
     solver.clear_cache()
 
     return results
+
+
+# ---------------------------------------------------------------------------
+# O(2) orientation helpers — used by refine_params
+# ---------------------------------------------------------------------------
+
+# D4 lookup table: maps (is_flipped, q) -> (flipud, fliplr, transpose).
+#
+# Parameterization: the full scan→detector transform is decomposed as
+#   "apply (flipud, fliplr, transpose) at rotation_deg = residual_angle"
+# such that it equals the O(2) state
+#   "(transpose=is_flipped only, flipud=fliplr=False) at rotation_deg = opt_angle_deg"
+#
+# is_flipped=False entries are the four pure CCW rotations (0°, 90°, 180°, 270°).
+# is_flipped=True entries are the four reflections (transpose composed with CCW rotations).
+# Derived from _get_transformed_bf_coordinates and verified numerically.
+_D4_TABLE = {
+    (False, 0): (False, False, False),  # identity
+    (False, 1): (True,  False, True),   # CCW 90°
+    (False, 2): (True,  True,  False),  # CCW 180°
+    (False, 3): (False, True,  True),   # CCW 270°
+    (True,  0): (False, False, True),   # transpose
+    (True,  1): (False, True,  False),  # fliplr
+    (True,  2): (True,  True,  True),   # flipud + fliplr + transpose
+    (True,  3): (True,  False, False),  # flipud
+}
+
+
+def map_to_ptyrad_state(if_transposed: bool, opt_angle_deg: float) -> dict:
+    """
+    Maps an optimized O(2) state (chirality + continuous rotation) to
+    PtyRAD-compatible D4 flags + residual rotation.
+
+    O(2) parameterization uses only 2 chiralities rather than 8 flip combos:
+      - if_transposed=False: (flipud=F, fliplr=F, transpose=F) + rotation opt_angle_deg
+      - if_transposed=True:  (flipud=F, fliplr=F, transpose=T) + rotation opt_angle_deg
+
+    Returns dict with keys: flipud, fliplr, transpose (bool), rotation_deg (float).
+    Residual rotation is opt_angle_deg mod 90°, in roughly [-45°, +45°].
+    """
+    q = int(round(opt_angle_deg / 90.0)) % 4
+    residual_angle = opt_angle_deg - q * 90.0
+    flipud, fliplr, transpose = _D4_TABLE[(bool(if_transposed), q)]
+    return {
+        'flipud': flipud,
+        'fliplr': fliplr,
+        'transpose': transpose,
+        'rotation_deg': residual_angle,
+    }
+
+
+@contextlib.contextmanager
+def _chirality_state(solver, if_transposed: bool):
+    """Temporarily set chirality (transpose flag only, flipud/fliplr reset); restore on exit."""
+    original = {k: solver.coord_transform.get(k) for k in ('flipud', 'fliplr', 'transpose')}
+    original_rotation = solver.rotation_deg
+    try:
+        solver.coord_transform['flipud'] = False
+        solver.coord_transform['fliplr'] = False
+        solver.coord_transform['transpose'] = if_transposed
+        solver.clear_cache()
+        yield
+    finally:
+        solver.coord_transform['flipud']    = original['flipud']
+        solver.coord_transform['fliplr']    = original['fliplr']
+        solver.coord_transform['transpose'] = original['transpose']
+        solver.set_rotation_deg(original_rotation)
+        solver.clear_cache()
+
+
+def _orientation_grid_search(
+    solver,
+    defocus_range: tuple,
+    rotation_num_points: int,
+    defocus_num_points: int,
+    metric: str,
+    mode: str,
+    **kwargs,
+) -> None:
+    """
+    Joint grid search over 2 chiralities × rotation_num_points angles × defocus_num_points
+    defocus values. Applies the best (chirality, angle, C_1_0) state to solver, decomposed
+    to PtyRAD D4 flags via map_to_ptyrad_state.
+
+    Only 2 full cache clears occur (one per chirality); rotation changes accumulate cache
+    entries without clearing, keeping the static geometry tensors alive across the sweep.
+    """
+    angles = np.linspace(0.0, 360.0, rotation_num_points, endpoint=False)
+    c10_values = np.linspace(defocus_range[0], defocus_range[1], defocus_num_points)
+    total = 2 * rotation_num_points * defocus_num_points
+    print(f"Starting orientation+defocus grid search: {total} evaluations "
+          f"(2 chiralities × {rotation_num_points} angles × {defocus_num_points} defocus points)")
+
+    original_c10 = solver.ab_state.get_physical('C_1_0')
+    # Non-rotationally-symmetric terms (m≠0) interact with rotation: C12 can compensate
+    # for orientation errors, creating deep local minima. Zero them during the grid search.
+    non_sym_keys = [k for k in solver.ab_state.coeffs if k.endswith('_a') or k.endswith('_b')]
+    original_non_sym = {k: solver.ab_state.get_physical(k) for k in non_sym_keys}
+
+    best_score = -np.inf
+    best_if_transposed = False
+    best_angle = 0.0
+    best_c10 = float(c10_values[0])
+
+    try:
+        with torch.no_grad():
+            for k in non_sym_keys:
+                solver.ab_state.set_physical(k, 0.0)
+
+            for if_transposed in (False, True):
+                # One cache clear per chirality — the expensive operation
+                solver.coord_transform['flipud'] = False
+                solver.coord_transform['fliplr'] = False
+                solver.coord_transform['transpose'] = if_transposed
+                solver.set_rotation_deg(0.0)
+                solver.clear_cache()
+
+                for angle in angles:
+                    # Rotation change: updates cache key without clearing old entries
+                    solver.set_rotation_deg(float(angle))
+                    for c10 in c10_values:
+                        solver.ab_state.set_physical('C_1_0', float(c10))
+                        img = solver.reconstruct(mode=mode, **kwargs)
+                        score = QualityMetrics.evaluate(img, metric=metric).item()
+                        if score > best_score:
+                            best_score = score
+                            best_if_transposed = if_transposed
+                            best_angle = float(angle)
+                            best_c10 = float(c10)
+    finally:
+        solver.ab_state.set_physical('C_1_0', original_c10)
+        for k, v in original_non_sym.items():
+            solver.ab_state.set_physical(k, v)
+        solver.clear_cache()
+
+    ptyrad_state = map_to_ptyrad_state(best_if_transposed, best_angle)
+    solver.coord_transform['flipud']    = ptyrad_state['flipud']
+    solver.coord_transform['fliplr']    = ptyrad_state['fliplr']
+    solver.coord_transform['transpose'] = ptyrad_state['transpose']
+    solver.set_rotation_deg(ptyrad_state['rotation_deg'])
+    solver.ab_state.set_physical('C_1_0', best_c10)
+    solver.clear_cache()
+
+    print(f"Best: if_transposed={best_if_transposed}, angle={best_angle:.1f}°, C10={best_c10:.2f}Å "
+          f"(score={best_score:.4g})")
+    print(f"  → flipud={ptyrad_state['flipud']}, fliplr={ptyrad_state['fliplr']}, "
+          f"transpose={ptyrad_state['transpose']}, rotation_deg={ptyrad_state['rotation_deg']:.1f}°")
+
+
+# ---------------------------------------------------------------------------
+# High-level orchestrator
+# ---------------------------------------------------------------------------
+
+def refine_params(
+    solver,
+    targets=('orientation_defocus', 'coarse_aberrations', 'fine_rotation', 'fine_aberrations'),
+    metric: str = 'normalized_std',
+    mode: str = 'tcBF',
+    defocus_range=None,
+    defocus_range_tolerance_factor: float = 24.0,
+    rotation_num_points: int = 36,
+    defocus_num_points: int = 11,
+    fine_rotation_halfwidth: float = 5.0,
+    fine_rotation_num_points: int = 11,
+    aberration_lr: float = 1.0,
+    aberration_iters: int = 50,
+    **kwargs,
+) -> None:
+    """
+    Coarse-to-fine parameter orchestration.
+
+    Executes a subset of the four pipeline steps, selected by `targets`:
+
+      'orientation_defocus'         — Joint 2-chirality × rotation × defocus grid search (Step 1).
+      'coarse_aberrations'  — Adam optimisation restricted to 1st + 2nd order (Step 2).
+      'fine_rotation'       — Tight ±fine_rotation_halfwidth° line search (Step 3).
+      'fine_aberrations'    — Full-order Adam optimisation (Step 4).
+
+    Args:
+        solver:                         Solver-like object.
+        targets:                        Ordered sequence of step names to run.
+        metric:                         Focus metric shared across all steps.
+        mode:                           Reconstruction mode ('tcBF' or 'acBF').
+        defocus_range:                  (min_c10, max_c10) in Å for Step 1. If None,
+                                        auto-computed as current_C10 ± defocus_range_tolerance_factor × T₁.
+        defocus_range_tolerance_factor: Multiplier on the 1st-order Kirkland tolerance T₁
+                                        for the auto defocus range. Default 24 (= ±6π phase).
+        rotation_num_points:            Rotation angles sampled in [0°, 360°) for Step 1.
+        defocus_num_points:             Defocus samples in defocus_range for Step 1.
+        fine_rotation_halfwidth:        Half-width in degrees for Step 3 search range.
+        fine_rotation_num_points:       Number of angles for Step 3.
+        aberration_lr:                  Base learning rate for Adam steps.
+        aberration_iters:               Gradient steps per Adam call.
+    """
+    mode = mode.lower()
+    targets = tuple(targets)
+
+    if 'orientation_defocus' in targets and defocus_range is None:
+        c10 = solver.ab_state.get_physical('C_1_0')
+        T1 = solver.tolerance_factors[1]
+        half = defocus_range_tolerance_factor * T1
+        defocus_range = (c10 - half, c10 + half)
+        print(f"Auto defocus_range: ({defocus_range[0]:.1f}, {defocus_range[1]:.1f}) Å "
+              f"(C10={c10:.1f} ± {half:.1f} Å = ±{defocus_range_tolerance_factor:.0f}×T₁)")
+
+    if 'orientation_defocus' in targets:
+        _orientation_grid_search(
+            solver,
+            defocus_range=defocus_range,
+            rotation_num_points=rotation_num_points,
+            defocus_num_points=defocus_num_points,
+            metric=metric,
+            mode=mode,
+            **kwargs,
+        )
+
+    if 'coarse_aberrations' in targets:
+        max_order = solver.ab_state.max_order
+        coarse_lr_scales = [1.0] * min(2, max_order) + [0.0] * max(0, max_order - 2)
+        refine_aberrations(
+            solver,
+            lr=aberration_lr,
+            lr_scales=coarse_lr_scales,
+            iters=aberration_iters,
+            metric=metric,
+            mode=mode,
+            **kwargs,
+        )
+
+    if 'fine_rotation' in targets:
+        rot = solver.rotation_deg
+        refine_scan_rotation(
+            solver,
+            search_range=(rot - fine_rotation_halfwidth, rot + fine_rotation_halfwidth),
+            num_points=fine_rotation_num_points,
+            metric=metric,
+            mode=mode,
+            **kwargs,
+        )
+
+    if 'fine_aberrations' in targets:
+        refine_aberrations(
+            solver,
+            lr=aberration_lr,
+            iters=aberration_iters,
+            metric=metric,
+            mode=mode,
+            **kwargs,
+        )

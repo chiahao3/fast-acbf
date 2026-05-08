@@ -507,6 +507,40 @@ class BFSolver:
         from fast_acbf.optimization import refinement
         return refinement.refine_flips(self, **kwargs)
 
+    def refine_params(
+        self,
+        targets=('orientation_defocus', 'coarse_aberrations', 'fine_rotation', 'fine_aberrations'),
+        metric: str = 'normalized_std',
+        mode: str = 'tcBF',
+        defocus_range=None,
+        defocus_range_tolerance_factor: float = 24.0,
+        rotation_num_points: int = 36,
+        defocus_num_points: int = 11,
+        fine_rotation_halfwidth: float = 5.0,
+        fine_rotation_num_points: int = 11,
+        aberration_lr: float = 1.0,
+        aberration_iters: int = 50,
+        **kwargs,
+    ) -> 'BFSolver':
+        """Coarse-to-fine parameter orchestration. See optimization.refinement.refine_params."""
+        from fast_acbf.optimization import refinement
+        refinement.refine_params(
+            self,
+            targets=targets,
+            metric=metric,
+            mode=mode,
+            defocus_range=defocus_range,
+            defocus_range_tolerance_factor=defocus_range_tolerance_factor,
+            rotation_num_points=rotation_num_points,
+            defocus_num_points=defocus_num_points,
+            fine_rotation_halfwidth=fine_rotation_halfwidth,
+            fine_rotation_num_points=fine_rotation_num_points,
+            aberration_lr=aberration_lr,
+            aberration_iters=aberration_iters,
+            **kwargs,
+        )
+        return self
+
     # ------------------------------------------------------------------
     # Plotting — thin pass-throughs to vis.plotting
     # ------------------------------------------------------------------
