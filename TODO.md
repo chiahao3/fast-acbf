@@ -2,8 +2,7 @@
 
 ## Tests
 - Test the `complex_inversion` reweighting with more simulated datasets, check for the phase shift values
-- Check if the cached reconstructed image is stale in any of the mode configurations
-- Check if the order of upsampling actually makes a difference
+- Revisit upscaling from a clean native-resolution baseline; add dedicated Fourier-padding tests before reintroducing it
 - Check if the `refine_register` stub (bf_solver.py L1571) needs a real implementation
 
 
@@ -13,9 +12,9 @@
 
 
 ## Refactoring
-- Clean up the upscale paths, ideally keeping only the k-space padding one
-- `self.vbf_images` is never offloaded after cache build (the `full_gpu` docstring says it should be). Confirm whether it can be freed once `img_fft` is cached; check both acBF and tcBF paths.
-- Improve the VRAM-friendly paths a bit more. acBF path seems to still contain a step that will materialize massive tensors simultaneously.
+- Split the native-resolution solver into smaller modules now that final-image caching and upscaling have been removed
+- Profile whether `self.vbf_images` can be freed once static FFT caches are built
+- Improve the lazy VRAM-friendly path. acBF may still materialize large temporary tensors per chunk.
 
 
 ## Bug Fix
@@ -37,11 +36,11 @@
 # Existing features
 - tcBF and acBF reconstructions
 - acBF can optionally use 'complex_inversion' algorithm to reweight the spatial frequencies
-- upscale with arbitrary scaling factor, can upsample in real space (or equivalently pad in k-space), and can defer the upscale timing to right before iFFT
+- Native-resolution reconstruction only; upscaling is temporarily unsupported pending a dedicated Fourier-padding implementation
 - Object, aberrations, and probe can be exported in either 'scan' or 'detector' frame. The 'detector' frame is the coordinate system used for PtyRAD.
 - brute-force defocus line search (`refine_defocus`): C10 sweep + optional parabola fit; no AD
 - aberration optimization with AD (`refine_aberrations`, controlled by `max_order`, `lr`, and `lr_scales`)
-- 3 different cache modes (`full_gpu`, `fft_gpu`, `full_cpu`) to balance VRAM usage and speed; `full_cpu` uses async H2D prefetch (CUDA stream overlap)
+- 2 static cache modes (`full`, `lazy`) to balance speed and VRAM usage
 - soft aperture with cosine rolloff (`rolloff` param in `reconstruct()`)
 - multiple focus quality metrics: `laplacian` (variance of Laplacian), `sobel` (Tenengrad), `normalized_std`
 - coordinate transform flags (flipud, fliplr, transpose, rotation_deg) matching PtyRAD's `meas_flipT`; used when computing scan-frame vs detector-frame outputs

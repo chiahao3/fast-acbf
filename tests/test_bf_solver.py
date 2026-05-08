@@ -53,9 +53,9 @@ class TestBFSolverInit:
                 cache_mode="invalid_mode",
             )
 
-    def test_invalid_upscale_method_raises(self, synth_dataset, synth_params, device):
+    def test_removed_upscale_constructor_args_raise(self, synth_dataset, synth_params, device):
         p = synth_params
-        with pytest.raises(ValueError, match="upscale_method"):
+        with pytest.raises(TypeError, match="upscale_method"):
             BFSolver(
                 dataset=synth_dataset,
                 max_alpha=p["max_alpha"],
@@ -67,6 +67,26 @@ class TestBFSolverInit:
                 device=device,
                 upscale_method="bilinear",
             )
+
+        with pytest.raises(TypeError, match="defer_upscale"):
+            BFSolver(
+                dataset=synth_dataset,
+                max_alpha=p["max_alpha"],
+                scan_step_size=p["scan_step_size"],
+                dk=p["dk"],
+                wavelength=p["wavelength"],
+                max_order=2,
+                aberrations={"C10": 0.0},
+                device=device,
+                defer_upscale=True,
+            )
+
+    def test_reconstruction_upscale_unsupported(self, solver_zero_ab):
+        with pytest.raises(NotImplementedError, match="upscale"):
+            solver_zero_ab.get_tcBF(upscale=2)
+
+        with pytest.raises(NotImplementedError, match="upscale"):
+            solver_zero_ab.get_acBF(upscale=2)
 
     def test_no_global_output_frame_state(self, solver_zero_ab):
         assert not hasattr(solver_zero_ab, "output_frame")
@@ -356,7 +376,32 @@ class TestGetAberrationsDict:
 
 class TestFrameCacheBehavior:
 
-    def test_rotation_change_misses_static_cache_and_clears_image_cache(self, synth_dataset, synth_params, device):
+    def test_no_final_image_cache(self, solver_zero_ab):
+        r1 = solver_zero_ab.get_tcBF(chunk_size=8)
+        r2 = solver_zero_ab.get_tcBF(chunk_size=8)
+        assert r1 is not r2
+
+    def test_aberration_change_recomputes_without_stale_final_image(self, synth_dataset, synth_params, device):
+        p = synth_params
+        solver = BFSolver(
+            dataset=synth_dataset,
+            max_alpha=p["max_alpha"],
+            scan_step_size=p["scan_step_size"],
+            dk=p["dk"],
+            wavelength=p["wavelength"],
+            max_order=2,
+            aberrations={"C10": 0.0},
+            device=device,
+        )
+
+        img0 = solver.get_tcBF(chunk_size=8).detach().clone()
+        with torch.no_grad():
+            solver.ab_state.set_physical('C_1_0', 50.0)
+        img1 = solver.get_tcBF(chunk_size=8).detach()
+
+        assert not torch.allclose(img0, img1)
+
+    def test_rotation_change_misses_static_cache(self, synth_dataset, synth_params, device):
         p = synth_params
         solver = BFSolver(
             dataset=synth_dataset,
@@ -371,14 +416,73 @@ class TestFrameCacheBehavior:
 
         solver.get_tcBF(chunk_size=8)
         assert len(solver._cache_store) == 1
-        assert len(solver._reconstructed_images) == 1
 
         solver.set_rotation_deg(15.0)
-        assert len(solver._reconstructed_images) == 0
 
         solver.get_tcBF(chunk_size=8)
         assert len(solver._cache_store) == 2
-        assert len(solver._reconstructed_images) == 1
+
+    def test_clear_cache_only_clears_static_cache(self, solver_zero_ab):
+        img = solver_zero_ab.get_tcBF(chunk_size=8)
+        assert solver_zero_ab.reconstructed_image is img
+        assert len(solver_zero_ab._cache_store) >= 1
+
+        solver_zero_ab.clear_cache()
+
+        assert solver_zero_ab.reconstructed_image is img
+        assert len(solver_zero_ab._cache_store) == 0
+
+
+# ── Cache mode parity ────────────────────────────────────────────────────────
+
+class TestCacheModeParity:
+
+    def _make_solver(self, cache_mode, synth_dataset, synth_params, device):
+        p = synth_params
+        return BFSolver(
+            dataset=synth_dataset,
+            max_alpha=p["max_alpha"],
+            scan_step_size=p["scan_step_size"],
+            dk=p["dk"],
+            wavelength=p["wavelength"],
+            max_order=2,
+            aberrations={"C10": 50.0, "C12": 10.0, "phi12": 30.0},
+            device=device,
+            cache_mode=cache_mode,
+        )
+
+    def test_tcbf_full_lazy_match(self, synth_dataset, synth_params, device):
+        full = self._make_solver("full", synth_dataset, synth_params, device)
+        lazy = self._make_solver("lazy", synth_dataset, synth_params, device)
+
+        torch.testing.assert_close(
+            full.get_tcBF(chunk_size=8),
+            lazy.get_tcBF(chunk_size=8),
+            atol=1e-5,
+            rtol=1e-5,
+        )
+
+    def test_acbf_phase_only_full_lazy_match(self, synth_dataset, synth_params, device):
+        full = self._make_solver("full", synth_dataset, synth_params, device)
+        lazy = self._make_solver("lazy", synth_dataset, synth_params, device)
+
+        torch.testing.assert_close(
+            full.get_acBF(chunk_size=8),
+            lazy.get_acBF(chunk_size=8),
+            atol=1e-5,
+            rtol=1e-5,
+        )
+
+    def test_acbf_complex_inversion_full_lazy_match(self, synth_dataset, synth_params, device):
+        full = self._make_solver("full", synth_dataset, synth_params, device)
+        lazy = self._make_solver("lazy", synth_dataset, synth_params, device)
+
+        torch.testing.assert_close(
+            full.get_acBF(chunk_size=8, acbf_algorithm='complex_inversion'),
+            lazy.get_acBF(chunk_size=8, acbf_algorithm='complex_inversion'),
+            atol=1e-5,
+            rtol=1e-5,
+        )
 
 
 # ── QualityMetrics ────────────────────────────────────────────────────────────
