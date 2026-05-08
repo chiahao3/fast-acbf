@@ -7,7 +7,7 @@ import numpy as np
 import pytest
 import torch
 
-from fast_acbf.bf_solver import BFSolver, QualityMetrics
+from fast_acbf import BFSolver, QualityMetrics
 
 
 # ── Initialization ────────────────────────────────────────────────────────────

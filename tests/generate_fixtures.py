@@ -25,7 +25,7 @@ import torch
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 
-from fast_acbf.bf_solver import BFSolver
+from fast_acbf import BFSolver
 
 DEFAULT_ZARR_PATH = (
     "/home/cl2696/scratch/"

@@ -4,8 +4,8 @@ from __future__ import annotations
 import pytest
 import torch
 
-from fast_acbf.bf_solver import (
-    AberrationState,
+from fast_acbf.core.aberrations import AberrationState
+from fast_acbf.core.functional import (
     generate_aberration_basis,
     generate_shift_basis,
     imshift_with_batch,

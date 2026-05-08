@@ -5,7 +5,7 @@ import pytest
 import torch
 import torch.nn as nn
 
-from fast_acbf.bf_solver import AberrationState
+from fast_acbf.core.aberrations import AberrationState
 
 
 @pytest.fixture

@@ -84,7 +84,7 @@ def synth_dataset():
 
 @pytest.fixture(scope="session")
 def solver_zero_ab(synth_dataset, synth_params, device):
-    from fast_acbf.bf_solver import BFSolver
+    from fast_acbf import BFSolver
     p = synth_params
     return BFSolver(
         dataset=synth_dataset,
@@ -100,7 +100,7 @@ def solver_zero_ab(synth_dataset, synth_params, device):
 
 @pytest.fixture(scope="session")
 def solver_nonzero_ab(synth_dataset, synth_params, device):
-    from fast_acbf.bf_solver import BFSolver
+    from fast_acbf import BFSolver
     p = synth_params
     return BFSolver(
         dataset=synth_dataset,
