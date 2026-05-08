@@ -230,6 +230,112 @@ class TestGetAcBF:
         ))
 
 
+# ── Autograd boundary behavior ───────────────────────────────────────────────
+
+class TestAutogradBoundary:
+
+    def _make_solver(self, synth_dataset, synth_params, device, **kwargs):
+        p = synth_params
+        defaults = dict(
+            dataset=synth_dataset,
+            max_alpha=p["max_alpha"],
+            scan_step_size=p["scan_step_size"],
+            dk=p["dk"],
+            wavelength=p["wavelength"],
+            max_order=2,
+            aberrations={"C10": 50.0, "C12": 10.0, "phi12": 30.0},
+            device=device,
+        )
+        defaults.update(kwargs)
+        return BFSolver(**defaults)
+
+    def test_reconstruct_no_grad_by_default(self, synth_dataset, synth_params, device):
+        solver = self._make_solver(synth_dataset, synth_params, device)
+        img = solver.reconstruct(mode='tcBF', chunk_size=8)
+        assert not img.requires_grad
+
+    def test_reconstruct_requires_grad_opt_in(self, synth_dataset, synth_params, device):
+        solver = self._make_solver(synth_dataset, synth_params, device)
+        img = solver.reconstruct(mode='tcBF', requires_grad=True, chunk_size=8)
+        assert img.requires_grad
+
+        loss = QualityMetrics.evaluate(img, metric='normalized_std')
+        loss.backward()
+        grads = [p.grad for p in solver.ab_state.coeffs.values()]
+        assert any(g is not None for g in grads)
+
+    def test_public_getters_store_detached_images(self, synth_dataset, synth_params, device):
+        solver = self._make_solver(synth_dataset, synth_params, device)
+        assert not solver.get_tcBF(chunk_size=8).requires_grad
+        assert solver.reconstructed_image is not None
+        assert not solver.reconstructed_image.requires_grad
+
+        assert not solver.get_acBF(chunk_size=8).requires_grad
+        assert solver.reconstructed_image is not None
+        assert not solver.reconstructed_image.requires_grad
+
+    def test_plot_reconstruction_does_not_store_graph(self, synth_dataset, synth_params, device, monkeypatch):
+        from fast_acbf.vis import plotting
+
+        solver = self._make_solver(synth_dataset, synth_params, device)
+        monkeypatch.setattr(plotting, "plot_reconstruction", lambda *args, **kwargs: None)
+
+        solver.plot_reconstruction(mode='tcBF', chunk_size=8)
+
+        assert solver.reconstructed_image is not None
+        assert not solver.reconstructed_image.requires_grad
+
+    def test_non_ad_refinements_do_not_store_graph(self, synth_dataset, synth_params, device):
+        solver = self._make_solver(synth_dataset, synth_params, device)
+
+        solver.refine_defocus(
+            search_range=(40.0, 60.0),
+            num_points=3,
+            plot_line_search=False,
+            chunk_size=8,
+        )
+        assert solver.reconstructed_image is not None
+        assert not solver.reconstructed_image.requires_grad
+
+        solver.refine_flips(chunk_size=8)
+        assert solver.reconstructed_image is not None
+        assert not solver.reconstructed_image.requires_grad
+
+        solver.refine_scan_rotation(
+            search_range=(-1.0, 1.0),
+            num_points=3,
+            chunk_size=8,
+        )
+        assert solver.reconstructed_image is None
+
+    def test_roi_refine_aberrations_updates_full_solver_no_grad(self, synth_dataset, synth_params, device):
+        solver = self._make_solver(
+            synth_dataset,
+            synth_params,
+            device,
+            aberrations={"C10": 25.0, "C12": 5.0, "phi12": 30.0},
+        )
+        before = {
+            key: solver.ab_state.get_physical(key)
+            for key in solver.ab_state.coeffs
+        }
+
+        solver.refine_aberrations(
+            iters=1,
+            lr=0.1,
+            scan_roi=(0, 4, 0, 4),
+            chunk_size=8,
+        )
+
+        after = {
+            key: solver.ab_state.get_physical(key)
+            for key in solver.ab_state.coeffs
+        }
+        assert any(after[key] != pytest.approx(before[key]) for key in before)
+        assert solver.reconstructed_image.shape == synth_dataset.shape[:2]
+        assert not solver.reconstructed_image.requires_grad
+
+
 # ── get_defocus_stack ─────────────────────────────────────────────────────────
 
 class TestGetDefocusStack:
@@ -429,13 +535,15 @@ class TestFrameCacheBehavior:
 
     def test_clear_cache_clears_all_caches(self, solver_zero_ab):
         img = solver_zero_ab.get_tcBF(chunk_size=8)
-        assert solver_zero_ab.reconstructed_image is img
+        torch.testing.assert_close(solver_zero_ab.reconstructed_image, img, atol=0, rtol=0)
+        assert not solver_zero_ab.reconstructed_image.requires_grad
         assert len(solver_zero_ab._basis_cache) >= 1
         assert solver_zero_ab._fft_cache is not None
 
         solver_zero_ab.clear_cache()
 
-        assert solver_zero_ab.reconstructed_image is img
+        torch.testing.assert_close(solver_zero_ab.reconstructed_image, img, atol=0, rtol=0)
+        assert not solver_zero_ab.reconstructed_image.requires_grad
         assert len(solver_zero_ab._basis_cache) == 0
         assert solver_zero_ab._fft_cache is None
 

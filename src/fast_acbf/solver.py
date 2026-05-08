@@ -296,9 +296,9 @@ class BFSolver:
                 "cache cleanup. Use upscale=1."
             )
 
-    def reconstruct(self, mode='tcBF', **kwargs):
+    def _reconstruct_impl(self, mode='tcBF', **kwargs):
         """
-        Unified reconstruction entry point.
+        Differentiable reconstruction implementation.
 
         Notes:
             - tcBF is the default mode.
@@ -334,6 +334,20 @@ class BFSolver:
             )
 
         raise ValueError(f"Unsupported mode '{mode}'. Choose between 'tcBF' and 'acBF'.")
+
+    def reconstruct(self, mode='tcBF', requires_grad: bool = False, **kwargs):
+        """
+        Unified reconstruction entry point.
+
+        Public/read-only reconstruction is no-grad by default so normal use does
+        not retain autograd graphs. Pass requires_grad=True only from AD
+        optimization paths that need gradients with respect to aberrations.
+        """
+        if requires_grad:
+            return self._reconstruct_impl(mode=mode, **kwargs)
+
+        with torch.no_grad():
+            return self._reconstruct_impl(mode=mode, **kwargs)
 
     def _build_c10_stack_axis(self, n_layers=None, z_top=None, z_bottom=None, slice_thickness=None):
         return build_c10_axis(
@@ -441,8 +455,8 @@ class BFSolver:
         """Return the reconstructed image, optionally rotated to detector frame."""
         mode = mode.lower()
         frame = self._validate_frame(frame)
-        img = self.reconstruct(mode=mode, **kwargs)
-        self.reconstructed_image = img
+        img = self.reconstruct(mode=mode, requires_grad=False, **kwargs)
+        self.reconstructed_image = img.detach()
 
         if frame == 'detector':
             img = self.rotate_scan_image_to_detector(img)
@@ -462,15 +476,16 @@ class BFSolver:
         self._validate_native_upscale(kwargs.get('upscale', 1))
         rolloff = kwargs.get('rolloff', 0)
         chunk_size = kwargs.get('chunk_size', 64)
-        cache = self._get_acBF_cache(rolloff=rolloff, chunk_size=chunk_size)
-        return reconstruct_acbf_complex_inversion(
-            cache,
-            self._get_scan_frame_coeffs(),
-            self.device,
-            regularization=kwargs.get('regularization', 1e-3),
-            support_threshold=kwargs.get('support_threshold', 1e-6),
-            return_diagnostics=True,
-        )
+        with torch.no_grad():
+            cache = self._get_acBF_cache(rolloff=rolloff, chunk_size=chunk_size)
+            return reconstruct_acbf_complex_inversion(
+                cache,
+                self._get_scan_frame_coeffs(),
+                self.device,
+                regularization=kwargs.get('regularization', 1e-3),
+                support_threshold=kwargs.get('support_threshold', 1e-6),
+                return_diagnostics=True,
+            )
 
     def get_defocus_stack(
         self,
@@ -544,6 +559,7 @@ class BFSolver:
         fine_rotation_num_points: int = 11,
         aberration_lr: float = 1.0,
         aberration_iters: int = 50,
+        refinement_scan_roi=None,
         **kwargs,
     ) -> 'BFSolver':
         """Coarse-to-fine parameter orchestration. See optimization.refinement.refine_all_params."""
@@ -561,6 +577,7 @@ class BFSolver:
             fine_rotation_num_points=fine_rotation_num_points,
             aberration_lr=aberration_lr,
             aberration_iters=aberration_iters,
+            refinement_scan_roi=refinement_scan_roi,
             **kwargs,
         )
         return self
@@ -593,9 +610,10 @@ class BFSolver:
             ab_dict = self.get_aberrations_dict(frame=frame, layout='flat')
             desc_str = ", ".join(f"{ab}: {val:.2f}" for ab, val in ab_dict.items())
 
-        img = self.get_reconstructed_image(mode=mode, frame=frame, **kwargs).detach().cpu().numpy()
-        fft = np.log(np.abs(np.fft.fftshift(mfft2(img)[0])))
-        probe = self.get_probe(frame=frame).abs().detach().cpu().numpy()
+        with torch.no_grad():
+            img = self.get_reconstructed_image(mode=mode, frame=frame, **kwargs).detach().cpu().numpy()
+            fft = np.log(np.abs(np.fft.fftshift(mfft2(img)[0])))
+            probe = self.get_probe(frame=frame).abs().detach().cpu().numpy()
 
         plotting.plot_reconstruction(
             img, fft, probe,

@@ -3,7 +3,7 @@
 All functions accept a solver-like object via duck typing (no BFSolver import).
 Required solver interface:
     .ab_state          — AberrationState with set_physical / get_physical
-    .reconstruct(mode, **kwargs) -> Tensor
+    .reconstruct(mode, requires_grad=False, **kwargs) -> Tensor
     .set_rotation_deg(deg, clear_basis=False) — handles cache invalidation internally
     .clear_basis_cache()         — clears orientation-dependent caches, preserves FFT cache
     .clear_cache()               — full reset (both basis and FFT caches)
@@ -23,6 +23,52 @@ import numpy as np
 import torch
 
 from fast_acbf.optimization.metrics import QualityMetrics
+
+
+def _validate_scan_roi(scan_roi, dataset_shape):
+    """Normalize a scan ROI tuple against the leading scan dimensions."""
+    if scan_roi is None:
+        return None
+    if len(scan_roi) != 4:
+        raise ValueError("scan_roi must be a 4-tuple (y0, y1, x0, x1).")
+
+    y0, y1, x0, x1 = (int(v) for v in scan_roi)
+    ry, rx = dataset_shape[:2]
+    if not (0 <= y0 < y1 <= ry and 0 <= x0 < x1 <= rx):
+        raise ValueError(
+            f"scan_roi must satisfy 0 <= y0 < y1 <= {ry} and "
+            f"0 <= x0 < x1 <= {rx}, got {(y0, y1, x0, x1)}."
+        )
+    return y0, y1, x0, x1
+
+
+def _copy_aberrations(src_solver, dst_solver):
+    """Copy physical detector-frame aberration values between compatible solvers."""
+    with torch.no_grad():
+        for key in dst_solver.ab_state.coeffs:
+            dst_solver.ab_state.set_physical(key, src_solver.ab_state.get_physical(key))
+
+
+def _build_roi_solver(solver, scan_roi):
+    """Create a temporary solver on a scan-space crop with matching physics state."""
+    from fast_acbf.solver import BFSolver
+
+    y0, y1, x0, x1 = _validate_scan_roi(scan_roi, solver.dataset.shape)
+    dataset_roi = np.ascontiguousarray(solver.dataset[y0:y1, x0:x1])
+
+    return BFSolver(
+        dataset=dataset_roi,
+        max_alpha=solver.max_alpha,
+        scan_step_size=solver.scan_step_size,
+        dk=solver.dk,
+        wavelength=solver.wavelength,
+        max_order=solver.max_order,
+        aberrations=solver.ab_state.get_cartesian_dict(),
+        device=solver.device,
+        coord_transform=solver.coord_transform.copy(),
+        eps=solver.eps,
+        cache_mode=solver.cache_mode,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -150,6 +196,7 @@ def refine_aberrations(
     plot_recon_every_n_iter=None,
     save_dir=None,
     mode: str = 'tcBF',
+    scan_roi=None,
     **kwargs,
 ) -> None:
     """
@@ -167,8 +214,36 @@ def refine_aberrations(
         plot_recon_every_n_iter: Show reconstruction every N iterations if set.
         save_dir:                Directory to save per-iteration figures if set.
         mode:                    Reconstruction mode.
+        scan_roi:                Optional (y0, y1, x0, x1) scan crop for AD refinement.
     """
     mode = mode.lower()
+
+    if scan_roi is not None:
+        roi_solver = _build_roi_solver(solver, scan_roi)
+        refine_aberrations(
+            roi_solver,
+            lr=lr,
+            lr_scales=lr_scales,
+            iters=iters,
+            metric=metric,
+            plot_recon_every_n_iter=plot_recon_every_n_iter,
+            save_dir=save_dir,
+            mode=mode,
+            scan_roi=None,
+            **kwargs,
+        )
+        _copy_aberrations(roi_solver, solver)
+        roi_solver.clear_cache()
+        del roi_solver
+        if torch.device(solver.device).type == 'cuda':
+            torch.cuda.empty_cache()
+
+        solver.clear_basis_cache()
+        solver.reconstructed_image = solver.reconstruct(
+            mode=mode, requires_grad=False, **kwargs,
+        ).detach()
+        return
+
     max_order = solver.ab_state.max_order
 
     if lr_scales is None:
@@ -190,7 +265,7 @@ def refine_aberrations(
 
     for i in range(iters):
         optimizer.zero_grad()
-        summed_img = solver.reconstruct(mode=mode, **kwargs)
+        summed_img = solver.reconstruct(mode=mode, requires_grad=True, **kwargs)
         solver.reconstructed_image = summed_img.detach()
         loss = -1 * QualityMetrics.evaluate(summed_img, metric=metric)
         loss.backward()
@@ -478,6 +553,7 @@ def refine_all_params(
     fine_rotation_num_points: int = 11,
     aberration_lr: float = 1.0,
     aberration_iters: int = 50,
+    refinement_scan_roi=None,
     **kwargs,
 ) -> None:
     """
@@ -505,6 +581,7 @@ def refine_all_params(
         fine_rotation_num_points:       Number of angles for Step 3.
         aberration_lr:                  Base learning rate for Adam steps.
         aberration_iters:               Gradient steps per Adam call.
+        refinement_scan_roi:            Optional scan ROI for AD aberration steps.
     """
     mode = mode.lower()
     targets = tuple(targets)
@@ -538,6 +615,7 @@ def refine_all_params(
             iters=aberration_iters,
             metric=metric,
             mode=mode,
+            scan_roi=refinement_scan_roi,
             **kwargs,
         )
 
@@ -559,5 +637,6 @@ def refine_all_params(
             iters=aberration_iters,
             metric=metric,
             mode=mode,
+            scan_roi=refinement_scan_roi,
             **kwargs,
         )
