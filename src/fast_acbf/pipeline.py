@@ -146,7 +146,7 @@ def build_acbf_cache(
     wavelength: float,
     max_order: int,
     device: str,
-    cache_mode: str = 'full',
+    cache_mode: str = 'lazy',
     rolloff: float = 0,
     chunk_size: int = 64,
     *,

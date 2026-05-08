@@ -44,7 +44,7 @@ class BFSolver:
         device='cuda',
         coord_transform=None,
         eps: float = 1e-3,
-        cache_mode: str = 'full',
+        cache_mode: str = 'lazy',
     ):
         """
         Initializes the solver. Dataset loading/parsing is assumed to be handled
@@ -52,6 +52,7 @@ class BFSolver:
 
         Args:
             cache_mode: Controls how the static acBF/tcBF cache is stored.
+                Defaults to 'lazy' for memory safety.
                 'full' — Precompute and cache all static acBF/tcBF tensors on device.
                 'lazy' — Cache only FFTs and detector coordinates, regenerating heavy
                          acBF basis/aperture tensors during each reconstruction.
