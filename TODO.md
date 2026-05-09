@@ -2,11 +2,6 @@
 
 ## High Priority
 
-- **`refine_params` orchestration method** — high-level entry point that sequentially runs
-  `refine_flips`, `refine_defocus`, `refine_scan_rotation`, and `refine_aberrations` with
-  boolean flags to enable/disable each step. Should accept a shared `mode` and `metric` and
-  handle cache invalidation between steps automatically.
-
 - **Improve `normalized_std` metric for acBF** — acBF images can have inverted contrast
   relative to tcBF; `normalized_std` is sign-agnostic but maximizing it can converge to the
   wrong polarity. Options: (a) detect and flip sign before scoring, (b) score on
@@ -17,10 +12,6 @@
   `probe` (complex wavefield), and `aberrations` (detector-frame dict ready for PtyRAD),
   optionally with `frame` selector. Consolidates the `get_reconstructed_image` + `get_probe`
   + `get_aberrations_dict` pattern used in notebooks.
-
-- **Benchmark peak VRAM vs. dataset size and max_order** — systematic sweep over
-  `(Nb, Ry, Rx, max_order)` for both `full` and `lazy` cache modes; measure peak GPU memory
-  and wall-clock time. Intended to produce a reference table for users choosing `cache_mode`.
 
 - **Revisit resampling approaches** — two separate questions that need literature before
   implementing:
