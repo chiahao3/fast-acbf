@@ -1,4 +1,4 @@
-"""Tests for the standalone VRAM benchmark helpers."""
+"""Tests for the standalone benchmark helpers."""
 from __future__ import annotations
 
 import importlib.util
@@ -11,6 +11,20 @@ import numpy as np
 def _load_benchmark_module():
     path = Path(__file__).resolve().parents[1] / "scripts" / "benchmark_vram.py"
     spec = importlib.util.spec_from_file_location("benchmark_vram", path)
+    module = importlib.util.module_from_spec(spec)
+    assert spec.loader is not None
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+def _load_timing_module():
+    scripts_dir = Path(__file__).resolve().parents[1] / "scripts"
+    if str(scripts_dir) not in sys.path:
+        sys.path.insert(0, str(scripts_dir))
+    _load_benchmark_module()
+    path = scripts_dir / "benchmark_timing.py"
+    spec = importlib.util.spec_from_file_location("benchmark_timing", path)
     module = importlib.util.module_from_spec(spec)
     assert spec.loader is not None
     sys.modules[spec.name] = module
@@ -85,3 +99,26 @@ def test_with_estimates_fills_failed_rows():
     assert failed["measured_status"] == "oom"
     assert failed["status"] == "oom_estimated"
     assert failed["peak_allocated_gib"] > 0
+
+
+def test_timing_stat_block_reports_basic_stats():
+    timing = _load_timing_module()
+
+    stats = timing.stat_block([1.0, 2.0, 3.0], "example")
+
+    assert stats["example_mean_s"] == 2.0
+    assert stats["example_min_s"] == 1.0
+    assert stats["example_max_s"] == 3.0
+    assert stats["example_std_s"] > 0
+
+
+def test_timing_vbf_host_uses_requested_geometry():
+    bench = _load_benchmark_module()
+    timing = _load_timing_module()
+    geom = bench.detector_geometry_for_nb(512)
+    dataset = bench.make_synthetic_dataset(8, 8, geom)
+
+    vbf = timing.make_vbf_host(dataset, geom)
+
+    assert vbf.shape == (geom.actual_nb, 8, 8)
+    assert vbf.dtype == np.float32
