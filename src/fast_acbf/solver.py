@@ -27,6 +27,8 @@ from fast_acbf.pipeline import (
     build_image_fft,
     build_scan_freq_grids,
     build_tcbf_cache,
+    compute_bf_geometry,
+    extract_vbf_stack,
     init_grid,
     init_vbf,
 )
@@ -116,9 +118,11 @@ class BFSolver:
         self._image_fft: ImageFFT | None = None
         self.last_c10_stack_axis = None
 
-        # One-time pipeline setup
+        # One-time pipeline setup. _bf_mask_bool and _vbf_pinned_buffer support
+        # in-place dataset/geometry updates during live acquisition.
         (self.vbf_images, self.kY_centers, self.kX_centers,
-         self.kY_grid, self.kX_grid, self.bf_mask) = init_vbf(
+         self.kY_grid, self.kX_grid, self.bf_mask,
+         self._bf_mask_bool, self._vbf_pinned_buffer) = init_vbf(
             dataset, max_alpha, dk, wavelength, device
         )
         self.bf_coordinates = torch.stack([self.kY_centers, self.kX_centers], dim=-1)
@@ -200,6 +204,273 @@ class BFSolver:
             )
         self.vbf_images = new_vbf_images
         return self.replace_image_fft(torch.fft.fft2(new_vbf_images, dim=(-2, -1)))
+
+    # ------------------------------------------------------------------
+    # Live-acquisition setters
+    # ------------------------------------------------------------------
+
+    def _invalidate_acbf_optics(self):
+        """Drop the optics tensors from every acBF cache entry; preserve geometry."""
+        for k, v in list(self._basis_cache.items()):
+            if isinstance(k, tuple) and len(k) > 0 and k[0] == 'acBF' and isinstance(v, tuple):
+                geometry, _ = v
+                self._basis_cache[k] = (geometry, None)
+
+    def _recompute_tolerance_factors(self):
+        """Recompute Kirkland tolerance factors from the current max_alpha and wavelength."""
+        alpha_rad = float(self.max_alpha) / 1e3
+        self.tolerance_factors = {
+            n: float((n + 1) * self.wavelength / (8 * alpha_rad ** (n + 1)))
+            for n in range(1, self.max_order + 1)
+        }
+        self.ab_state.rebuild_normalization(self.tolerance_factors)
+
+    def _rebuild_bf_geometry_and_stack(self, new_dataset: np.ndarray):
+        """Rebuild bf_mask, k-grids, vBF stack from a new dataset under current params.
+
+        Used by Tier-3 setters whose change invalidates the BF mask
+        (max_alpha, dk, wavelength). After this returns, all basis/FFT caches
+        must be cleared by the caller (Nb may have changed).
+
+        Reallocates the pinned host buffer and the device vbf_images tensor —
+        Nb is allowed to change.
+        """
+        Ry, Rx, Ky_dim, Kx_dim = new_dataset.shape
+        kY_grid_np, kX_grid_np, bf_mask_bool = compute_bf_geometry(
+            Ky_dim, Kx_dim, self.max_alpha, self.dk, self.wavelength,
+        )
+        self._bf_mask_bool = bf_mask_bool
+
+        self.kY_grid = torch.tensor(kY_grid_np, dtype=torch.float32, device=self.device)
+        self.kX_grid = torch.tensor(kX_grid_np, dtype=torch.float32, device=self.device)
+        self.bf_mask = torch.tensor(bf_mask_bool, dtype=torch.float32, device=self.device)
+        self.kY_centers = torch.tensor(
+            kY_grid_np[bf_mask_bool], dtype=torch.float32, device=self.device,
+        )
+        self.kX_centers = torch.tensor(
+            kX_grid_np[bf_mask_bool], dtype=torch.float32, device=self.device,
+        )
+        self.bf_coordinates = torch.stack([self.kY_centers, self.kX_centers], dim=-1)
+
+        # Force reallocation — Nb (and possibly Ry, Rx) may have changed.
+        self.vbf_images, self._vbf_pinned_buffer = extract_vbf_stack(
+            new_dataset, bf_mask_bool, self.device,
+            out=None, pinned_buffer=None,
+        )
+        self.dataset = new_dataset
+
+        if (Ry, Rx) != (self.Ry, self.Rx):
+            self.Ry, self.Rx = Ry, Rx
+            self.shift_grid = init_grid(Ry, Rx, self.device)
+            self.qx_grid, self.qy_grid = build_scan_freq_grids(
+                Ry, Rx, self.scan_step_size, self.device,
+            )
+
+    def update_dataset(self, new_dataset: np.ndarray):
+        """Tier-1 update: new 4D dataset under unchanged optics/scan geometry.
+
+        Re-extracts the vBF stack via the cached BF mask using a pinned host
+        buffer + non-blocking H2D copy, then refreshes the cached image FFT.
+        Preserves all basis caches.
+
+        Raises if the dataset shape does not match (Ry, Rx, *, *) under the
+        current mask; for shape changes, use update_scan_shape instead.
+        """
+        new_Ry, new_Rx = new_dataset.shape[0], new_dataset.shape[1]
+        if (new_Ry, new_Rx) != (self.Ry, self.Rx):
+            raise ValueError(
+                f"update_dataset: scan shape {(new_Ry, new_Rx)} does not match "
+                f"solver shape {(self.Ry, self.Rx)}. Use update_scan_shape."
+            )
+        if new_dataset.shape[2:] != self._bf_mask_bool.shape:
+            raise ValueError(
+                f"update_dataset: detector shape {new_dataset.shape[2:]} does not match "
+                f"BF mask shape {self._bf_mask_bool.shape}."
+            )
+        self.vbf_images, self._vbf_pinned_buffer = extract_vbf_stack(
+            new_dataset, self._bf_mask_bool, self.device,
+            out=self.vbf_images, pinned_buffer=self._vbf_pinned_buffer,
+        )
+        # Track latest 4D array — refinement._build_roi_solver and friends
+        # read solver.dataset; if we don't refresh it here, the ROI path
+        # silently keeps cropping the original frame.
+        self.dataset = new_dataset
+        # FFT cache must follow the data; basis caches are independent.
+        self._image_fft = build_image_fft(self.vbf_images)
+        return self
+
+    def update_scan_step(self, new_scan_step: float):
+        """Tier-2 update: scan step size (Å/pixel).
+
+        Rebuilds the scan-frequency grids and invalidates ACBFOpticsCache only.
+        TCBFCache, ACBFGeometryCache, and ImageFFT all survive.
+        """
+        new_scan_step = float(new_scan_step)
+        if new_scan_step == self.scan_step_size:
+            return self
+        self.scan_step_size = new_scan_step
+        self.qx_grid, self.qy_grid = build_scan_freq_grids(
+            self.Ry, self.Rx, self.scan_step_size, self.device,
+        )
+        self._invalidate_acbf_optics()
+        return self
+
+    def update_scan_shape(self, new_dataset: np.ndarray):
+        """Tier-3 partial update: scan field-of-view (Ry, Rx) changes.
+
+        Rebuilds qx/qy grids, shift_grid, vBF stack, and image FFT. Preserves
+        TCBFCache and ACBFGeometryCache (Nb unchanged); clears ACBFOpticsCache
+        and ImageFFT.
+        """
+        Ry, Rx = new_dataset.shape[0], new_dataset.shape[1]
+        if new_dataset.shape[2:] != self._bf_mask_bool.shape:
+            raise ValueError(
+                f"update_scan_shape: detector shape {new_dataset.shape[2:]} does not match "
+                f"BF mask shape {self._bf_mask_bool.shape}."
+            )
+        if (Ry, Rx) == (self.Ry, self.Rx):
+            return self.update_dataset(new_dataset)
+
+        self.Ry, self.Rx = Ry, Rx
+        self.qx_grid, self.qy_grid = build_scan_freq_grids(
+            Ry, Rx, self.scan_step_size, self.device,
+        )
+        self.shift_grid = init_grid(Ry, Rx, self.device)
+        # Force reallocation — Ry, Rx changed.
+        self.vbf_images, self._vbf_pinned_buffer = extract_vbf_stack(
+            new_dataset, self._bf_mask_bool, self.device,
+            out=None, pinned_buffer=None,
+        )
+        self.dataset = new_dataset
+        self._image_fft = build_image_fft(self.vbf_images)
+        self._invalidate_acbf_optics()
+        return self
+
+    def update_convergence_angle(self, new_max_alpha: float, new_dataset: np.ndarray):
+        """Tier-3 heavy update: probe convergence semi-angle (mrad).
+
+        Changes the BF mask → Nb may change → all basis/FFT caches are cleared
+        and tolerance factors are rebuilt on `ab_state`.
+        """
+        new_max_alpha = float(new_max_alpha)
+        if new_max_alpha == self.max_alpha:
+            return self.update_dataset(new_dataset)
+        self.max_alpha = new_max_alpha
+        self._recompute_tolerance_factors()
+        self._rebuild_bf_geometry_and_stack(new_dataset)
+        self.clear_cache()
+        return self
+
+    def update_dk(self, new_dk: float, new_dataset: np.ndarray):
+        """Tier-3 heavy update: detector reciprocal pixel size (Å⁻¹/pixel)."""
+        new_dk = float(new_dk)
+        if new_dk == self.dk:
+            return self.update_dataset(new_dataset)
+        self.dk = new_dk
+        # max_alpha and wavelength unchanged → tolerance_factors unchanged.
+        self._rebuild_bf_geometry_and_stack(new_dataset)
+        self.clear_cache()
+        return self
+
+    def update_wavelength(self, new_wavelength: float, new_dataset: np.ndarray):
+        """Tier-3 heavy update: electron wavelength (Å).
+
+        Wavelength enters the BF mask, the Kirkland tolerance factors, and
+        every basis. All caches are cleared and the AberrationState is
+        re-normalized under the new tolerances.
+        """
+        new_wavelength = float(new_wavelength)
+        if new_wavelength == self.wavelength:
+            return self.update_dataset(new_dataset)
+        self.wavelength = new_wavelength
+        self._recompute_tolerance_factors()
+        self._rebuild_bf_geometry_and_stack(new_dataset)
+        self.clear_cache()
+        return self
+
+    _METADATA_KEYS = (
+        'wavelength', 'max_alpha', 'dk', 'scan_shape', 'scan_step_size',
+        'rotation_deg', 'flipud', 'fliplr', 'transpose',
+    )
+    _HEAVY_KEYS = ('wavelength', 'max_alpha', 'dk')
+
+    def apply_metadata(self, metadata: dict, dataset: np.ndarray | None = None):
+        """Diff `metadata` against current state and dispatch setters from
+        heaviest to lightest.
+
+        Recognized keys:
+            wavelength, max_alpha, dk, scan_step_size, rotation_deg,
+            flipud, fliplr, transpose, scan_shape (tuple (Ry, Rx))
+
+        `dataset` is required if any heavy or scan-shape change is detected.
+        Tier-3 setters consume the dataset themselves; once consumed, the
+        trailing Tier-1 update_dataset is suppressed to avoid a redundant
+        second H2D copy.
+
+        Unknown keys are warned and ignored.
+        """
+        for key in metadata:
+            if key not in self._METADATA_KEYS:
+                logger.warning(
+                    "apply_metadata: ignoring unrecognized key %r (recognized: %s)",
+                    key, self._METADATA_KEYS,
+                )
+
+        # Detect changes.
+        changed_heavy = any(
+            k in metadata and float(metadata[k]) != float(getattr(self, k))
+            for k in self._HEAVY_KEYS
+        )
+        new_shape = tuple(metadata['scan_shape']) if 'scan_shape' in metadata else None
+        changed_shape = new_shape is not None and new_shape != (self.Ry, self.Rx)
+
+        if (changed_heavy or changed_shape) and dataset is None:
+            raise ValueError(
+                "apply_metadata: a heavy or scan-shape change requires `dataset`."
+            )
+
+        dataset_consumed = False
+
+        # Heaviest first; each Tier-3 setter calls clear_cache and absorbs the dataset.
+        if 'wavelength' in metadata and float(metadata['wavelength']) != self.wavelength:
+            self.update_wavelength(float(metadata['wavelength']), dataset)
+            dataset_consumed = True
+        if 'max_alpha' in metadata and float(metadata['max_alpha']) != self.max_alpha:
+            self.update_convergence_angle(float(metadata['max_alpha']), dataset)
+            dataset_consumed = True
+        if 'dk' in metadata and float(metadata['dk']) != self.dk:
+            self.update_dk(float(metadata['dk']), dataset)
+            dataset_consumed = True
+
+        if changed_shape and not dataset_consumed:
+            self.update_scan_shape(dataset)
+            dataset_consumed = True
+
+        if 'scan_step_size' in metadata and float(metadata['scan_step_size']) != self.scan_step_size:
+            self.update_scan_step(float(metadata['scan_step_size']))
+
+        # Rotation / flips. Always pass clear_basis=True for live acquisition
+        # to prevent VRAM bloat from accumulated per-angle bases.
+        flip_changed = any(
+            k in metadata and bool(metadata[k]) != bool(self.coord_transform.get(k, False))
+            for k in ('flipud', 'fliplr', 'transpose')
+        )
+        rot_changed = (
+            'rotation_deg' in metadata
+            and float(metadata['rotation_deg']) != self.rotation_deg
+        )
+        if flip_changed or rot_changed:
+            for k in ('flipud', 'fliplr', 'transpose'):
+                if k in metadata:
+                    self.coord_transform[k] = bool(metadata[k])
+            new_rot = float(metadata.get('rotation_deg', self.rotation_deg))
+            self.set_rotation_deg(new_rot, clear_basis=True)
+
+        # Tier-1 dataset update — only if no heavier setter already consumed it.
+        if dataset is not None and not dataset_consumed:
+            self.update_dataset(dataset)
+
+        return self
 
     def _get_transform_flags(self):
         flipud = self.coord_transform.get('flipud', False)

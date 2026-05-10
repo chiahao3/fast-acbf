@@ -46,6 +46,67 @@ class ACBFOpticsCache:
     chunks: list  # each: {ap_t, ap_mt, b_tr, b_t, b_mt, start, end}
 
 
+def compute_bf_geometry(
+    Ky_dim: int, Kx_dim: int, max_alpha: float, dk: float, wavelength: float,
+):
+    """Build the k-space coordinate grids and the boolean BF aperture mask.
+
+    Returns numpy arrays only — caller decides where to put them.
+    """
+    ky = np.fft.fftshift(np.fft.fftfreq(Ky_dim, d=(1 / dk / Ky_dim)))
+    kx = np.fft.fftshift(np.fft.fftfreq(Kx_dim, d=(1 / dk / Kx_dim)))
+    kX_grid, kY_grid = np.meshgrid(kx, ky, indexing='xy')
+    kR_grid = np.sqrt(kX_grid**2 + kY_grid**2)
+    bf_mask_bool = kR_grid <= (max_alpha / 1e3 / wavelength)
+    return kY_grid, kX_grid, bf_mask_bool
+
+
+def extract_vbf_stack(
+    dataset: np.ndarray,
+    bf_mask_bool: np.ndarray,
+    device: str,
+    *,
+    out: torch.Tensor | None = None,
+    pinned_buffer: torch.Tensor | None = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Apply the BF mask to a 4D dataset and stage onto `device`.
+
+    Layout: dataset is (Ry, Rx, Ky, Kx); output is (Nb, Ry, Rx) float32.
+
+    Live-acquisition fast path:
+        - If `pinned_buffer` is provided and shape-matches, the masked stack is
+          copied into it (host pinned memory) and then to `out` (device tensor)
+          with non_blocking=True. Caller reuses both buffers across frames.
+        - If `out` is provided, the result is copied in-place into it.
+        - If neither is provided, both are freshly allocated.
+
+    Returns (vbf_images, pinned_buffer) so the caller can stash the pinned
+    buffer for reuse on the next frame. Pinned buffer is None on CPU device.
+    """
+    masked = dataset[:, :, bf_mask_bool]
+    masked = np.ascontiguousarray(np.moveaxis(masked, -1, 0)).astype(np.float32, copy=False)
+    expected_shape = masked.shape
+
+    use_pinned = str(device).startswith('cuda')
+
+    if use_pinned:
+        if pinned_buffer is None or tuple(pinned_buffer.shape) != expected_shape:
+            pinned_buffer = torch.empty(expected_shape, dtype=torch.float32, pin_memory=True)
+        pinned_buffer.copy_(torch.from_numpy(masked))
+        if out is None or tuple(out.shape) != expected_shape:
+            out = torch.empty(expected_shape, dtype=torch.float32, device=device)
+        out.copy_(pinned_buffer, non_blocking=True)
+        return out, pinned_buffer
+
+    # CPU path — no pinned-memory benefit; just allocate / copy.
+    src = torch.from_numpy(masked)
+    if out is None or tuple(out.shape) != expected_shape:
+        out = src.to(device=device)
+    else:
+        out.copy_(src)
+    return out, None
+
+
 def init_vbf(dataset: np.ndarray, max_alpha: float, dk: float, wavelength: float, device: str):
     """
     Build the BF mask, extract vBF image stack, and return k-space coordinate tensors.
@@ -57,31 +118,31 @@ def init_vbf(dataset: np.ndarray, max_alpha: float, dk: float, wavelength: float
         kY_grid (Tensor): (Ky, Kx) full k-grid
         kX_grid (Tensor): (Ky, Kx)
         bf_mask (Tensor): (Ky, Kx) float32 binary mask
+        bf_mask_bool (np.ndarray): (Ky, Kx) bool mask retained for live-acquisition reuse
+        pinned_buffer (Tensor | None): pinned host buffer used for the initial H2D copy,
+            returned so the solver can reuse it on subsequent dataset updates
     """
-    Ry_dim, Rx_dim, Ky_dim, Kx_dim = dataset.shape
+    _, _, Ky_dim, Kx_dim = dataset.shape
 
-    ky = np.fft.fftshift(np.fft.fftfreq(Ky_dim, d=(1 / dk / Ky_dim)))
-    kx = np.fft.fftshift(np.fft.fftfreq(Kx_dim, d=(1 / dk / Kx_dim)))
-    kX_grid, kY_grid = np.meshgrid(kx, ky, indexing='xy')
+    kY_grid, kX_grid, bf_mask_bool = compute_bf_geometry(Ky_dim, Kx_dim, max_alpha, dk, wavelength)
 
-    kR_grid = np.sqrt(kX_grid**2 + kY_grid**2)
-    bf_mask = kR_grid <= (max_alpha / 1e3 / wavelength)
+    kY_centers_np = kY_grid[bf_mask_bool]
+    kX_centers_np = kX_grid[bf_mask_bool]
 
-    kY_centers_np = kY_grid[bf_mask]
-    kX_centers_np = kX_grid[bf_mask]
-
-    vbf_np = dataset[:, :, bf_mask]
-    vbf_np = np.ascontiguousarray(np.moveaxis(vbf_np, -1, 0))
+    vbf_images, pinned_buffer = extract_vbf_stack(dataset, bf_mask_bool, device)
 
     kY_centers = torch.tensor(kY_centers_np, dtype=torch.float32, device=device)
     kX_centers = torch.tensor(kX_centers_np, dtype=torch.float32, device=device)
     kX_grid_t = torch.tensor(kX_grid, dtype=torch.float32, device=device)
     kY_grid_t = torch.tensor(kY_grid, dtype=torch.float32, device=device)
-    bf_mask_t = torch.tensor(bf_mask, dtype=torch.float32, device=device)
-    vbf_images = torch.tensor(vbf_np, dtype=torch.float32, device=device)
+    bf_mask_t = torch.tensor(bf_mask_bool, dtype=torch.float32, device=device)
 
     print(f"Extracted {vbf_images.shape[0]} vBF images within the max alpha angle = {max_alpha} mrad.")
-    return vbf_images, kY_centers, kX_centers, kY_grid_t, kX_grid_t, bf_mask_t
+    return (
+        vbf_images, kY_centers, kX_centers,
+        kY_grid_t, kX_grid_t, bf_mask_t,
+        bf_mask_bool, pinned_buffer,
+    )
 
 
 def init_grid(Ry: int, Rx: int, device: str) -> torch.Tensor:
@@ -261,7 +322,10 @@ def build_c10_axis(
             return torch.tensor([start], dtype=torch.float32, device=device)
 
         direction = 1.0 if delta > 0 else -1.0
-        steps = int(np.floor(abs(delta) / slice_thickness))
+        # Add a tiny epsilon before floor to absorb fp roundoff so a range that
+        # mathematically divides evenly (e.g. exactly 11 slices) does not
+        # silently lose its final slice when stored as 10.99999...
+        steps = int(np.floor(abs(delta) / slice_thickness + 1e-9))
         offsets = torch.arange(steps + 1, device=device, dtype=torch.float32)
         return start + direction * slice_thickness * offsets
 
