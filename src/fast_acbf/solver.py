@@ -17,12 +17,15 @@ from fast_acbf.core.acbf import reconstruct_acbf, reconstruct_acbf_complex_inver
 from fast_acbf.core.functional import generate_aberration_basis, generate_shift_basis, make_probe_from_chi
 from fast_acbf.core.tcbf import reconstruct_tcbf
 from fast_acbf.pipeline import (
-    ACBFCache,
-    BFImageCache,
+    ACBFGeometryCache,
+    ACBFOpticsCache,
+    ImageFFT,
     TCBFCache,
-    build_acbf_cache,
-    build_bf_image_cache,
+    build_acbf_geometry_cache,
+    build_acbf_optics_cache,
     build_c10_axis,
+    build_image_fft,
+    build_scan_freq_grids,
     build_tcbf_cache,
     init_grid,
     init_vbf,
@@ -110,7 +113,7 @@ class BFSolver:
 
         self.reconstructed_image = None
         self._basis_cache: dict = {}
-        self._fft_cache: BFImageCache | None = None
+        self._image_fft: ImageFFT | None = None
         self.last_c10_stack_axis = None
 
         # One-time pipeline setup
@@ -121,6 +124,10 @@ class BFSolver:
         self.bf_coordinates = torch.stack([self.kY_centers, self.kX_centers], dim=-1)
         self.Ry, self.Rx = dataset.shape[0], dataset.shape[1]
         self.shift_grid = init_grid(self.Ry, self.Rx, device)
+        # Scan-frame frequency grids — derived from (Ry, Rx, scan_step_size); fixed per session.
+        self.qx_grid, self.qy_grid = build_scan_freq_grids(
+            self.Ry, self.Rx, self.scan_step_size, self.device,
+        )
 
     # ------------------------------------------------------------------
     # Internal helpers — coordinate transforms & frame handling
@@ -138,18 +145,61 @@ class BFSolver:
         return self._rotation_deg
 
     def clear_basis_cache(self):
-        """Clear orientation-dependent basis caches. FFT cache is preserved."""
+        """Clear orientation-dependent basis caches. Image FFT preserved."""
         self._basis_cache = {}
 
     def clear_fft_cache(self):
-        """Clear the FFT image cache. Also clears basis cache (entries reference FFT data)."""
-        self._fft_cache = None
-        self._basis_cache = {}
+        """Drop the cached image FFT only.
+
+        Note: After the cache split, basis no longer references image data, so
+        this does NOT clear basis (a behavior change from the pre-split design).
+        Use clear_cache() for a full reset.
+        """
+        self._image_fft = None
 
     def clear_cache(self):
-        """Full reset — clears both basis and FFT caches."""
+        """Full reset — clears image FFT and basis caches."""
         self._basis_cache = {}
-        self._fft_cache = None
+        self._image_fft = None
+
+    def replace_image_fft(self, new_img_fft: torch.Tensor):
+        """Swap in a new image FFT for live acquisition; preserves basis caches.
+
+        Shape must match the current detector/scan geometry exactly. If the BF
+        mask or scan shape changes, rebuild the solver or update those geometry
+        objects explicitly before swapping image data.
+        """
+        expected_shape = (int(self.kX_centers.shape[0]), self.Ry, self.Rx)
+        if tuple(new_img_fft.shape) != expected_shape:
+            raise ValueError(
+                f"replace_image_fft: new img_fft shape {tuple(new_img_fft.shape)} "
+                f"does not match solver shape {expected_shape}."
+            )
+        new_Nb = int(new_img_fft.shape[0])
+        for key, val in self._basis_cache.items():
+            chunks = val[0].chunks if isinstance(val, tuple) else val.chunks
+            for chunk in chunks:
+                if chunk['end'] > new_Nb:
+                    raise ValueError(
+                        f"replace_image_fft: basis cache {key!r} has chunk end "
+                        f"{chunk['end']} > new Nb={new_Nb}. Call clear_basis_cache() first."
+                    )
+        if self._image_fft is None:
+            self._image_fft = ImageFFT(img_fft=new_img_fft)
+        else:
+            self._image_fft.img_fft = new_img_fft
+        return self
+
+    def replace_image_stack(self, new_vbf_images: torch.Tensor):
+        """Replace the BF image stack for live acquisition; preserves basis caches."""
+        expected_shape = (int(self.kX_centers.shape[0]), self.Ry, self.Rx)
+        if tuple(new_vbf_images.shape) != expected_shape:
+            raise ValueError(
+                f"replace_image_stack: new vBF stack shape {tuple(new_vbf_images.shape)} "
+                f"does not match solver shape {expected_shape}."
+            )
+        self.vbf_images = new_vbf_images
+        return self.replace_image_fft(torch.fft.fft2(new_vbf_images, dim=(-2, -1)))
 
     def _get_transform_flags(self):
         flipud = self.coord_transform.get('flipud', False)
@@ -251,39 +301,50 @@ class BFSolver:
     # Cache management — lazy-build wrappers
     # ------------------------------------------------------------------
 
-    def _get_fft_cache(self) -> BFImageCache:
-        """Return the orientation-independent FFT image cache, building it on first call."""
-        if self._fft_cache is None:
-            self._fft_cache = build_bf_image_cache(
-                self.vbf_images, self.scan_step_size, self.device,
-            )
-        return self._fft_cache
+    def _get_image_fft(self) -> ImageFFT:
+        """Return the BF image FFT, building it on first call."""
+        if self._image_fft is None:
+            self._image_fft = build_image_fft(self.vbf_images)
+        return self._image_fft
 
     def _get_tcBF_cache(self, chunk_size=64) -> TCBFCache:
         key = ('tcBF', chunk_size, *self._frame_cache_key())
         if key not in self._basis_cache:
             kX_full, kY_full = self._get_transformed_bf_coordinates()
-            ic = self._get_fft_cache()
             self._basis_cache[key] = build_tcbf_cache(
                 kX_full, kY_full,
-                self.ab_state.order_keys, self.wavelength, self.device, chunk_size,
-                img_fft=ic.img_fft, qx_grid=ic.qx_grid, qy_grid=ic.qy_grid, out_shape=ic.out_shape,
+                self.ab_state.order_keys, self.wavelength, chunk_size,
             )
         return self._basis_cache[key]
 
-    def _get_acBF_cache(self, rolloff=0, chunk_size=64) -> ACBFCache:
-        key = ('acBF', rolloff, chunk_size, self.cache_mode, *self._frame_cache_key())
+    def _get_acBF_cache(
+        self, rolloff=0, chunk_size=64,
+    ) -> tuple[ACBFGeometryCache, ACBFOpticsCache | None]:
+        """Return (geometry, optics_or_None).
+
+        Geometry is mode-independent and shared across lazy/full toggles.
+        Optics is built on demand only in 'full' mode; cached for free reuse if
+        the mode is later flipped back to 'full'. The consumer-facing optics
+        return is gated on the current cache_mode — flipping to 'lazy' yields
+        None even if optics is materialized in storage.
+        """
+        key = ('acBF', rolloff, chunk_size, *self._frame_cache_key())
         if key not in self._basis_cache:
             kX_full, kY_full = self._get_transformed_bf_coordinates()
-            ic = self._get_fft_cache()
-            self._basis_cache[key] = build_acbf_cache(
+            geometry = build_acbf_geometry_cache(
                 kX_full, kY_full,
-                self.ab_state.order_keys, self.max_alpha,
-                self.wavelength, self.max_order,
-                self.device, self.cache_mode, rolloff, chunk_size,
-                img_fft=ic.img_fft, qx_grid=ic.qx_grid, qy_grid=ic.qy_grid, out_shape=ic.out_shape,
+                self.ab_state.order_keys, self.max_alpha, self.wavelength,
+                self.max_order, rolloff, chunk_size,
             )
-        return self._basis_cache[key]
+            self._basis_cache[key] = (geometry, None)
+
+        geometry, optics = self._basis_cache[key]
+        if self.cache_mode == 'full':
+            if optics is None:
+                optics = build_acbf_optics_cache(geometry, self.qx_grid, self.qy_grid)
+                self._basis_cache[key] = (geometry, optics)
+            return geometry, optics
+        return geometry, None
 
     # ------------------------------------------------------------------
     # Reconstruction orchestration
@@ -311,21 +372,30 @@ class BFSolver:
         if mode_key == 'tcbf':
             self._validate_native_upscale(kwargs.get('upscale', 1))
             cache = self._get_tcBF_cache(chunk_size=kwargs.get('chunk_size', 64))
-            return reconstruct_tcbf(cache, self._get_scan_frame_coeffs(), self.device)
+            image_fft = self._get_image_fft()
+            return reconstruct_tcbf(
+                image_fft, self.qx_grid, self.qy_grid, cache,
+                self._get_scan_frame_coeffs(), self.device,
+            )
 
         elif mode_key == 'acbf':
             self._validate_native_upscale(kwargs.get('upscale', 1))
             rolloff = kwargs.get('rolloff', 0)
             chunk_size = kwargs.get('chunk_size', 64)
             acbf_algorithm = self._normalize_acbf_algorithm(kwargs.get('acbf_algorithm', 'phase_only'))
-            cache = self._get_acBF_cache(rolloff=rolloff, chunk_size=chunk_size)
+            geometry, optics = self._get_acBF_cache(rolloff=rolloff, chunk_size=chunk_size)
+            image_fft = self._get_image_fft()
             coeffs = self._get_scan_frame_coeffs()
 
             if acbf_algorithm == 'phase_only':
-                return reconstruct_acbf(cache, coeffs, self.eps, self.device)
+                return reconstruct_acbf(
+                    image_fft, self.qx_grid, self.qy_grid, geometry, optics,
+                    coeffs, self.eps, self.device,
+                )
             if acbf_algorithm == 'complex_inversion':
                 return reconstruct_acbf_complex_inversion(
-                    cache, coeffs, self.device,
+                    image_fft, self.qx_grid, self.qy_grid, geometry, optics,
+                    coeffs, self.device,
                     regularization=kwargs.get('regularization', 1e-3),
                     support_threshold=kwargs.get('support_threshold', 1e-6),
                 )
@@ -478,9 +548,10 @@ class BFSolver:
         rolloff = kwargs.get('rolloff', 0)
         chunk_size = kwargs.get('chunk_size', 64)
         with torch.no_grad():
-            cache = self._get_acBF_cache(rolloff=rolloff, chunk_size=chunk_size)
+            geometry, optics = self._get_acBF_cache(rolloff=rolloff, chunk_size=chunk_size)
+            image_fft = self._get_image_fft()
             return reconstruct_acbf_complex_inversion(
-                cache,
+                image_fft, self.qx_grid, self.qy_grid, geometry, optics,
                 self._get_scan_frame_coeffs(),
                 self.device,
                 regularization=kwargs.get('regularization', 1e-3),

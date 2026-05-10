@@ -5,57 +5,62 @@ from __future__ import annotations
 import torch
 
 from fast_acbf.core.functional import generate_aberration_basis, make_soft_aperture_torch
-from fast_acbf.pipeline import ACBFCache
+from fast_acbf.pipeline import ACBFGeometryCache, ACBFOpticsCache, ImageFFT
 
 
 def compute_transfer(
-    chunk: dict,
+    geom_chunk: dict,
+    optics_chunk: dict | None,
     coeffs: torch.Tensor,
-    cache: ACBFCache,
+    qx_grid: torch.Tensor,
+    qy_grid: torch.Tensor,
+    geometry: ACBFGeometryCache,
     device: str,
 ) -> torch.Tensor:
     """
-    Compute the detector-wise complex transfer for one cache chunk.
+    Compute the detector-wise complex transfer for one chunk.
 
-    Two paths depending on chunk content (self-describing structure):
-        Fast path ('full'): bases are pre-cached in the chunk dict.
-        Lazy path ('lazy'): bases are absent and recomputed from stored kxt/kyt,
-                            using physics params carried on the ACBFCache.
+    Two paths driven by the presence of an optics chunk:
+        Fast path: bases and apertures pre-cached on optics_chunk.
+        Lazy path: optics_chunk is None — recompute from geom_chunk + scan grids + physics.
 
     Args:
-        chunk:   Cache chunk dict (one element of cache.chunks).
-        coeffs:  Flat scan-frame aberration coefficients, shape (num_coeffs,).
-        cache:   ACBFCache — carries rolloff + physics params for the lazy path.
-        device:  Target device string.
+        geom_chunk:   One ACBFGeometryCache chunk dict ({kxt, kyt, start, end}).
+        optics_chunk: Matching ACBFOpticsCache chunk dict, or None for lazy path.
+        coeffs:       Flat scan-frame aberration coefficients, shape (num_coeffs,).
+        qx_grid:      Scan-frame frequency grid, shape (1, 1, Rx).
+        qy_grid:      Scan-frame frequency grid, shape (1, Ry, 1).
+        geometry:     ACBFGeometryCache — physics params used by the lazy path.
+        device:       Target device string.
 
     Returns:
         Complex transfer T, shape (chunk_size, Ny, Nx).
     """
     j1 = torch.tensor(1.0j, dtype=torch.complex64, device=device)
 
-    if 'b_tr' in chunk:
-        b_tr  = chunk['b_tr']
-        b_t   = chunk['b_t']
-        b_mt  = chunk['b_mt']
-        ap_t  = chunk['ap_t']
-        ap_mt = chunk['ap_mt']
+    if optics_chunk is not None:
+        b_tr  = optics_chunk['b_tr']
+        b_t   = optics_chunk['b_t']
+        b_mt  = optics_chunk['b_mt']
+        ap_t  = optics_chunk['ap_t']
+        ap_mt = optics_chunk['ap_mt']
     else:
-        kxt = chunk['kxt'].to(device)
-        kyt = chunk['kyt'].to(device)
-        kx_base = cache.qx_grid
-        ky_base = cache.qy_grid
-        kx_t,  ky_t  = kx_base + kxt, ky_base + kyt
-        kx_mt, ky_mt = kx_base - kxt, ky_base - kyt
+        kxt = geom_chunk['kxt'].to(device)
+        kyt = geom_chunk['kyt'].to(device)
+        kx_t,  ky_t  = qx_grid + kxt, qy_grid + kyt
+        kx_mt, ky_mt = qx_grid - kxt, qy_grid - kyt
         ap_t  = make_soft_aperture_torch(
-            torch.sqrt(kx_t**2  + ky_t**2)  * cache.wavelength, cache.max_alpha, cache.rolloff)
+            torch.sqrt(kx_t**2  + ky_t**2)  * geometry.wavelength,
+            geometry.max_alpha, geometry.rolloff)
         ap_mt = make_soft_aperture_torch(
-            torch.sqrt(kx_mt**2 + ky_mt**2) * cache.wavelength, cache.max_alpha, cache.rolloff)
+            torch.sqrt(kx_mt**2 + ky_mt**2) * geometry.wavelength,
+            geometry.max_alpha, geometry.rolloff)
         b_tr = generate_aberration_basis(
-            cache.max_order, cache.order_keys, kxt,    kyt,    cache.wavelength)
+            geometry.max_order, geometry.order_keys, kxt,    kyt,    geometry.wavelength)
         b_t  = generate_aberration_basis(
-            cache.max_order, cache.order_keys, kx_t,   ky_t,   cache.wavelength)
+            geometry.max_order, geometry.order_keys, kx_t,   ky_t,   geometry.wavelength)
         b_mt = generate_aberration_basis(
-            cache.max_order, cache.order_keys, -kx_mt, -ky_mt, cache.wavelength)
+            geometry.max_order, geometry.order_keys, -kx_mt, -ky_mt, geometry.wavelength)
 
     chi_tr_az = torch.einsum('k, kbxy -> bxy', coeffs, b_tr)
     chi_t     = torch.einsum('k, kbxy -> bxy', coeffs, b_t)
@@ -69,8 +74,32 @@ def compute_transfer(
     return (-j1) * D
 
 
+def _iter_chunks(geometry: ACBFGeometryCache, optics: ACBFOpticsCache | None):
+    """Yield (geom_chunk, optics_chunk_or_None) pairs."""
+    if optics is None:
+        for g in geometry.chunks:
+            yield g, None
+        return
+    if len(geometry.chunks) != len(optics.chunks):
+        raise ValueError(
+            f"geometry/optics chunk count mismatch: "
+            f"{len(geometry.chunks)} vs {len(optics.chunks)}."
+        )
+    for g, o in zip(geometry.chunks, optics.chunks):
+        if g['start'] != o['start'] or g['end'] != o['end']:
+            raise ValueError(
+                f"geometry/optics chunk bounds mismatch: "
+                f"({g['start']},{g['end']}) vs ({o['start']},{o['end']})."
+            )
+        yield g, o
+
+
 def reconstruct_acbf(
-    cache: ACBFCache,
+    image_fft: ImageFFT,
+    qx_grid: torch.Tensor,
+    qy_grid: torch.Tensor,
+    geometry: ACBFGeometryCache,
+    optics: ACBFOpticsCache | None,
     coeffs: torch.Tensor,
     eps: float,
     device: str,
@@ -81,25 +110,34 @@ def reconstruct_acbf(
     Aligns detector contributions by their phase before summation.
 
     Args:
-        cache:   ACBFCache built by pipeline.build_acbf_cache.
-        coeffs:  Flat scan-frame aberration coefficients, shape (num_coeffs,).
-        eps:     Small constant for phase normalization stability.
-        device:  Target device string.
+        image_fft: ImageFFT carrying the pre-computed BF stack FFT.
+        qx_grid:   Scan-frame frequency grid, shape (1, 1, Rx).
+        qy_grid:   Scan-frame frequency grid, shape (1, Ry, 1).
+        geometry:  ACBFGeometryCache built by pipeline.build_acbf_geometry_cache.
+        optics:    ACBFOpticsCache (full mode) or None (lazy mode).
+        coeffs:    Flat scan-frame aberration coefficients, shape (num_coeffs,).
+        eps:       Small constant for phase normalization stability.
+        device:    Target device string.
 
     Returns:
         Reconstructed acBF image, shape (Ry, Rx), float32.
     """
-    acBF_total = torch.zeros(cache.out_shape, dtype=torch.float32, device=device)
-    for chunk in cache.chunks:
-        img_fft_chunk = cache.img_fft[chunk['start']:chunk['end']]
-        transfer = compute_transfer(chunk, coeffs, cache, device)
+    out_shape = image_fft.img_fft.shape[-2:]
+    acBF_total = torch.zeros(out_shape, dtype=torch.float32, device=device)
+    for geom_chunk, optics_chunk in _iter_chunks(geometry, optics):
+        img_fft_chunk = image_fft.fft_chunk(geom_chunk['start'], geom_chunk['end'])
+        transfer = compute_transfer(geom_chunk, optics_chunk, coeffs, qx_grid, qy_grid, geometry, device)
         phasor = transfer / (transfer.abs() + eps)
         acBF_total += torch.sum(torch.fft.ifft2(img_fft_chunk * phasor, dim=(-2, -1)).real, dim=0)
     return acBF_total
 
 
 def reconstruct_acbf_complex_inversion(
-    cache: ACBFCache,
+    image_fft: ImageFFT,
+    qx_grid: torch.Tensor,
+    qy_grid: torch.Tensor,
+    geometry: ACBFGeometryCache,
+    optics: ACBFOpticsCache | None,
     coeffs: torch.Tensor,
     device: str,
     regularization: float = 1e-3,
@@ -118,7 +156,11 @@ def reconstruct_acbf_complex_inversion(
         S(q) = sum_b |T_b(q)|^2
 
     Args:
-        cache:              ACBFCache.
+        image_fft:          ImageFFT carrying the pre-computed BF stack FFT.
+        qx_grid:            Scan-frame frequency grid, shape (1, 1, Rx).
+        qy_grid:            Scan-frame frequency grid, shape (1, Ry, 1).
+        geometry:           ACBFGeometryCache.
+        optics:             ACBFOpticsCache (full mode) or None (lazy mode).
         coeffs:             Flat scan-frame aberration coefficients.
         device:             Target device string.
         regularization:     Non-negative regularization weight lambda.
@@ -134,12 +176,13 @@ def reconstruct_acbf_complex_inversion(
     if support_threshold < 0:
         raise ValueError(f"support_threshold must be non-negative, got {support_threshold}.")
 
-    numerator = torch.zeros(cache.out_shape, dtype=torch.complex64, device=device)
-    transfer_power = torch.zeros(cache.out_shape, dtype=torch.float32, device=device)
+    out_shape = image_fft.img_fft.shape[-2:]
+    numerator = torch.zeros(out_shape, dtype=torch.complex64, device=device)
+    transfer_power = torch.zeros(out_shape, dtype=torch.float32, device=device)
 
-    for chunk in cache.chunks:
-        img_fft_chunk = cache.img_fft[chunk['start']:chunk['end']]
-        transfer = compute_transfer(chunk, coeffs, cache, device)
+    for geom_chunk, optics_chunk in _iter_chunks(geometry, optics):
+        img_fft_chunk = image_fft.fft_chunk(geom_chunk['start'], geom_chunk['end'])
+        transfer = compute_transfer(geom_chunk, optics_chunk, coeffs, qx_grid, qy_grid, geometry, device)
         numerator.add_(torch.sum(transfer * img_fft_chunk, dim=0))
         transfer_power.add_(torch.sum(transfer.abs().square(), dim=0))
 

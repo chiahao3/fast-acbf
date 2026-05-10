@@ -15,38 +15,35 @@ from fast_acbf.core.functional import (
 
 
 @dataclass
-class BFImageCache:
-    """Static, mode-independent, orientation-independent. Single allocation per session."""
-    img_fft: torch.Tensor   # (Nb, Ry, Rx) — full BF stack FFT; dtype matches fft2(vbf_images)
-    qx_grid: torch.Tensor   # (1, 1, Rx) — fftfreq(Rx, d=scan_step_size)
-    qy_grid: torch.Tensor   # (1, Ry, 1) — fftfreq(Ry, d=scan_step_size)
-    out_shape: tuple         # (Ry, Rx)
+class ImageFFT:
+    """Pre-computed FFT of the BF image stack. Mutable for live acquisition."""
+    img_fft: torch.Tensor  # (Nb, Ry, Rx) complex64
+
+    def fft_chunk(self, start: int, end: int) -> torch.Tensor:
+        return self.img_fft[start:end]
 
 
 @dataclass
 class TCBFCache:
-    chunks: list          # each: {b_dx, b_dy, start, end}
-    img_fft: torch.Tensor # (Nb, Ry, Rx) — shared reference from BFImageCache
-    qx_grid: torch.Tensor # (1, 1, Rx) — shared reference
-    qy_grid: torch.Tensor # (1, Ry, 1) — shared reference
-    out_shape: tuple
+    """Per-chunk shift basis for tcBF. Orientation-dependent."""
+    chunks: list  # each: {b_dx, b_dy, start, end}
 
 
 @dataclass
-class ACBFCache:
-    chunks: list          # full: {ap_t,ap_mt,b_tr,b_t,b_mt,start,end}
-                          # lazy: {kxt,kyt,start,end}
-    img_fft: torch.Tensor # (Nb, Ry, Rx) — shared reference from BFImageCache
-    qx_grid: torch.Tensor # (1, 1, Rx) — shared reference
-    qy_grid: torch.Tensor # (1, Ry, 1) — shared reference
-    out_shape: tuple
-    rolloff: float
-    cache_mode: str
-    # Physics params stored for lazy-recompute path
+class ACBFGeometryCache:
+    """Per-chunk detector k-coords plus physics params needed to derive optics on demand."""
+    chunks: list           # each: {kxt, kyt, start, end}
     max_order: int
     order_keys: list
     max_alpha: float
     wavelength: float
+    rolloff: float
+
+
+@dataclass
+class ACBFOpticsCache:
+    """Per-chunk apertures and aberration bases. Built only in 'full' mode."""
+    chunks: list  # each: {ap_t, ap_mt, b_tr, b_t, b_mt, start, end}
 
 
 def init_vbf(dataset: np.ndarray, max_alpha: float, dk: float, wavelength: float, device: str):
@@ -97,17 +94,19 @@ def init_grid(Ry: int, Rx: int, device: str) -> torch.Tensor:
     return torch.stack([kpy, kpx], dim=0)
 
 
-def build_bf_image_cache(
-    vbf_images: torch.Tensor,
-    scan_step_size: float,
-    device: str,
-) -> BFImageCache:
-    """Pre-compute the full-stack FFT and scan-frame frequency grids. Mode-independent."""
-    _, Ry, Rx = vbf_images.shape
+def build_image_fft(vbf_images: torch.Tensor) -> ImageFFT:
+    """Pre-compute the full-stack FFT. Mode/orientation-independent."""
     img_fft = torch.fft.fft2(vbf_images, dim=(-2, -1))
+    return ImageFFT(img_fft=img_fft)
+
+
+def build_scan_freq_grids(
+    Ry: int, Rx: int, scan_step_size: float, device: str,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Build scan-frame frequency grids. Returns (qx_grid (1,1,Rx), qy_grid (1,Ry,1))."""
     qx_grid = torch.fft.fftfreq(Rx, d=scan_step_size, device=device).view(1, 1, Rx)
     qy_grid = torch.fft.fftfreq(Ry, d=scan_step_size, device=device).view(1, Ry, 1)
-    return BFImageCache(img_fft=img_fft, qx_grid=qx_grid, qy_grid=qy_grid, out_shape=(Ry, Rx))
+    return qx_grid, qy_grid
 
 
 def build_tcbf_cache(
@@ -115,75 +114,79 @@ def build_tcbf_cache(
     kY_full: torch.Tensor,
     order_keys: list,
     wavelength: float,
-    device: str,
     chunk_size: int = 64,
-    *,
-    img_fft: torch.Tensor,
-    qx_grid: torch.Tensor,
-    qy_grid: torch.Tensor,
-    out_shape: tuple,
 ) -> TCBFCache:
     """Pre-compute the orientation-dependent shift basis chunks.
 
-    img_fft, qx_grid, qy_grid, out_shape are shared references from BFImageCache.
+    Holds basis only — no image or scan grid references.
     """
-    Nb = img_fft.shape[0]
+    Nb = kX_full.shape[0]
     chunks = []
     for i in range(0, Nb, chunk_size):
         end = min(i + chunk_size, Nb)
         b_dx, b_dy = generate_shift_basis(order_keys, kX_full[i:end], kY_full[i:end], wavelength)
         chunks.append({'b_dx': b_dx, 'b_dy': b_dy, 'start': i, 'end': end})
 
-    return TCBFCache(chunks=chunks, img_fft=img_fft, qx_grid=qx_grid,
-                    qy_grid=qy_grid, out_shape=out_shape)
+    return TCBFCache(chunks=chunks)
 
 
-def build_acbf_cache(
+def build_acbf_geometry_cache(
     kX_full: torch.Tensor,
     kY_full: torch.Tensor,
     order_keys: list,
     max_alpha: float,
     wavelength: float,
     max_order: int,
-    device: str,
-    cache_mode: str = 'lazy',
     rolloff: float = 0,
     chunk_size: int = 64,
-    *,
-    img_fft: torch.Tensor,
-    qx_grid: torch.Tensor,
-    qy_grid: torch.Tensor,
-    out_shape: tuple,
-) -> ACBFCache:
+) -> ACBFGeometryCache:
+    """Chunk detector k-coords and bundle the physics params needed to derive optics later.
+
+    Always built (mode-independent). Optics are materialized separately via
+    build_acbf_optics_cache when cache_mode='full'.
     """
-    Pre-compute and chunk all static geometry and soft apertures.
-
-    img_fft, qx_grid, qy_grid, out_shape are shared references from BFImageCache.
-    qx_grid / qy_grid replace the locally computed kx_base / ky_base.
-
-    What is stored per chunk depends on cache_mode:
-        'full' — bases + apertures on device.
-        'lazy' — only detector k-coords (kxt/kyt); bases/apertures recomputed each call.
-    """
-    Nb = img_fft.shape[0]
-
+    Nb = kX_full.shape[0]
     kX_full = kX_full.view(Nb, 1, 1)
     kY_full = kY_full.view(Nb, 1, 1)
 
     chunks = []
     for i in range(0, Nb, chunk_size):
         end = min(i + chunk_size, Nb)
-        kxt = kX_full[i:end]
-        kyt = kY_full[i:end]
+        chunks.append({
+            'kxt': kX_full[i:end].detach().clone(),
+            'kyt': kY_full[i:end].detach().clone(),
+            'start': i, 'end': end,
+        })
 
-        if cache_mode == 'lazy':
-            chunks.append({
-                'kxt': kxt.detach().clone(),
-                'kyt': kyt.detach().clone(),
-                'start': i, 'end': end,
-            })
-            continue
+    return ACBFGeometryCache(
+        chunks=chunks,
+        max_order=max_order,
+        order_keys=order_keys,
+        max_alpha=max_alpha,
+        wavelength=wavelength,
+        rolloff=rolloff,
+    )
 
+
+def build_acbf_optics_cache(
+    geometry: ACBFGeometryCache,
+    qx_grid: torch.Tensor,
+    qy_grid: torch.Tensor,
+) -> ACBFOpticsCache:
+    """Materialize per-chunk apertures and aberration bases from geometry + scan grids.
+
+    Heavy precompute used by 'full' cache mode. Reuses the physics params bundled
+    on the geometry cache.
+    """
+    max_order = geometry.max_order
+    order_keys = geometry.order_keys
+    max_alpha = geometry.max_alpha
+    wavelength = geometry.wavelength
+    rolloff = geometry.rolloff
+
+    chunks = []
+    for chunk in geometry.chunks:
+        kxt, kyt = chunk['kxt'], chunk['kyt']
         kx_t,  ky_t  = qx_grid + kxt, qy_grid + kyt
         kx_mt, ky_mt = qx_grid - kxt, qy_grid - kyt
 
@@ -197,22 +200,10 @@ def build_acbf_cache(
         chunks.append({
             'ap_t': ap_t, 'ap_mt': ap_mt,
             'b_tr': b_tr, 'b_t': b_t, 'b_mt': b_mt,
-            'start': i, 'end': end,
+            'start': chunk['start'], 'end': chunk['end'],
         })
 
-    return ACBFCache(
-        chunks=chunks,
-        img_fft=img_fft,
-        qx_grid=qx_grid,
-        qy_grid=qy_grid,
-        out_shape=out_shape,
-        rolloff=rolloff,
-        cache_mode=cache_mode,
-        max_order=max_order,
-        order_keys=order_keys,
-        max_alpha=max_alpha,
-        wavelength=wavelength,
-    )
+    return ACBFOpticsCache(chunks=chunks)
 
 
 def build_c10_axis(
