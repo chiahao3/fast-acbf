@@ -102,6 +102,55 @@ class TestUpdateDataset:
         solver.update_dataset(new_data)
         assert solver.dataset is new_data
 
+    def test_cuda_path_b_reuses_4d_buffers(self, device):
+        """On CUDA, update_dataset takes Path B (large H2D + device gather).
+
+        After the first call the pinned host + device staging 4D buffers are
+        allocated; subsequent calls must reuse the same buffer objects so the
+        live loop never re-allocates ~2 GB per frame.
+        """
+        if device != "cuda":
+            pytest.skip("Path B is CUDA-only")
+        solver = _build_solver(device=device)
+        # Before the first update_dataset call, the 4D buffers are unallocated.
+        assert solver._dataset_pinned_buffer_4d is None
+        assert solver._dataset_device_staging_4d is None
+
+        solver.update_dataset(_alt_dataset(seed=11))
+        pinned1 = solver._dataset_pinned_buffer_4d
+        device1 = solver._dataset_device_staging_4d
+        assert pinned1 is not None and device1 is not None
+        assert pinned1.is_pinned()
+        assert device1.device.type == "cuda"
+
+        solver.update_dataset(_alt_dataset(seed=12))
+        # Same Python objects on the second pass — proves buffer reuse.
+        assert solver._dataset_pinned_buffer_4d is pinned1
+        assert solver._dataset_device_staging_4d is device1
+
+    def test_cuda_path_b_invalidates_buffers_on_bf_geometry_change(self, device):
+        """Tier-3 setters that change the BF mask or scan shape must drop the
+        stashed 4D buffers so the next update_dataset call reallocates them.
+        """
+        if device != "cuda":
+            pytest.skip("Path B is CUDA-only")
+        solver = _build_solver(device=device)
+        solver.update_dataset(_alt_dataset(seed=11))
+        assert solver._dataset_pinned_buffer_4d is not None
+
+        new_data = _alt_dataset(seed=13)
+        solver.update_convergence_angle(SYNTH_MAX_ALPHA * 1.2, new_data)
+        # _bf_mask_bool_d must follow the new mask.
+        np.testing.assert_array_equal(
+            solver._bf_mask_bool_d.cpu().numpy(), solver._bf_mask_bool
+        )
+        # 4D buffers were released; next update_dataset will reallocate them.
+        assert solver._dataset_pinned_buffer_4d is None
+        assert solver._dataset_device_staging_4d is None
+
+        solver.update_dataset(_alt_dataset(seed=14))
+        assert solver._dataset_pinned_buffer_4d is not None
+
 
 # ── Tier 2: update_scan_step ──────────────────────────────────────────────────
 

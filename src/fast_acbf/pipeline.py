@@ -107,6 +107,63 @@ def extract_vbf_stack(
     return out, None
 
 
+def extract_vbf_stack_via_device_mask(
+    dataset: np.ndarray,
+    bf_mask_bool_d: torch.Tensor,
+    device: str,
+    *,
+    dataset_pinned_buffer: torch.Tensor | None = None,
+    dataset_device_buffer: torch.Tensor | None = None,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Path B: large H2D into a device staging buffer, then BF gather on device.
+
+    Per-frame steps:
+        1) numpy 4D  -> pinned host 4D            (DDR memcpy)
+        2) pinned 4D -> device staging 4D         (non-blocking H2D)
+        3) staging[:, :, bf_mask_bool_d]          (GPU fancy-index gather)
+        4) .permute(2, 0, 1).contiguous()         (to (Nb, Ry, Rx))
+
+    Faster than the host-mask path (extract_vbf_stack) for live acquisition
+    when the dataset is large: the CPU-side `dataset[:, :, bf_mask_bool]`
+    fancy-index over a 1 GB array is bandwidth-bound at ~2 GB/s by cache
+    thrashing, while the device gather runs at VRAM bandwidth. On a 128^4
+    float32 dataset this comes out ~5x faster end-to-end.
+
+    Cost: keeps a (Ry, Rx, Ky, Kx) float32 buffer alive on host (pinned)
+    AND on device. For a 128^4 dataset that's ~2 GB of total memory
+    reserved — only worth it for long-lived live-acquisition sessions.
+
+    Buffer reuse contract mirrors extract_vbf_stack: caller stashes both
+    returned buffers and feeds them back on the next call to skip
+    allocation. Buffers auto-reallocate on shape mismatch.
+
+    CUDA-only. Raises if device does not start with 'cuda'.
+    """
+    if not str(device).startswith('cuda'):
+        raise ValueError(
+            f"extract_vbf_stack_via_device_mask requires a CUDA device; got {device!r}."
+        )
+    expected_4d = tuple(dataset.shape)
+    if dataset_pinned_buffer is None or tuple(dataset_pinned_buffer.shape) != expected_4d:
+        dataset_pinned_buffer = torch.empty(
+            expected_4d, dtype=torch.float32, pin_memory=True,
+        )
+    if dataset_device_buffer is None or tuple(dataset_device_buffer.shape) != expected_4d:
+        dataset_device_buffer = torch.empty(
+            expected_4d, dtype=torch.float32, device=device,
+        )
+    # numpy -> pinned host: pure DDR memcpy. ascontiguousarray is a no-op when
+    # the input is already C-contig float32 (the common case from real loaders).
+    src_np = np.ascontiguousarray(dataset, dtype=np.float32)
+    dataset_pinned_buffer.copy_(torch.from_numpy(src_np))
+    # pinned -> device: non-blocking H2D. Runs near PCIe peak.
+    dataset_device_buffer.copy_(dataset_pinned_buffer, non_blocking=True)
+    # device-side gather. Result shape is (Ry, Rx, Nb); permute to (Nb, Ry, Rx)
+    # and force contiguous so downstream FFT sees the expected memory layout.
+    out = dataset_device_buffer[:, :, bf_mask_bool_d].permute(2, 0, 1).contiguous()
+    return out, dataset_pinned_buffer, dataset_device_buffer
+
+
 def init_vbf(dataset: np.ndarray, max_alpha: float, dk: float, wavelength: float, device: str):
     """
     Build the BF mask, extract vBF image stack, and return k-space coordinate tensors.

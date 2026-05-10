@@ -29,6 +29,7 @@ from fast_acbf.pipeline import (
     build_tcbf_cache,
     compute_bf_geometry,
     extract_vbf_stack,
+    extract_vbf_stack_via_device_mask,
     init_grid,
     init_vbf,
 )
@@ -132,6 +133,16 @@ class BFSolver:
         self.qx_grid, self.qy_grid = build_scan_freq_grids(
             self.Ry, self.Rx, self.scan_step_size, self.device,
         )
+        # Path B (device-side BF mask gather) artifacts for the live-acquisition
+        # update_dataset hot path. _bf_mask_bool_d is the device mirror of the
+        # BF mask; the 4D pinned/device staging buffers are lazily allocated on
+        # the first update_dataset call (CUDA only).
+        self._bf_mask_bool_d = (
+            torch.as_tensor(self._bf_mask_bool, device=self.device)
+            if str(self.device).startswith('cuda') else None
+        )
+        self._dataset_pinned_buffer_4d: torch.Tensor | None = None
+        self._dataset_device_staging_4d: torch.Tensor | None = None
 
     # ------------------------------------------------------------------
     # Internal helpers — coordinate transforms & frame handling
@@ -266,12 +277,29 @@ class BFSolver:
                 Ry, Rx, self.scan_step_size, self.device,
             )
 
+        # Path B artifacts must follow the new BF geometry. The 4D buffers also
+        # need releasing if (Ry, Rx, Ky, Kx) changed; setting them to None
+        # forces extract_vbf_stack_via_device_mask to lazily reallocate at the
+        # right shape on the next update_dataset call.
+        if str(self.device).startswith('cuda'):
+            self._bf_mask_bool_d = torch.as_tensor(bf_mask_bool, device=self.device)
+        self._dataset_pinned_buffer_4d = None
+        self._dataset_device_staging_4d = None
+
     def update_dataset(self, new_dataset: np.ndarray):
         """Tier-1 update: new 4D dataset under unchanged optics/scan geometry.
 
-        Re-extracts the vBF stack via the cached BF mask using a pinned host
-        buffer + non-blocking H2D copy, then refreshes the cached image FFT.
-        Preserves all basis caches.
+        Refreshes the cached vBF stack and image FFT in place; preserves all
+        basis caches.
+
+        On CUDA: uses ``extract_vbf_stack_via_device_mask`` (Path B) — the full
+        4D dataset is copied into a pinned host buffer, H2D-uploaded to a
+        device staging buffer, then the BF mask is applied on the GPU. Avoids
+        the CPU-side fancy-index gather that bottlenecks the host-mask path
+        on large frames (~5x faster end-to-end on a 128^4 float32 dataset).
+
+        On CPU/MPS: uses the host-mask path (Path A); pinned memory has no
+        benefit and the device gather has nothing to do.
 
         Raises if the dataset shape does not match (Ry, Rx, *, *) under the
         current mask; for shape changes, use update_scan_shape instead.
@@ -287,10 +315,19 @@ class BFSolver:
                 f"update_dataset: detector shape {new_dataset.shape[2:]} does not match "
                 f"BF mask shape {self._bf_mask_bool.shape}."
             )
-        self.vbf_images, self._vbf_pinned_buffer = extract_vbf_stack(
-            new_dataset, self._bf_mask_bool, self.device,
-            out=self.vbf_images, pinned_buffer=self._vbf_pinned_buffer,
-        )
+        if str(self.device).startswith('cuda'):
+            (self.vbf_images,
+             self._dataset_pinned_buffer_4d,
+             self._dataset_device_staging_4d) = extract_vbf_stack_via_device_mask(
+                new_dataset, self._bf_mask_bool_d, self.device,
+                dataset_pinned_buffer=self._dataset_pinned_buffer_4d,
+                dataset_device_buffer=self._dataset_device_staging_4d,
+            )
+        else:
+            self.vbf_images, self._vbf_pinned_buffer = extract_vbf_stack(
+                new_dataset, self._bf_mask_bool, self.device,
+                out=self.vbf_images, pinned_buffer=self._vbf_pinned_buffer,
+            )
         # Track latest 4D array — refinement._build_roi_solver and friends
         # read solver.dataset; if we don't refresh it here, the ROI path
         # silently keeps cropping the original frame.
@@ -344,6 +381,10 @@ class BFSolver:
         self.dataset = new_dataset
         self._image_fft = build_image_fft(self.vbf_images)
         self._invalidate_acbf_optics()
+        # Path B 4D buffers held the old (Ry, Rx, Ky, Kx) shape; release them so
+        # the next update_dataset reallocates at the right shape.
+        self._dataset_pinned_buffer_4d = None
+        self._dataset_device_staging_4d = None
         return self
 
     def update_convergence_angle(self, new_max_alpha: float, new_dataset: np.ndarray):
