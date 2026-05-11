@@ -2,11 +2,9 @@
 
 ## High Priority
 
-- **Improve `normalized_std` metric for acBF** — acBF images can have inverted contrast
-  relative to tcBF; `normalized_std` is sign-agnostic but maximizing it can converge to the
-  wrong polarity. Options: (a) detect and flip sign before scoring, (b) score on
-  `abs(normalized_std)`, (c) add a `contrast_sign` param. Needs investigation with simulated
-  data where ground truth polarity is known.
+- **Improve quality metrics** 
+  - acBF images can have mean jittering around zero, making `normalized_std` useless
+  - acBF can also introduce sharp fringes from incorrect aberrations
 
 - **Export method** — `get_export()` returning a dict with `object` (reconstructed image),
   `probe` (complex wavefield), and `aberrations` (detector-frame dict ready for PtyRAD),
@@ -26,17 +24,11 @@
 
 ## Tests
 - Test the `complex_inversion` reweighting with more simulated datasets, check for the phase shift values
-- Revisit upscaling from a clean native-resolution baseline; add dedicated Fourier-padding tests before reintroducing it
-- Check if the `refine_register` stub (bf_solver.py L1571) needs a real implementation
 
 
 ## Research / Experiments
 - Experiment with Optuna for more comprehensive BO-based optimization for 1st and 2nd order aberrations estimation, see if it's fast enough for real-time pipeline
-- Experiment the tcDF track and see if AD-based image optimization (via the `refine_register` stub) is worth implementing vs the current quality-metric approach in `refine_aberrations`
-
-
-## Bug Fix
-- Fix image rotation to avoid edge cropping when `output_frame = 'detector'`: `tv_rotate` uses `expand=False` by default (see `get_reconstructed_image` L1478, `_sweep_c10_stack` L1271); fix with `expand=True` or pre-padding. Affects PtyRAD export with `scan_rotation != 0`.
+- Experiment the tcDF track 
 
 
 ## Features
@@ -45,8 +37,7 @@
 
 
 ## Pipeline & Integration
-- Automate the data loading part
-- Wrap this as a py4DGUI plugin and push to Muller repo
+- Setup a dataloader path so we can run datasets larger than VRAM, or even RAM
 
 
 # Existing features
@@ -66,3 +57,4 @@
 - `get_acBF_diagnostics`: returns transfer power map, support mask, and complex image channels for complex-inversion debugging
 - Export 3D defocus volume stack (`get_defocus_stack`)
 - Modular package structure: `core/` (portable physics), `pipeline.py` (caching), `optimization/` (metrics + refinement), `vis/` (plotting)
+- py4D-browser-fast-acbf as a interactive GUI (currently only in Muller group Github repo @ Cornell)
