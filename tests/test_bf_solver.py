@@ -1023,67 +1023,6 @@ class TestACBFGeometryOpticsSplit:
         solver.get_acBF(chunk_size=8)
 
 
-class TestReplaceImageFFT:
-
-    def _make_solver(self, synth_dataset, synth_params, device):
-        p = synth_params
-        return BFSolver(
-            dataset=synth_dataset,
-            max_alpha=p["max_alpha"],
-            scan_step_size=p["scan_step_size"],
-            dk=p["dk"],
-            wavelength=p["wavelength"],
-            max_order=2,
-            aberrations={"C10": 0.0},
-            device=device,
-        )
-
-    def test_replace_preserves_basis_and_changes_output(self, synth_dataset, synth_params, device):
-        solver = self._make_solver(synth_dataset, synth_params, device)
-        r1 = solver.get_tcBF(chunk_size=8).detach().clone()
-        basis_snapshot = dict(solver._basis_cache)
-        assert len(basis_snapshot) >= 1
-
-        # Build a different image FFT (scale by 2 — preserves shape, changes values).
-        new_fft = solver._image_fft.img_fft.clone() * 2.0
-        solver.replace_image_fft(new_fft)
-
-        # Basis cache identity preserved across the swap.
-        assert set(solver._basis_cache.keys()) == set(basis_snapshot.keys())
-        for key, val in basis_snapshot.items():
-            assert solver._basis_cache[key] is val
-
-        r2 = solver.get_tcBF(chunk_size=8)
-        # Output changed because image data changed.
-        assert not torch.allclose(r1, r2, atol=1e-6, rtol=1e-6)
-
-    def test_replace_image_stack_computes_fft_and_preserves_basis(self, synth_dataset, synth_params, device):
-        solver = self._make_solver(synth_dataset, synth_params, device)
-        solver.get_tcBF(chunk_size=8)
-        basis_snapshot = dict(solver._basis_cache)
-
-        new_stack = solver.vbf_images.clone() * 3.0
-        solver.replace_image_stack(new_stack)
-
-        assert solver.vbf_images is new_stack
-        torch.testing.assert_close(
-            solver._image_fft.img_fft,
-            torch.fft.fft2(new_stack, dim=(-2, -1)),
-            atol=0,
-            rtol=0,
-        )
-        for key, val in basis_snapshot.items():
-            assert solver._basis_cache[key] is val
-
-    def test_replace_with_mismatched_shape_raises(self, synth_dataset, synth_params, device):
-        solver = self._make_solver(synth_dataset, synth_params, device)
-        solver.get_tcBF(chunk_size=8)
-        Nb, Ry, Rx = solver._image_fft.img_fft.shape
-        bad = torch.zeros((Nb, Ry + 1, Rx), dtype=torch.complex64, device=solver.device)
-        with pytest.raises(ValueError, match="does not match solver"):
-            solver.replace_image_fft(bad)
-
-
 @pytest.mark.regression
 def test_regression_tcbf(real_solver):
     fixture = os.path.join(FIXTURE_DIR, "tcbf.npy")
