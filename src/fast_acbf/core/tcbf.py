@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import torch
 
-from fast_acbf.pipeline import ImageFFT, TCBFCache
+from fast_acbf.recon.cache import ImageFFT, TCBFCache
 
 
 def reconstruct_tcbf(

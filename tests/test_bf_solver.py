@@ -16,7 +16,7 @@ class TestBFSolverInit:
 
     def test_no_crash(self, synth_dataset, synth_params, device):
         p = synth_params
-        BFSolver(
+        BFSolver.from_array(
             dataset=synth_dataset,
             max_alpha=p["max_alpha"],
             scan_step_size=p["scan_step_size"],
@@ -41,7 +41,7 @@ class TestBFSolverInit:
     def test_invalid_cache_mode_raises(self, synth_dataset, synth_params, device):
         p = synth_params
         with pytest.raises(ValueError, match="cache_mode"):
-            BFSolver(
+            BFSolver.from_array(
                 dataset=synth_dataset,
                 max_alpha=p["max_alpha"],
                 scan_step_size=p["scan_step_size"],
@@ -56,7 +56,7 @@ class TestBFSolverInit:
     def test_removed_upscale_constructor_args_raise(self, synth_dataset, synth_params, device):
         p = synth_params
         with pytest.raises(TypeError, match="upscale_method"):
-            BFSolver(
+            BFSolver.from_array(
                 dataset=synth_dataset,
                 max_alpha=p["max_alpha"],
                 scan_step_size=p["scan_step_size"],
@@ -69,7 +69,7 @@ class TestBFSolverInit:
             )
 
         with pytest.raises(TypeError, match="defer_upscale"):
-            BFSolver(
+            BFSolver.from_array(
                 dataset=synth_dataset,
                 max_alpha=p["max_alpha"],
                 scan_step_size=p["scan_step_size"],
@@ -247,7 +247,7 @@ class TestAutogradBoundary:
             device=device,
         )
         defaults.update(kwargs)
-        return BFSolver(**defaults)
+        return BFSolver.from_array(**defaults)
 
     def test_reconstruct_no_grad_by_default(self, synth_dataset, synth_params, device):
         solver = self._make_solver(synth_dataset, synth_params, device)
@@ -562,7 +562,7 @@ class TestGetAberrationsDict:
 
     def test_c10_value_matches_constructor(self, synth_dataset, synth_params, device):
         p = synth_params
-        solver = BFSolver(
+        solver = BFSolver.from_array(
             dataset=synth_dataset,
             max_alpha=p["max_alpha"],
             scan_step_size=p["scan_step_size"],
@@ -593,8 +593,8 @@ class TestGetAberrationsDict:
             aberrations=aberrations,
             device=device,
         )
-        reference = BFSolver(**kwargs).get_aberrations_dict(layout='flat')
-        rotated = BFSolver(
+        reference = BFSolver.from_array(**kwargs).get_aberrations_dict(layout='flat')
+        rotated = BFSolver.from_array(
             **kwargs,
             coord_transform={'rotation_deg': 37.0},
         ).get_aberrations_dict(frame='detector', layout='flat')
@@ -605,7 +605,7 @@ class TestGetAberrationsDict:
 
     def test_scan_frame_export_matches_rotated_detector_coefficients(self, synth_dataset, synth_params, device):
         p = synth_params
-        solver = BFSolver(
+        solver = BFSolver.from_array(
             dataset=synth_dataset,
             max_alpha=p["max_alpha"],
             scan_step_size=p["scan_step_size"],
@@ -638,7 +638,7 @@ class TestGetAberrationsDict:
 
     def test_scan_frame_public_export_uses_rotated_coefficients(self, synth_dataset, synth_params, device):
         p = synth_params
-        solver = BFSolver(
+        solver = BFSolver.from_array(
             dataset=synth_dataset,
             max_alpha=p["max_alpha"],
             scan_step_size=p["scan_step_size"],
@@ -673,7 +673,7 @@ class TestFrameCacheBehavior:
 
     def test_aberration_change_recomputes_without_stale_final_image(self, synth_dataset, synth_params, device):
         p = synth_params
-        solver = BFSolver(
+        solver = BFSolver.from_array(
             dataset=synth_dataset,
             max_alpha=p["max_alpha"],
             scan_step_size=p["scan_step_size"],
@@ -693,7 +693,7 @@ class TestFrameCacheBehavior:
 
     def test_rotation_change_misses_static_cache(self, synth_dataset, synth_params, device):
         p = synth_params
-        solver = BFSolver(
+        solver = BFSolver.from_array(
             dataset=synth_dataset,
             max_alpha=p["max_alpha"],
             scan_step_size=p["scan_step_size"],
@@ -705,31 +705,31 @@ class TestFrameCacheBehavior:
         )
 
         solver.get_tcBF(chunk_size=8)
-        assert len(solver._basis_cache) == 1
-        assert solver._image_fft is not None
-        fft_tensor_id = id(solver._image_fft.img_fft)
+        assert len(solver._recon._tcbf_cache) == 1
+        assert solver._recon._image_fft is not None
+        fft_tensor_id = id(solver._recon._image_fft.img_fft)
 
         solver.set_rotation_deg(15.0)
 
         solver.get_tcBF(chunk_size=8)
-        assert len(solver._basis_cache) == 2
+        assert len(solver._recon._tcbf_cache) == 2
         # FFT cache is untouched — same tensor object
-        assert solver._image_fft is not None
-        assert id(solver._image_fft.img_fft) == fft_tensor_id
+        assert solver._recon._image_fft is not None
+        assert id(solver._recon._image_fft.img_fft) == fft_tensor_id
 
     def test_clear_cache_clears_all_caches(self, solver_zero_ab):
         img = solver_zero_ab.get_tcBF(chunk_size=8)
         torch.testing.assert_close(solver_zero_ab.reconstructed_image, img, atol=0, rtol=0)
         assert not solver_zero_ab.reconstructed_image.requires_grad
-        assert len(solver_zero_ab._basis_cache) >= 1
-        assert solver_zero_ab._image_fft is not None
+        assert len(solver_zero_ab._recon._tcbf_cache) + len(solver_zero_ab._recon._acbf_cache) >= 1
+        assert solver_zero_ab._recon._image_fft is not None
 
         solver_zero_ab.clear_cache()
 
         torch.testing.assert_close(solver_zero_ab.reconstructed_image, img, atol=0, rtol=0)
         assert not solver_zero_ab.reconstructed_image.requires_grad
-        assert len(solver_zero_ab._basis_cache) == 0
-        assert solver_zero_ab._image_fft is None
+        assert not solver_zero_ab._recon._tcbf_cache and not solver_zero_ab._recon._acbf_cache
+        assert solver_zero_ab._recon._image_fft is None
 
 
 # ── Cache mode parity ────────────────────────────────────────────────────────
@@ -738,7 +738,7 @@ class TestCacheModeParity:
 
     def _make_solver(self, cache_mode, synth_dataset, synth_params, device):
         p = synth_params
-        return BFSolver(
+        return BFSolver.from_array(
             dataset=synth_dataset,
             max_alpha=p["max_alpha"],
             scan_step_size=p["scan_step_size"],
@@ -854,7 +854,7 @@ def real_solver(device):
     import zarr
     z = zarr.open(REAL_ZARR, mode='r')
     dataset = np.array(z[0]).reshape(64, 64, REAL_NPIX, REAL_NPIX)
-    return BFSolver(
+    return BFSolver.from_array(
         dataset=dataset,
         max_alpha=REAL_MAX_ALPHA,
         scan_step_size=REAL_SCAN_STEP,
@@ -873,7 +873,7 @@ class TestImageBasisSplit:
 
     def _make_solver(self, synth_dataset, synth_params, device, **ab_kwargs):
         p = synth_params
-        return BFSolver(
+        return BFSolver.from_array(
             dataset=synth_dataset,
             max_alpha=p["max_alpha"],
             scan_step_size=p["scan_step_size"],
@@ -887,52 +887,52 @@ class TestImageBasisSplit:
     def test_fft_cache_shared_across_rotations(self, synth_dataset, synth_params, device):
         solver = self._make_solver(synth_dataset, synth_params, device)
         solver.get_tcBF(chunk_size=8)
-        fft_id = id(solver._image_fft.img_fft)
+        fft_id = id(solver._recon._image_fft.img_fft)
 
         solver.set_rotation_deg(15.0, clear_basis=True)
         solver.get_tcBF(chunk_size=8)
 
         # Same underlying tensor — no copy made
-        assert id(solver._image_fft.img_fft) == fft_id
+        assert id(solver._recon._image_fft.img_fft) == fft_id
 
     def test_tcbf_and_acbf_share_same_image_fft(self, synth_dataset, synth_params, device):
         solver = self._make_solver(synth_dataset, synth_params, device)
         # Trigger both modes; both must reuse the solver's single image FFT.
         solver.get_tcBF(chunk_size=8)
-        image_after_tcbf = solver._image_fft
+        image_after_tcbf = solver._recon._image_fft
         solver.get_acBF(chunk_size=8)
-        assert solver._image_fft is image_after_tcbf
+        assert solver._recon._image_fft is image_after_tcbf
 
     def test_clear_basis_cache_preserves_fft(self, synth_dataset, synth_params, device):
         solver = self._make_solver(synth_dataset, synth_params, device)
         solver.get_tcBF(chunk_size=8)
-        fft_obj = solver._image_fft
+        fft_obj = solver._recon._image_fft
 
         solver.clear_basis_cache()
 
-        assert len(solver._basis_cache) == 0
-        assert solver._image_fft is fft_obj
+        assert not solver._recon._tcbf_cache and not solver._recon._acbf_cache
+        assert solver._recon._image_fft is fft_obj
 
     def test_clear_cache_resets_both(self, synth_dataset, synth_params, device):
         solver = self._make_solver(synth_dataset, synth_params, device)
         solver.get_tcBF(chunk_size=8)
-        assert solver._image_fft is not None
-        assert len(solver._basis_cache) >= 1
+        assert solver._recon._image_fft is not None
+        assert len(solver._recon._tcbf_cache) >= 1
 
         solver.clear_cache()
 
-        assert solver._image_fft is None
-        assert len(solver._basis_cache) == 0
+        assert solver._recon._image_fft is None
+        assert not solver._recon._tcbf_cache and not solver._recon._acbf_cache
 
     def test_set_rotation_clear_basis_preserves_fft(self, synth_dataset, synth_params, device):
         solver = self._make_solver(synth_dataset, synth_params, device)
         solver.get_tcBF(chunk_size=8)
-        fft_obj = solver._image_fft
+        fft_obj = solver._recon._image_fft
 
         solver.set_rotation_deg(20.0, clear_basis=True)
 
-        assert solver._image_fft is fft_obj
-        assert len(solver._basis_cache) == 0
+        assert solver._recon._image_fft is fft_obj
+        assert not solver._recon._tcbf_cache and not solver._recon._acbf_cache
 
     def test_tcbf_output_unchanged_after_split(self, synth_dataset, synth_params, device):
         solver = self._make_solver(synth_dataset, synth_params, device, C10=50.0, C12=10.0)
@@ -952,17 +952,17 @@ class TestImageBasisSplit:
         from fast_acbf.optimization.refinement import refine_flips
         solver = self._make_solver(synth_dataset, synth_params, device)
         solver.get_tcBF(chunk_size=8)
-        fft_obj = solver._image_fft
+        fft_obj = solver._recon._image_fft
 
         refine_flips(solver, mode='tcBF', metric='laplacian', plot_search=False)
 
-        assert solver._image_fft is fft_obj
+        assert solver._recon._image_fft is fft_obj
 
     def test_refine_scan_rotation_preserves_fft_and_clears_basis(self, synth_dataset, synth_params, device):
         from fast_acbf.optimization.refinement import refine_scan_rotation
         solver = self._make_solver(synth_dataset, synth_params, device)
         solver.get_tcBF(chunk_size=8)
-        fft_obj = solver._image_fft
+        fft_obj = solver._recon._image_fft
 
         refine_scan_rotation(
             solver,
@@ -974,8 +974,8 @@ class TestImageBasisSplit:
             chunk_size=8,
         )
 
-        assert solver._image_fft is fft_obj
-        assert len(solver._basis_cache) == 0
+        assert solver._recon._image_fft is fft_obj
+        assert not solver._recon._tcbf_cache and not solver._recon._acbf_cache
 
 
 # ── Geometry/optics split + live-update behavior ─────────────────────────────
@@ -984,7 +984,7 @@ class TestACBFGeometryOpticsSplit:
 
     def _make_solver(self, synth_dataset, synth_params, device, cache_mode='lazy'):
         p = synth_params
-        return BFSolver(
+        return BFSolver.from_array(
             dataset=synth_dataset,
             max_alpha=p["max_alpha"],
             scan_step_size=p["scan_step_size"],
@@ -999,23 +999,23 @@ class TestACBFGeometryOpticsSplit:
     def test_lazy_to_full_reuses_geometry(self, synth_dataset, synth_params, device):
         solver = self._make_solver(synth_dataset, synth_params, device, cache_mode='lazy')
         solver.get_acBF(chunk_size=8)
-        geometry_lazy, optics_lazy = solver._get_acBF_cache(chunk_size=8)
+        geometry_lazy, optics_lazy = solver._recon._get_acbf_cache(chunk_size=8)
         assert optics_lazy is None
 
         solver.cache_mode = 'full'
         solver.get_acBF(chunk_size=8)
-        geometry_full, optics_full = solver._get_acBF_cache(chunk_size=8)
+        geometry_full, optics_full = solver._recon._get_acbf_cache(chunk_size=8)
         assert geometry_full is geometry_lazy
         assert optics_full is not None
 
     def test_full_to_lazy_gates_optics_to_none(self, synth_dataset, synth_params, device):
         solver = self._make_solver(synth_dataset, synth_params, device, cache_mode='full')
         solver.get_acBF(chunk_size=8)
-        geometry_full, optics_full = solver._get_acBF_cache(chunk_size=8)
+        geometry_full, optics_full = solver._recon._get_acbf_cache(chunk_size=8)
         assert optics_full is not None
 
         solver.cache_mode = 'lazy'
-        geometry_lazy, optics_lazy = solver._get_acBF_cache(chunk_size=8)
+        geometry_lazy, optics_lazy = solver._recon._get_acbf_cache(chunk_size=8)
         # Geometry preserved; optics gated to None even though storage retains it.
         assert geometry_lazy is geometry_full
         assert optics_lazy is None

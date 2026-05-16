@@ -5,14 +5,16 @@ Required solver interface:
     .ab_state          — AberrationState with set_physical / get_physical
     .reconstruct(mode, requires_grad=False, **kwargs) -> Tensor
     .set_rotation_deg(deg, clear_basis=False) — handles cache invalidation internally
+    .set_flips(flipud, fliplr, transpose)     — sets flip flags and clears basis cache
     .clear_basis_cache()         — clears orientation-dependent caches, preserves FFT cache
     .clear_cache()               — full reset (both basis and FFT caches)
-    .coord_transform             — dict with flipud/fliplr/transpose flags
+    .coord_transform             — dict with flipud/fliplr/transpose/rotation_deg (read-only view)
     .reconstructed_image         — writable attribute for caching last result
     .last_c10_stack_axis         — writable attribute
+    .tolerance_factors           — dict {n: Tn_in_ang} for defocus range auto-scaling
 
-State safety: always mutate solver state through public setters, never direct
-attribute writes, so that BFSolver's cache invalidation logic stays intact.
+State safety: always mutate solver state through public setters (set_rotation_deg,
+set_flips), never direct dict-item writes, so cache invalidation stays consistent.
 """
 
 from __future__ import annotations
@@ -56,7 +58,8 @@ def _build_roi_solver(solver, scan_roi):
     y0, y1, x0, x1 = _validate_scan_roi(scan_roi, solver.dataset.shape)
     dataset_roi = np.ascontiguousarray(solver.dataset[y0:y1, x0:x1])
 
-    return BFSolver(
+    # TODO: replace solver.dataset crop with solver._source.crop_scan_roi()
+    return BFSolver.from_array(
         dataset=dataset_roi,
         max_alpha=solver.max_alpha,
         scan_step_size=solver.scan_step_size,
@@ -65,7 +68,7 @@ def _build_roi_solver(solver, scan_roi):
         max_order=solver.max_order,
         aberrations=solver.ab_state.get_cartesian_dict(),
         device=solver.device,
-        coord_transform=solver.coord_transform.copy(),
+        coord_transform=solver.coord_transform,  # returns a dict
         eps=solver.eps,
         cache_mode=solver.cache_mode,
     )
@@ -446,10 +449,7 @@ def refine_flips(
     try:
         with torch.no_grad():
             for (flipud, fliplr, transpose) in combos:
-                solver.coord_transform['flipud']    = flipud
-                solver.coord_transform['fliplr']    = fliplr
-                solver.coord_transform['transpose'] = transpose
-                solver.clear_basis_cache()
+                solver.set_flips(flipud, fliplr, transpose)
                 img = solver.reconstruct(mode=mode, **kwargs)
                 score = QualityMetrics.evaluate(img, metric=metric).item()
                 results[(flipud, fliplr, transpose)] = score
@@ -459,8 +459,7 @@ def refine_flips(
                 if plot_search:
                     plot_images.append(img.detach().cpu().numpy())
     finally:
-        solver.coord_transform.update(original)
-        solver.clear_basis_cache()
+        solver.set_flips(**original)
 
     best_combo = max(results, key=results.__getitem__)
     results['best'] = best_combo
@@ -468,10 +467,7 @@ def refine_flips(
     print(f"Best flip combination: flipud={best_combo[0]}, fliplr={best_combo[1]}, "
           f"transpose={best_combo[2]}  (score={results[best_combo]:.4g})")
 
-    solver.coord_transform['flipud']    = best_combo[0]
-    solver.coord_transform['fliplr']    = best_combo[1]
-    solver.coord_transform['transpose'] = best_combo[2]
-    solver.clear_basis_cache()
+    solver.set_flips(*best_combo)
     solver.reconstructed_image = best_image
 
     if plot_search:
@@ -578,11 +574,8 @@ def _orientation_grid_search(
 
             for if_transposed in (False, True):
                 # One cache clear per chirality — the expensive operation
-                solver.coord_transform['flipud'] = False
-                solver.coord_transform['fliplr'] = False
-                solver.coord_transform['transpose'] = if_transposed
+                solver.set_flips(False, False, if_transposed)
                 solver.set_rotation_deg(0.0)
-                solver.clear_basis_cache()
 
                 for angle in angles:
                     # clear_basis=True: sequential search never revisits old angles,
@@ -604,12 +597,9 @@ def _orientation_grid_search(
         solver.clear_basis_cache()
 
     ptyrad_state = map_to_ptyrad_state(best_if_transposed, best_angle)
-    solver.coord_transform['flipud']    = ptyrad_state['flipud']
-    solver.coord_transform['fliplr']    = ptyrad_state['fliplr']
-    solver.coord_transform['transpose'] = ptyrad_state['transpose']
+    solver.set_flips(ptyrad_state['flipud'], ptyrad_state['fliplr'], ptyrad_state['transpose'])
     solver.set_rotation_deg(ptyrad_state['rotation_deg'])
     solver.ab_state.set_physical('C_1_0', best_c10)
-    solver.clear_basis_cache()
 
     print(f"Best: if_transposed={best_if_transposed}, angle={best_angle:.1f}°, C10={best_c10:.2f}Å "
           f"(score={best_score:.4g})")

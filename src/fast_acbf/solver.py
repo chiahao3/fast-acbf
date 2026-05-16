@@ -1,4 +1,4 @@
-"""BFSolver — stateful facade orchestrating tcBF and acBF reconstruction."""
+"""BFSolver — user-facing offline/notebook facade over BFReconstructor."""
 
 from __future__ import annotations
 
@@ -13,469 +13,291 @@ from ptyrad.optics.aberrations import Aberrations
 from ptyrad.utils.image_proc import mfft2
 
 from fast_acbf.core.aberrations import AberrationState
-from fast_acbf.core.acbf import reconstruct_acbf, reconstruct_acbf_complex_inversion
 from fast_acbf.core.functional import generate_aberration_basis, generate_shift_basis, make_probe_from_chi
-from fast_acbf.core.tcbf import reconstruct_tcbf
-from fast_acbf.pipeline import (
-    ACBFGeometryCache,
-    ACBFOpticsCache,
-    ImageFFT,
-    TCBFCache,
-    build_acbf_geometry_cache,
-    build_acbf_optics_cache,
-    build_c10_axis,
-    build_image_fft,
-    build_scan_freq_grids,
-    build_tcbf_cache,
-    compute_bf_geometry,
-    extract_vbf_stack,
-    init_grid,
-    init_vbf,
-)
+from fast_acbf.data.geometry import CoordinateTransform, DetectorGeometry, ScanGeometry
+from fast_acbf.data.prepared import PreparedBFDataset
+from fast_acbf.data.source import ArrayDatasetSource
+from fast_acbf.recon.reconstructor import BFReconstructor
 
 logger = logging.getLogger(__name__)
 
 
+def _build_c10_axis(
+    c10_center: float,
+    device: str,
+    n_layers=None,
+    z_top=None,
+    z_bottom=None,
+    slice_thickness=None,
+) -> torch.Tensor:
+    """Build a 1D C10 axis in Angstroms for defocus-stack reconstruction.
+
+    Mode 1: n_layers + slice_thickness — symmetric stack centred on c10_center.
+    Mode 2: z_top + z_bottom + slice_thickness — explicit range.
+    """
+    has_n_layers = n_layers is not None
+    has_range_arg = any(val is not None for val in (z_top, z_bottom))
+
+    if slice_thickness is None:
+        raise ValueError("slice_thickness is required for defocus-stack reconstruction.")
+
+    slice_thickness = float(slice_thickness)
+    if slice_thickness <= 0:
+        raise ValueError(f"slice_thickness must be positive, got {slice_thickness}.")
+
+    if has_n_layers and has_range_arg:
+        raise ValueError(
+            "Provide either n_layers or z_top/z_bottom with slice_thickness, not both."
+        )
+
+    if has_n_layers:
+        if z_top is not None or z_bottom is not None:
+            raise ValueError("n_layers mode does not accept z_top or z_bottom.")
+        if not isinstance(n_layers, (int, np.integer)):
+            raise ValueError(f"n_layers must be a positive integer, got {n_layers!r}.")
+        n_layers = int(n_layers)
+        if n_layers <= 0:
+            raise ValueError(f"n_layers must be positive, got {n_layers}.")
+        offsets = (torch.arange(n_layers, device=device, dtype=torch.float32)
+                   - ((n_layers - 1) / 2.0))
+        return c10_center + offsets * slice_thickness
+
+    if has_range_arg:
+        if z_top is None or z_bottom is None:
+            raise ValueError(
+                "Range mode requires z_top, z_bottom, and slice_thickness together."
+            )
+        start = float(z_top)
+        stop = float(z_bottom)
+        delta = stop - start
+
+        if delta == 0:
+            return torch.tensor([start], dtype=torch.float32, device=device)
+
+        direction = 1.0 if delta > 0 else -1.0
+        # Add epsilon before floor to absorb fp roundoff when range divides evenly.
+        steps = int(np.floor(abs(delta) / slice_thickness + 1e-9))
+        offsets = torch.arange(steps + 1, device=device, dtype=torch.float32)
+        return start + direction * slice_thickness * offsets
+
+    raise ValueError(
+        "Provide either n_layers with slice_thickness, or z_top, z_bottom, and slice_thickness."
+    )
+
+
 class BFSolver:
-    def __init__(
-        self,
+    """Offline/notebook facade for tcBF and acBF reconstruction.
+
+    Primary constructor: BFSolver.from_array(...)
+    """
+
+    def __init__(self, recon: BFReconstructor, source: ArrayDatasetSource) -> None:
+        self._recon = recon
+        self._source = source
+        self.reconstructed_image: torch.Tensor | None = None
+        self.last_c10_stack_axis: torch.Tensor | None = None
+
+    # ------------------------------------------------------------------
+    # Primary constructor
+    # ------------------------------------------------------------------
+
+    @classmethod
+    def from_array(
+        cls,
         dataset: np.ndarray,
         max_alpha: float,
         scan_step_size: float,
         dk: float,
         wavelength: float,
-        max_order: int,
-        aberrations: dict,
-        device='cuda',
-        coord_transform=None,
-        eps: float = 1e-3,
+        max_order: int = 2,
+        aberrations: dict | None = None,
+        device: str = 'cuda',
+        coord_transform: dict | None = None,
         cache_mode: str = 'lazy',
-    ):
-        """
-        Initializes the solver. Dataset loading/parsing is assumed to be handled
-        upstream (e.g., by PtyRAD's Initializer).
+        eps: float = 1e-3,
+    ) -> BFSolver:
+        if aberrations is None:
+            aberrations = {}
 
-        Args:
-            cache_mode: Controls how the static acBF/tcBF cache is stored.
-                Defaults to 'lazy' for memory safety.
-                'full' — Precompute and cache all static acBF/tcBF tensors on device.
-                'lazy' — Cache only FFTs and detector coordinates, regenerating heavy
-                         acBF basis/aperture tensors during each reconstruction.
-        """
-        self.dataset = dataset
-        self.max_alpha = max_alpha
-        self.scan_step_size = scan_step_size
-        self.dk = dk
-        self.wavelength = wavelength
-        self.max_order = max_order
-        self.orig_aberrations = aberrations
-        self.parsed_aberrations = Aberrations(aberrations).export(
+        source = ArrayDatasetSource(dataset)
+
+        parsed_aberrations = Aberrations(aberrations).export(
             notation='krivanek', style='cartesian', layout='nested'
         )
 
-        # Kirkland tolerance factors: T_n = (n+1)·lambda / (8·alpha_max^(n+1))
-        alpha_rad = float(self.max_alpha) / 1e3
-        self.tolerance_factors = {
-            n: float((n + 1) * self.wavelength / (8 * alpha_rad ** (n + 1)))
+        alpha_rad = float(max_alpha) / 1e3
+        tolerance_factors = {
+            n: float((n + 1) * wavelength / (8 * alpha_rad ** (n + 1)))
             for n in range(1, max_order + 1)
         }
-        # ab_state stores detector-frame coefficients. Reconstruction converts to scan
-        # frame on demand via ab_state.to_scan_frame(rotation_deg).
-        self.ab_state = AberrationState(
-            self.parsed_aberrations, self.max_order, device=device,
-            tolerance_factors=self.tolerance_factors,
-        )
-        self.eps = eps
-        self.device = device
 
-        _VALID_CACHE_MODES = ('full', 'lazy')
-        cache_mode = str(cache_mode).strip().lower()
-        if cache_mode not in _VALID_CACHE_MODES:
-            raise ValueError(
-                f"cache_mode must be one of {_VALID_CACHE_MODES}, got {cache_mode!r}."
-            )
-        self.cache_mode = cache_mode
-
-        # Coordinate transform — maps acBF k-space orientation to the PtyRAD pipeline.
-        #
-        # flipud / fliplr / transpose:
-        #   Correct discrete 90°-class detector orientation differences.
-        #   Operations applied: flipud → fliplr → transpose (same order as PtyRAD _meas_flipT).
-        #
-        # rotation_deg:
-        #   Scan rotation angle in detector frame (CCW positive as seen on screen).
-        #   Maps to PtyRAD's pos_scan_affine rotation (same value, same sign).
-        self.coord_transform = coord_transform or {
-            'flipud': False,
-            'fliplr': False,
-            'transpose': False,
-            'rotation_deg': 0.0,
-        }
-        self._rotation_deg = float(self.coord_transform.get('rotation_deg', 0.0))
-
-        self.reconstructed_image = None
-        self._basis_cache: dict = {}
-        self._image_fft: ImageFFT | None = None
-        self.last_c10_stack_axis = None
-
-        # One-time pipeline setup. _bf_mask_bool and the 4D staging buffers
-        # support in-place dataset/geometry updates during live acquisition.
-        (self.vbf_images, self.kY_centers, self.kX_centers,
-         self.kY_grid, self.kX_grid, self.bf_mask,
-         self._bf_mask_bool, self._dataset_pinned_buffer_4d,
-         self._dataset_device_staging_4d) = init_vbf(
-            dataset, max_alpha, dk, wavelength, device
+        ab_state = AberrationState(
+            parsed_aberrations, max_order, device=device,
+            tolerance_factors=tolerance_factors,
         )
-        self.bf_coordinates = torch.stack([self.kY_centers, self.kX_centers], dim=-1)
-        self.Ry, self.Rx = dataset.shape[0], dataset.shape[1]
-        self.shift_grid = init_grid(self.Ry, self.Rx, device)
-        # Scan-frame frequency grids — derived from (Ry, Rx, scan_step_size); fixed per session.
-        self.qx_grid, self.qy_grid = build_scan_freq_grids(
-            self.Ry, self.Rx, self.scan_step_size, self.device,
+
+        ct = CoordinateTransform.from_dict(coord_transform)
+
+        Ry, Rx = source.scan_shape
+        Ky, Kx = source.detector_shape
+        det_geom = DetectorGeometry.from_params(
+            detector_shape=(Ky, Kx),
+            max_alpha=max_alpha,
+            dk=dk,
+            wavelength=wavelength,
+            device=device,
         )
-        # Device-side BF mask gather artifacts for the live-acquisition
-        # update_dataset hot path. _bf_mask_bool_d is the device mirror of the
-        # BF mask. CUDA extraction reuses the 4D pinned/device staging buffers.
-        self._bf_mask_bool_d = (
-            torch.as_tensor(self._bf_mask_bool, device=self.device)
-            if str(self.device).startswith('cuda') else None
+        scan_geom = ScanGeometry.from_params(
+            scan_shape=(Ry, Rx),
+            scan_step_size=scan_step_size,
+            device=device,
         )
+        prepared = PreparedBFDataset.build(source, det_geom, device)
+
+        recon = BFReconstructor(
+            prepared=prepared,
+            scan_geom=scan_geom,
+            ab_state=ab_state,
+            coord_transform=ct,
+            cache_mode=cache_mode,
+            eps=eps,
+        )
+
+        solver = cls(recon=recon, source=source)
+        # Store tolerance_factors for refinement access.
+        solver.tolerance_factors = tolerance_factors
+        return solver
 
     # ------------------------------------------------------------------
-    # Internal helpers — coordinate transforms & frame handling
+    # Delegated properties — expose only what refinement/users actually need
     # ------------------------------------------------------------------
 
-    @staticmethod
-    def _normalize_acbf_algorithm(acbf_algorithm):
-        if acbf_algorithm is None:
-            return 'phase_only'
-        return str(acbf_algorithm).strip().lower().replace('-', '_')
+    @property
+    def ab_state(self) -> AberrationState:
+        return self._recon.ab_state
+
+    @property
+    def vbf_images(self) -> torch.Tensor:
+        return self._recon.prepared.vbf_images
+
+    @property
+    def bf_mask(self) -> torch.Tensor:
+        return self._recon.prepared.detector_geom.bf_mask
+
+    @property
+    def kY_centers(self) -> torch.Tensor:
+        return self._recon.prepared.detector_geom.kY_centers
+
+    @property
+    def kX_centers(self) -> torch.Tensor:
+        return self._recon.prepared.detector_geom.kX_centers
+
+    @property
+    def kY_grid(self) -> torch.Tensor:
+        return self._recon.prepared.detector_geom.kY_grid
+
+    @property
+    def kX_grid(self) -> torch.Tensor:
+        return self._recon.prepared.detector_geom.kX_grid
+
+    @property
+    def device(self) -> str:
+        return self._recon.device
+
+    @property
+    def max_alpha(self) -> float:
+        return self._recon.prepared.detector_geom.max_alpha
+
+    @property
+    def dk(self) -> float:
+        return self._recon.prepared.detector_geom.dk
+
+    @property
+    def wavelength(self) -> float:
+        return self._recon.prepared.detector_geom.wavelength
+
+    @property
+    def scan_step_size(self) -> float:
+        return self._recon.scan_geom.scan_step_size
+
+    @property
+    def Ry(self) -> int:
+        return self._recon.scan_geom.scan_shape[0]
+
+    @property
+    def Rx(self) -> int:
+        return self._recon.scan_geom.scan_shape[1]
+
+    @property
+    def max_order(self) -> int:
+        return self._recon.ab_state.max_order
+
+    @property
+    def eps(self) -> float:
+        return self._recon.eps
+
+    @property
+    def cache_mode(self) -> str:
+        return self._recon.cache_mode
+
+    @cache_mode.setter
+    def cache_mode(self, value: str) -> None:
+        self._recon.cache_mode = value
+
+    @property
+    def coord_transform(self) -> dict:
+        """Mutable dict view of the current CoordinateTransform.
+
+        Refinement code reads and writes this dict. Writes are applied via
+        set_rotation_deg() or _apply_coord_transform_dict(). Kept as a dict
+        for backward compatibility with the duck-typed refinement interface.
+        """
+        return self._recon.coord_transform.to_dict()
+
+    @coord_transform.setter
+    def coord_transform(self, value: dict) -> None:
+        """Accepting dict assignment from refinement code; rebuilds CoordinateTransform."""
+        self._recon.set_coord_transform(CoordinateTransform.from_dict(value), clear_basis=True)
 
     @property
     def rotation_deg(self) -> float:
-        """Scan rotation angle in degrees. Use set_rotation_deg() to update."""
-        return self._rotation_deg
+        return self._recon.rotation_deg
 
-    def clear_basis_cache(self):
-        """Clear orientation-dependent basis caches. Image FFT preserved."""
-        self._basis_cache = {}
-
-    def clear_fft_cache(self):
-        """Drop the cached image FFT only.
-
-        Note: After the cache split, basis no longer references image data, so
-        this does NOT clear basis (a behavior change from the pre-split design).
-        Use clear_cache() for a full reset.
-        """
-        self._image_fft = None
-
-    def clear_cache(self):
-        """Full reset — clears image FFT and basis caches."""
-        self._basis_cache = {}
-        self._image_fft = None
+    # TODO: remove when _build_roi_solver uses source.crop_scan_roi()
+    @property
+    def dataset(self) -> np.ndarray:
+        """Transitional: provides raw array access for ROI refinement."""
+        return self._source.get_array()
 
     # ------------------------------------------------------------------
-    # Live-acquisition setters
+    # Cache / state management (public interface mirroring BFReconstructor)
     # ------------------------------------------------------------------
 
-    def _invalidate_acbf_optics(self):
-        """Drop the optics tensors from every acBF cache entry; preserve geometry."""
-        for k, v in list(self._basis_cache.items()):
-            if isinstance(k, tuple) and len(k) > 0 and k[0] == 'acBF' and isinstance(v, tuple):
-                geometry, _ = v
-                self._basis_cache[k] = (geometry, None)
+    def clear_cache(self) -> None:
+        self._recon.clear_cache()
 
-    def _recompute_tolerance_factors(self):
-        """Recompute Kirkland tolerance factors from the current max_alpha and wavelength."""
-        alpha_rad = float(self.max_alpha) / 1e3
-        self.tolerance_factors = {
-            n: float((n + 1) * self.wavelength / (8 * alpha_rad ** (n + 1)))
-            for n in range(1, self.max_order + 1)
-        }
-        self.ab_state.rebuild_normalization(self.tolerance_factors)
+    def clear_basis_cache(self) -> None:
+        self._recon.clear_basis_cache()
 
-    def _rebuild_bf_geometry_and_stack(self, new_dataset: np.ndarray):
-        """Rebuild bf_mask, k-grids, vBF stack from a new dataset under current params.
-
-        Used by Tier-3 setters whose change invalidates the BF mask
-        (max_alpha, dk, wavelength). After this returns, all basis/FFT caches
-        must be cleared by the caller (Nb may have changed).
-
-        Reallocates the pinned host buffer and the device vbf_images tensor —
-        Nb is allowed to change.
-        """
-        Ry, Rx, Ky_dim, Kx_dim = new_dataset.shape
-        kY_grid_np, kX_grid_np, bf_mask_bool = compute_bf_geometry(
-            Ky_dim, Kx_dim, self.max_alpha, self.dk, self.wavelength,
-        )
-        self._bf_mask_bool = bf_mask_bool
-
-        self.kY_grid = torch.tensor(kY_grid_np, dtype=torch.float32, device=self.device)
-        self.kX_grid = torch.tensor(kX_grid_np, dtype=torch.float32, device=self.device)
-        self.bf_mask = torch.tensor(bf_mask_bool, dtype=torch.float32, device=self.device)
-        self.kY_centers = torch.tensor(
-            kY_grid_np[bf_mask_bool], dtype=torch.float32, device=self.device,
-        )
-        self.kX_centers = torch.tensor(
-            kX_grid_np[bf_mask_bool], dtype=torch.float32, device=self.device,
-        )
-        self.bf_coordinates = torch.stack([self.kY_centers, self.kX_centers], dim=-1)
-        self._bf_mask_bool_d = (
-            torch.as_tensor(bf_mask_bool, device=self.device)
-            if str(self.device).startswith('cuda') else None
-        )
-
-        # Force reallocation — Nb (and possibly Ry, Rx) may have changed.
-        (self.vbf_images,
-         self._dataset_pinned_buffer_4d,
-         self._dataset_device_staging_4d) = extract_vbf_stack(
-            new_dataset, bf_mask_bool, self.device,
-            out=None,
-            dataset_pinned_buffer=None,
-            dataset_device_buffer=None,
-            bf_mask_bool_d=self._bf_mask_bool_d,
-        )
-        self.dataset = new_dataset
-
-        if (Ry, Rx) != (self.Ry, self.Rx):
-            self.Ry, self.Rx = Ry, Rx
-            self.shift_grid = init_grid(Ry, Rx, self.device)
-            self.qx_grid, self.qy_grid = build_scan_freq_grids(
-                Ry, Rx, self.scan_step_size, self.device,
-            )
-
-    def update_dataset(self, new_dataset: np.ndarray):
-        """Tier-1 update: new 4D dataset under unchanged optics/scan geometry.
-
-        Refreshes the cached vBF stack and image FFT in place; preserves all
-        basis caches.
-
-        On CUDA: the full 4D dataset is copied into a pinned host buffer,
-        H2D-uploaded to a device staging buffer, then the BF mask is applied
-        on the GPU. Avoids the CPU-side fancy-index gather that bottlenecks
-        the host-mask path on large frames.
-
-        On CPU: uses a host-mask fallback. Other torch devices gather on the
-        requested device without CUDA pinned-memory staging.
-
-        Raises if the dataset shape does not match (Ry, Rx, *, *) under the
-        current mask; for shape changes, use update_scan_shape instead.
-        """
-        new_Ry, new_Rx = new_dataset.shape[0], new_dataset.shape[1]
-        if (new_Ry, new_Rx) != (self.Ry, self.Rx):
-            raise ValueError(
-                f"update_dataset: scan shape {(new_Ry, new_Rx)} does not match "
-                f"solver shape {(self.Ry, self.Rx)}. Use update_scan_shape."
-            )
-        if new_dataset.shape[2:] != self._bf_mask_bool.shape:
-            raise ValueError(
-                f"update_dataset: detector shape {new_dataset.shape[2:]} does not match "
-                f"BF mask shape {self._bf_mask_bool.shape}."
-            )
-        (self.vbf_images,
-         self._dataset_pinned_buffer_4d,
-         self._dataset_device_staging_4d) = extract_vbf_stack(
-            new_dataset, self._bf_mask_bool, self.device,
-            out=self.vbf_images,
-            dataset_pinned_buffer=self._dataset_pinned_buffer_4d,
-            dataset_device_buffer=self._dataset_device_staging_4d,
-            bf_mask_bool_d=self._bf_mask_bool_d,
-        )
-        # Track latest 4D array — refinement._build_roi_solver and friends
-        # read solver.dataset; if we don't refresh it here, the ROI path
-        # silently keeps cropping the original frame.
-        self.dataset = new_dataset
-        # FFT cache must follow the data; basis caches are independent.
-        self._image_fft = build_image_fft(self.vbf_images)
+    def set_rotation_deg(self, rotation_deg: float, clear_basis: bool = False) -> BFSolver:
+        ct = self._recon.coord_transform.with_rotation(float(rotation_deg))
+        self._recon.set_coord_transform(ct, clear_basis=clear_basis)
         return self
 
-    def update_scan_step(self, new_scan_step: float):
-        """Tier-2 update: scan step size (Å/pixel).
-
-        Rebuilds the scan-frequency grids and invalidates ACBFOpticsCache only.
-        TCBFCache, ACBFGeometryCache, and ImageFFT all survive.
-        """
-        new_scan_step = float(new_scan_step)
-        if new_scan_step == self.scan_step_size:
-            return self
-        self.scan_step_size = new_scan_step
-        self.qx_grid, self.qy_grid = build_scan_freq_grids(
-            self.Ry, self.Rx, self.scan_step_size, self.device,
+    def set_flips(self, flipud: bool, fliplr: bool, transpose: bool) -> BFSolver:
+        """Set flip/transpose flags and clear basis cache. Used by refinement sweeps."""
+        ct = CoordinateTransform(
+            flipud=bool(flipud),
+            fliplr=bool(fliplr),
+            transpose=bool(transpose),
+            rotation_deg=self._recon.coord_transform.rotation_deg,
         )
-        self._invalidate_acbf_optics()
+        self._recon.set_coord_transform(ct, clear_basis=True)
         return self
 
-    def update_scan_shape(self, new_dataset: np.ndarray):
-        """Tier-3 partial update: scan field-of-view (Ry, Rx) changes.
-
-        Rebuilds qx/qy grids, shift_grid, vBF stack, and image FFT. Preserves
-        TCBFCache and ACBFGeometryCache (Nb unchanged); clears ACBFOpticsCache
-        and ImageFFT.
-        """
-        Ry, Rx = new_dataset.shape[0], new_dataset.shape[1]
-        if new_dataset.shape[2:] != self._bf_mask_bool.shape:
-            raise ValueError(
-                f"update_scan_shape: detector shape {new_dataset.shape[2:]} does not match "
-                f"BF mask shape {self._bf_mask_bool.shape}."
-            )
-        if (Ry, Rx) == (self.Ry, self.Rx):
-            return self.update_dataset(new_dataset)
-
-        self.Ry, self.Rx = Ry, Rx
-        self.qx_grid, self.qy_grid = build_scan_freq_grids(
-            Ry, Rx, self.scan_step_size, self.device,
-        )
-        self.shift_grid = init_grid(Ry, Rx, self.device)
-        # Force reallocation — Ry, Rx changed.
-        (self.vbf_images,
-         self._dataset_pinned_buffer_4d,
-         self._dataset_device_staging_4d) = extract_vbf_stack(
-            new_dataset, self._bf_mask_bool, self.device,
-            out=None,
-            dataset_pinned_buffer=None,
-            dataset_device_buffer=None,
-            bf_mask_bool_d=self._bf_mask_bool_d,
-        )
-        self.dataset = new_dataset
-        self._image_fft = build_image_fft(self.vbf_images)
-        self._invalidate_acbf_optics()
-        return self
-
-    def update_convergence_angle(self, new_max_alpha: float, new_dataset: np.ndarray):
-        """Tier-3 heavy update: probe convergence semi-angle (mrad).
-
-        Changes the BF mask → Nb may change → all basis/FFT caches are cleared
-        and tolerance factors are rebuilt on `ab_state`.
-        """
-        new_max_alpha = float(new_max_alpha)
-        if new_max_alpha == self.max_alpha:
-            return self.update_dataset(new_dataset)
-        self.max_alpha = new_max_alpha
-        self._recompute_tolerance_factors()
-        self._rebuild_bf_geometry_and_stack(new_dataset)
-        self.clear_cache()
-        return self
-
-    def update_dk(self, new_dk: float, new_dataset: np.ndarray):
-        """Tier-3 heavy update: detector reciprocal pixel size (Å⁻¹/pixel)."""
-        new_dk = float(new_dk)
-        if new_dk == self.dk:
-            return self.update_dataset(new_dataset)
-        self.dk = new_dk
-        # max_alpha and wavelength unchanged → tolerance_factors unchanged.
-        self._rebuild_bf_geometry_and_stack(new_dataset)
-        self.clear_cache()
-        return self
-
-    def update_wavelength(self, new_wavelength: float, new_dataset: np.ndarray):
-        """Tier-3 heavy update: electron wavelength (Å).
-
-        Wavelength enters the BF mask, the Kirkland tolerance factors, and
-        every basis. All caches are cleared and the AberrationState is
-        re-normalized under the new tolerances.
-        """
-        new_wavelength = float(new_wavelength)
-        if new_wavelength == self.wavelength:
-            return self.update_dataset(new_dataset)
-        self.wavelength = new_wavelength
-        self._recompute_tolerance_factors()
-        self._rebuild_bf_geometry_and_stack(new_dataset)
-        self.clear_cache()
-        return self
-
-    _METADATA_KEYS = (
-        'wavelength', 'max_alpha', 'dk', 'scan_shape', 'scan_step_size',
-        'rotation_deg', 'flipud', 'fliplr', 'transpose',
-    )
-    _HEAVY_KEYS = ('wavelength', 'max_alpha', 'dk')
-
-    def apply_metadata(self, metadata: dict, dataset: np.ndarray | None = None):
-        """Diff `metadata` against current state and dispatch setters from
-        heaviest to lightest.
-
-        Recognized keys:
-            wavelength, max_alpha, dk, scan_step_size, rotation_deg,
-            flipud, fliplr, transpose, scan_shape (tuple (Ry, Rx))
-
-        `dataset` is required if any heavy or scan-shape change is detected.
-        Tier-3 setters consume the dataset themselves; once consumed, the
-        trailing Tier-1 update_dataset is suppressed to avoid a redundant
-        second H2D copy.
-
-        Unknown keys are warned and ignored.
-        """
-        for key in metadata:
-            if key not in self._METADATA_KEYS:
-                logger.warning(
-                    "apply_metadata: ignoring unrecognized key %r (recognized: %s)",
-                    key, self._METADATA_KEYS,
-                )
-
-        # Detect changes.
-        changed_heavy = any(
-            k in metadata and float(metadata[k]) != float(getattr(self, k))
-            for k in self._HEAVY_KEYS
-        )
-        new_shape = tuple(metadata['scan_shape']) if 'scan_shape' in metadata else None
-        changed_shape = new_shape is not None and new_shape != (self.Ry, self.Rx)
-
-        if (changed_heavy or changed_shape) and dataset is None:
-            raise ValueError(
-                "apply_metadata: a heavy or scan-shape change requires `dataset`."
-            )
-
-        dataset_consumed = False
-
-        # Heaviest first; each Tier-3 setter calls clear_cache and absorbs the dataset.
-        if 'wavelength' in metadata and float(metadata['wavelength']) != self.wavelength:
-            self.update_wavelength(float(metadata['wavelength']), dataset)
-            dataset_consumed = True
-        if 'max_alpha' in metadata and float(metadata['max_alpha']) != self.max_alpha:
-            self.update_convergence_angle(float(metadata['max_alpha']), dataset)
-            dataset_consumed = True
-        if 'dk' in metadata and float(metadata['dk']) != self.dk:
-            self.update_dk(float(metadata['dk']), dataset)
-            dataset_consumed = True
-
-        if changed_shape and not dataset_consumed:
-            self.update_scan_shape(dataset)
-            dataset_consumed = True
-
-        if 'scan_step_size' in metadata and float(metadata['scan_step_size']) != self.scan_step_size:
-            self.update_scan_step(float(metadata['scan_step_size']))
-
-        # Rotation / flips. Always pass clear_basis=True for live acquisition
-        # to prevent VRAM bloat from accumulated per-angle bases.
-        flip_changed = any(
-            k in metadata and bool(metadata[k]) != bool(self.coord_transform.get(k, False))
-            for k in ('flipud', 'fliplr', 'transpose')
-        )
-        rot_changed = (
-            'rotation_deg' in metadata
-            and float(metadata['rotation_deg']) != self.rotation_deg
-        )
-        if flip_changed or rot_changed:
-            for k in ('flipud', 'fliplr', 'transpose'):
-                if k in metadata:
-                    self.coord_transform[k] = bool(metadata[k])
-            new_rot = float(metadata.get('rotation_deg', self.rotation_deg))
-            self.set_rotation_deg(new_rot, clear_basis=True)
-
-        # Tier-1 dataset update — only if no heavier setter already consumed it.
-        if dataset is not None and not dataset_consumed:
-            self.update_dataset(dataset)
-
-        return self
-
-    def _get_transform_flags(self):
-        flipud = self.coord_transform.get('flipud', False)
-        fliplr = self.coord_transform.get('fliplr', False)
-        transpose = self.coord_transform.get('transpose', False)
-        return flipud, fliplr, transpose, self.rotation_deg
-
-    def _frame_cache_key(self):
-        flipud, fliplr, transpose, _ = self._get_transform_flags()
-        return (self.rotation_deg, flipud, fliplr, transpose)
+    # ------------------------------------------------------------------
+    # Internal helpers
+    # ------------------------------------------------------------------
 
     def _validate_frame(self, frame: str) -> str:
         frame = str(frame).lower()
@@ -484,7 +306,7 @@ class BFSolver:
         return frame
 
     def _get_scan_frame_coeffs(self) -> torch.Tensor:
-        return self.ab_state.to_scan_frame(self.rotation_deg)
+        return self._recon._get_scan_frame_coeffs()
 
     def _flat_to_cartesian_dict(self, flat: torch.Tensor) -> dict:
         out = {}
@@ -498,196 +320,28 @@ class BFSolver:
                 idx += 2
         return out
 
-    def set_rotation_deg(self, rotation_deg: float, clear_basis: bool = False):
-        """
-        Update scan rotation metadata.
+    def _get_transformed_bf_coordinates(self, in_scan_frame: bool = True) -> tuple[torch.Tensor, torch.Tensor]:
+        return self._recon._get_transformed_centers(in_scan_frame=in_scan_frame)
 
-        Basis caches include rotation in their keys so they do not need to be cleared
-        for correctness. Set clear_basis=True to release the old rotation's basis cache.
-        The FFT cache is orientation-independent and is never cleared here.
-        """
-        self._rotation_deg = float(rotation_deg)
-        self.coord_transform['rotation_deg'] = self._rotation_deg
-        if clear_basis:
-            self.clear_basis_cache()
-        return self
+    def _get_transformed_k_grids(self, in_scan_frame: bool = True) -> tuple[torch.Tensor, torch.Tensor]:
+        return self._recon._get_transformed_grids(in_scan_frame=in_scan_frame)
 
-    def _get_transformed_bf_coordinates(self, in_scan_frame=True):
-        """
-        Return transformed reciprocal-space BF coordinates as (kX, kY).
-
-        Operations applied: flipud → fliplr → transpose → rotation_deg.
-        in_scan_frame=True  → all four steps; in_scan_frame=False → rotation skipped.
-        """
-        ky = self.kY_centers.clone()
-        kx = self.kX_centers.clone()
-        flipud, fliplr, transpose, rotation_deg = self._get_transform_flags()
-
-        if flipud:
-            ky = -ky
-        if fliplr:
-            kx = -kx
-        if transpose:
-            ky, kx = kx, ky
-        if in_scan_frame and rotation_deg:
-            theta = np.deg2rad(rotation_deg)
-            kx_old = kx.clone()
-            ky_old = ky.clone()
-            kx = kx_old * np.cos(theta) - ky_old * np.sin(theta)
-            ky = kx_old * np.sin(theta) + ky_old * np.cos(theta)
-
-        return kx, ky
-
-    def _get_transformed_k_grids(self, in_scan_frame=True):
-        """
-        Return transformed reciprocal-space full grids as (kX_grid, kY_grid).
-
-        Same operation order as _get_transformed_bf_coordinates.
-        """
-        ky = self.kY_grid.clone()
-        kx = self.kX_grid.clone()
-        flipud, fliplr, transpose, rotation_deg = self._get_transform_flags()
-
-        if flipud:
-            ky = -ky
-        if fliplr:
-            kx = -kx
-        if transpose:
-            ky, kx = kx, ky
-        if in_scan_frame and rotation_deg:
-            theta = np.deg2rad(rotation_deg)
-            kx_old = kx.clone()
-            ky_old = ky.clone()
-            kx = kx_old * np.cos(theta) - ky_old * np.sin(theta)
-            ky = kx_old * np.sin(theta) + ky_old * np.cos(theta)
-
-        return kx, ky
+    # Internal: apply a raw dict to coord_transform + clear basis (used by refinement).
+    def _apply_coord_transform_dict(self, d: dict) -> None:
+        ct = CoordinateTransform.from_dict(d)
+        self._recon.set_coord_transform(ct, clear_basis=True)
 
     # ------------------------------------------------------------------
-    # Cache management — lazy-build wrappers
+    # Reconstruction
     # ------------------------------------------------------------------
 
-    def _get_image_fft(self) -> ImageFFT:
-        """Return the BF image FFT, building it on first call."""
-        if self._image_fft is None:
-            self._image_fft = build_image_fft(self.vbf_images)
-        return self._image_fft
+    def reconstruct(self, mode: str = 'tcBF', requires_grad: bool = False, **kwargs) -> torch.Tensor:
+        return self._recon.reconstruct(mode=mode, requires_grad=requires_grad, **kwargs)
 
-    def _get_tcBF_cache(self, chunk_size=64) -> TCBFCache:
-        key = ('tcBF', chunk_size, *self._frame_cache_key())
-        if key not in self._basis_cache:
-            kX_full, kY_full = self._get_transformed_bf_coordinates()
-            self._basis_cache[key] = build_tcbf_cache(
-                kX_full, kY_full,
-                self.ab_state.order_keys, self.wavelength, chunk_size,
-            )
-        return self._basis_cache[key]
-
-    def _get_acBF_cache(
-        self, rolloff=0, chunk_size=64,
-    ) -> tuple[ACBFGeometryCache, ACBFOpticsCache | None]:
-        """Return (geometry, optics_or_None).
-
-        Geometry is mode-independent and shared across lazy/full toggles.
-        Optics is built on demand only in 'full' mode; cached for free reuse if
-        the mode is later flipped back to 'full'. The consumer-facing optics
-        return is gated on the current cache_mode — flipping to 'lazy' yields
-        None even if optics is materialized in storage.
-        """
-        key = ('acBF', rolloff, chunk_size, *self._frame_cache_key())
-        if key not in self._basis_cache:
-            kX_full, kY_full = self._get_transformed_bf_coordinates()
-            geometry = build_acbf_geometry_cache(
-                kX_full, kY_full,
-                self.ab_state.order_keys, self.max_alpha, self.wavelength,
-                self.max_order, rolloff, chunk_size,
-            )
-            self._basis_cache[key] = (geometry, None)
-
-        geometry, optics = self._basis_cache[key]
-        if self.cache_mode == 'full':
-            if optics is None:
-                optics = build_acbf_optics_cache(geometry, self.qx_grid, self.qy_grid)
-                self._basis_cache[key] = (geometry, optics)
-            return geometry, optics
-        return geometry, None
-
-    # ------------------------------------------------------------------
-    # Reconstruction orchestration
-    # ------------------------------------------------------------------
-
-    @staticmethod
-    def _validate_native_upscale(upscale):
-        if upscale != 1:
-            raise NotImplementedError(
-                "upscale is temporarily unsupported during the native-resolution "
-                "cache cleanup. Use upscale=1."
-            )
-
-    def _reconstruct_impl(self, mode='tcBF', **kwargs):
-        """
-        Differentiable reconstruction implementation.
-
-        Notes:
-            - tcBF is the default mode.
-            - acBF supports acbf_algorithm='phase_only' (default) and
-              acbf_algorithm='complex_inversion'.
-        """
-        mode_key = mode.lower()
-
-        if mode_key == 'tcbf':
-            self._validate_native_upscale(kwargs.get('upscale', 1))
-            cache = self._get_tcBF_cache(chunk_size=kwargs.get('chunk_size', 64))
-            image_fft = self._get_image_fft()
-            return reconstruct_tcbf(
-                image_fft, self.qx_grid, self.qy_grid, cache,
-                self._get_scan_frame_coeffs(), self.device,
-            )
-
-        elif mode_key == 'acbf':
-            self._validate_native_upscale(kwargs.get('upscale', 1))
-            rolloff = kwargs.get('rolloff', 0)
-            chunk_size = kwargs.get('chunk_size', 64)
-            acbf_algorithm = self._normalize_acbf_algorithm(kwargs.get('acbf_algorithm', 'phase_only'))
-            geometry, optics = self._get_acBF_cache(rolloff=rolloff, chunk_size=chunk_size)
-            image_fft = self._get_image_fft()
-            coeffs = self._get_scan_frame_coeffs()
-
-            if acbf_algorithm == 'phase_only':
-                return reconstruct_acbf(
-                    image_fft, self.qx_grid, self.qy_grid, geometry, optics,
-                    coeffs, self.eps, self.device,
-                )
-            if acbf_algorithm == 'complex_inversion':
-                return reconstruct_acbf_complex_inversion(
-                    image_fft, self.qx_grid, self.qy_grid, geometry, optics,
-                    coeffs, self.device,
-                    regularization=kwargs.get('regularization', 1e-3),
-                    support_threshold=kwargs.get('support_threshold', 1e-6),
-                )
-            raise ValueError(
-                f"Unsupported acBF algorithm '{acbf_algorithm}'. "
-                "Choose between 'phase_only' and 'complex_inversion'."
-            )
-
-        raise ValueError(f"Unsupported mode '{mode}'. Choose between 'tcBF' and 'acBF'.")
-
-    def reconstruct(self, mode='tcBF', requires_grad: bool = False, **kwargs):
-        """
-        Unified reconstruction entry point.
-
-        Public/read-only reconstruction is no-grad by default so normal use does
-        not retain autograd graphs. Pass requires_grad=True only from AD
-        optimization paths that need gradients with respect to aberrations.
-        """
-        if requires_grad:
-            return self._reconstruct_impl(mode=mode, **kwargs)
-
-        with torch.no_grad():
-            return self._reconstruct_impl(mode=mode, **kwargs)
-
-    def _build_c10_stack_axis(self, n_layers=None, z_top=None, z_bottom=None, slice_thickness=None):
-        return build_c10_axis(
+    def _build_c10_stack_axis(
+        self, n_layers=None, z_top=None, z_bottom=None, slice_thickness=None,
+    ) -> torch.Tensor:
+        return _build_c10_axis(
             c10_center=self.ab_state.get_physical('C_1_0'),
             device=self.device,
             n_layers=n_layers,
@@ -696,15 +350,11 @@ class BFSolver:
             slice_thickness=slice_thickness,
         )
 
-    def _sweep_c10_stack(self, c10_axis, mode='tcBF', frame='scan', **kwargs):
-        """
-        Evaluate a read-only reconstruction stack over an absolute C10 axis.
-
-        Updates self.last_c10_stack_axis. Does not modify self.reconstructed_image.
-        """
-        original_c10 = self.ab_state.coeffs['C_1_0'].detach().clone()
+    def _sweep_c10_stack(
+        self, c10_axis: torch.Tensor, mode: str = 'tcBF', frame: str = 'scan', **kwargs,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        original_c10 = self.ab_state.get_physical('C_1_0')
         stack_images = []
-
         try:
             with torch.no_grad():
                 for c10 in c10_axis:
@@ -715,19 +365,23 @@ class BFSolver:
                     stack_images.append(img)
         finally:
             with torch.no_grad():
-                self.ab_state.coeffs['C_1_0'].copy_(original_c10)
+                self.ab_state.set_physical('C_1_0', original_c10)
 
         c10_axis = c10_axis.detach().clone()
-        stack = torch.stack(stack_images, dim=0)
         self.last_c10_stack_axis = c10_axis
-        return c10_axis, stack
+        return c10_axis, torch.stack(stack_images, dim=0)
 
     # ------------------------------------------------------------------
-    # Public API — getters
+    # Public getters
     # ------------------------------------------------------------------
 
-    def get_aberrations_dict(self, frame='detector', notation='krivanek', style='cartesian', layout='nested'):
-        """Return aberration coefficients in the requested notation/style/layout."""
+    def get_aberrations_dict(
+        self,
+        frame: str = 'detector',
+        notation: str = 'krivanek',
+        style: str = 'cartesian',
+        layout: str = 'nested',
+    ) -> dict:
         frame = self._validate_frame(frame)
         if frame == 'detector':
             ab_dict = self.ab_state.get_cartesian_dict()
@@ -735,8 +389,7 @@ class BFSolver:
             ab_dict = self._flat_to_cartesian_dict(self._get_scan_frame_coeffs())
         return Aberrations(ab_dict).export(notation=notation, style=style, layout=layout)
 
-    def print_aberrations(self, frame='detector'):
-        """Print aberration coefficients."""
+    def print_aberrations(self, frame: str = 'detector') -> None:
         frame = self._validate_frame(frame)
         if frame == 'scan' and self.rotation_deg:
             logger.warning(
@@ -746,13 +399,7 @@ class BFSolver:
             )
         print(Aberrations(self.get_aberrations_dict(frame=frame)))
 
-    def get_chi_surface(self, frame='detector'):
-        """
-        Return aberration surface chi. Note: psi = exp(-1j*chi).
-
-        The chi/probe raster is always the canonical flip/transpose-corrected
-        detector raster. frame selects which coefficient frame is evaluated.
-        """
+    def get_chi_surface(self, frame: str = 'detector') -> torch.Tensor:
         frame = self._validate_frame(frame)
         kX_grid, kY_grid = self._get_transformed_k_grids(in_scan_frame=False)
         chi_basis = generate_aberration_basis(
@@ -761,7 +408,7 @@ class BFSolver:
         coeffs = self.ab_state.get_flat_coeffs() if frame == 'detector' else self._get_scan_frame_coeffs()
         return torch.einsum('k,kij->ij', coeffs, chi_basis)
 
-    def get_yx_shifts_ang(self, frame='detector'):
+    def get_yx_shifts_ang(self, frame: str = 'detector') -> torch.Tensor:
         """Return image shifts in Angstroms as (Nb, 2) tensor (shift_y, shift_x)."""
         frame = self._validate_frame(frame)
         in_scan = frame == 'scan'
@@ -774,12 +421,13 @@ class BFSolver:
         shift_y_ang = torch.einsum('k,kb->b', coeffs, b_dy)
         return torch.stack([shift_y_ang, shift_x_ang], dim=-1)
 
-    def get_yx_shifts_px(self, frame='detector'):
-        """Return image shifts in real-space pixels as (Nb, 2) tensor."""
+    def get_yx_shifts_px(self, frame: str = 'detector') -> torch.Tensor:
         return self.get_yx_shifts_ang(frame=frame) / self.scan_step_size
 
+    def get_probe(self, frame: str = 'detector') -> torch.Tensor:
+        return make_probe_from_chi(self.get_chi_surface(frame=frame), self.bf_mask)
+
     def rotate_scan_image_to_detector(self, img: torch.Tensor) -> torch.Tensor:
-        """Rotate a scan-frame image to detector frame via bilinear resampling (display path)."""
         if not self.rotation_deg:
             return img
         return tv_rotate(
@@ -788,36 +436,33 @@ class BFSolver:
             interpolation=InterpolationMode.BILINEAR,
         ).squeeze(0)
 
-    def get_reconstructed_image(self, mode='tcBF', frame='scan', **kwargs):
-        """Return the reconstructed image, optionally rotated to detector frame."""
-        mode = mode.lower()
+    def get_reconstructed_image(
+        self, mode: str = 'tcBF', frame: str = 'scan', **kwargs,
+    ) -> torch.Tensor:
         frame = self._validate_frame(frame)
-        img = self.reconstruct(mode=mode, requires_grad=False, **kwargs)
+        img = self.reconstruct(mode=mode.lower(), requires_grad=False, **kwargs)
         self.reconstructed_image = img.detach()
-
         if frame == 'detector':
             img = self.rotate_scan_image_to_detector(img)
-
         return img
 
-    def get_tcBF(self, frame='scan', **kwargs):
-        """Return tcBF image."""
+    def get_tcBF(self, frame: str = 'scan', **kwargs) -> torch.Tensor:
         return self.get_reconstructed_image(mode='tcBF', frame=frame, **kwargs)
 
-    def get_acBF(self, frame='scan', **kwargs):
-        """Return acBF image."""
+    def get_acBF(self, frame: str = 'scan', **kwargs) -> torch.Tensor:
         return self.get_reconstructed_image(mode='acBF', frame=frame, **kwargs)
 
-    def get_acBF_diagnostics(self, **kwargs):
-        """Return transfer diagnostics for the complex-inversion acBF estimator."""
-        self._validate_native_upscale(kwargs.get('upscale', 1))
+    def get_acBF_diagnostics(self, **kwargs) -> dict:
+        from fast_acbf.recon.cache import build_acbf_optics_cache
         rolloff = kwargs.get('rolloff', 0)
         chunk_size = kwargs.get('chunk_size', 64)
         with torch.no_grad():
-            geometry, optics = self._get_acBF_cache(rolloff=rolloff, chunk_size=chunk_size)
-            image_fft = self._get_image_fft()
+            geometry, optics = self._recon._get_acbf_cache(rolloff=rolloff, chunk_size=chunk_size)
+            image_fft = self._recon._get_image_fft()
+            from fast_acbf.core.acbf import reconstruct_acbf_complex_inversion
             return reconstruct_acbf_complex_inversion(
-                image_fft, self.qx_grid, self.qy_grid, geometry, optics,
+                image_fft, self._recon.scan_geom.qx_grid, self._recon.scan_geom.qy_grid,
+                geometry, optics,
                 self._get_scan_frame_coeffs(),
                 self.device,
                 regularization=kwargs.get('regularization', 1e-3),
@@ -827,60 +472,45 @@ class BFSolver:
 
     def get_defocus_stack(
         self,
-        mode='tcBF',
-        frame='scan',
+        mode: str = 'tcBF',
+        frame: str = 'scan',
         n_layers=None,
         z_top=None,
         z_bottom=None,
         slice_thickness=None,
         **kwargs,
-    ):
-        """
-        Return a read-only defocus stack with shape (Nz, Ny, Nx).
-
-        The stack axis is absolute C10 in Angstroms, stored in self.last_c10_stack_axis.
-        Supported modes: n_layers + slice_thickness, or z_top + z_bottom + slice_thickness.
-        """
-        mode = mode.lower()
+    ) -> torch.Tensor:
+        """Return a defocus stack (Nz, Ny, Nx). C10 axis stored in last_c10_stack_axis."""
         c10_axis = self._build_c10_stack_axis(
             n_layers=n_layers, z_top=z_top, z_bottom=z_bottom, slice_thickness=slice_thickness,
         )
-        _, stack = self._sweep_c10_stack(c10_axis, mode=mode, frame=frame, **kwargs)
+        _, stack = self._sweep_c10_stack(c10_axis, mode=mode.lower(), frame=frame, **kwargs)
         return stack
-
-    def get_probe(self, frame='detector'):
-        """Return the complex probe wavefield on the canonical detector raster."""
-        return make_probe_from_chi(self.get_chi_surface(frame=frame), self.bf_mask)
 
     # ------------------------------------------------------------------
     # Refinement — thin pass-throughs to optimization.refinement
     # ------------------------------------------------------------------
 
-    def refine_register(self, max_shifts=None):
-        """Refines shifts using rigid registration (not yet implemented)."""
+    def refine_register(self, max_shifts=None) -> BFSolver:
         print("Executed: Rigid Registration Refinement")
         return self
 
-    def refine_defocus(self, *, search_range: tuple | None = None, **kwargs):
-        """Line search for optimal C10 (defocus). See optimization.refinement.refine_defocus."""
+    def refine_defocus(self, *, search_range=None, **kwargs) -> BFSolver:
         from fast_acbf.optimization import refinement
         refinement.refine_defocus(self, search_range=search_range, **kwargs)
         return self
 
-    def refine_aberrations(self, **kwargs):
-        """Gradient-based aberration refinement. See optimization.refinement.refine_aberrations."""
+    def refine_aberrations(self, **kwargs) -> BFSolver:
         from fast_acbf.optimization import refinement
         refinement.refine_aberrations(self, **kwargs)
         return self
 
-    def refine_scan_rotation(self, *, search_range: tuple | None = None, **kwargs):
-        """Line search for optimal scan rotation. See optimization.refinement.refine_scan_rotation."""
+    def refine_scan_rotation(self, *, search_range=None, **kwargs) -> BFSolver:
         from fast_acbf.optimization import refinement
         refinement.refine_scan_rotation(self, search_range=search_range, **kwargs)
         return self
 
-    def refine_flips(self, **kwargs):
-        """Exhaustive flip/transpose search. See optimization.refinement.refine_flips."""
+    def refine_flips(self, **kwargs) -> dict:
         from fast_acbf.optimization import refinement
         return refinement.refine_flips(self, **kwargs)
 
@@ -899,8 +529,7 @@ class BFSolver:
         aberration_iters: int = 50,
         refinement_scan_roi=None,
         **kwargs,
-    ) -> 'BFSolver':
-        """Coarse-to-fine parameter orchestration. See optimization.refinement.refine_all_params."""
+    ) -> BFSolver:
         from fast_acbf.optimization import refinement
         refinement.refine_all_params(
             self,
@@ -929,14 +558,12 @@ class BFSolver:
         title_str=None,
         desc_str=None,
         save_path=None,
-        mode='tcBF',
-        frame='scan',
-        vmin_img=None,
-        vmax_img=None,
-        vmin_fft=None,
-        vmax_fft=None,
+        mode: str = 'tcBF',
+        frame: str = 'scan',
+        vmin_img=None, vmax_img=None,
+        vmin_fft=None, vmax_fft=None,
         **kwargs,
-    ):
+    ) -> None:
         from fast_acbf.vis import plotting
 
         mode = mode.lower()
@@ -959,29 +586,25 @@ class BFSolver:
             vmin_img=vmin_img, vmax_img=vmax_img, vmin_fft=vmin_fft, vmax_fft=vmax_fft,
         )
 
-    def plot_chi_surface(self, plot_probe_phase=False):
-        """Plot the aberration (chi) surface."""
+    def plot_chi_surface(self, plot_probe_phase: bool = False) -> None:
         from fast_acbf.vis import plotting
-
         chi = self.get_chi_surface()
         if plot_probe_phase:
             sign, title_str = -1, 'k-space probe phase (psi = exp(-1j*chi))'
         else:
             sign, title_str = 1, 'k-space aberration (chi) surface (psi = exp(-1j*chi))'
-
         surface = (self.bf_mask * sign * chi).detach().cpu().numpy()
         plotting.plot_chi_surface(surface, title_str=title_str)
 
-    def plot_shift_quiver(self, subsample=None, scale=None, show=True, frame='detector'):
-        """Quiver plot of image shifts over BF disk."""
+    def plot_shift_quiver(
+        self, subsample=None, scale=None, show: bool = True, frame: str = 'detector',
+    ):
         from fast_acbf.vis import plotting
-
         frame = self._validate_frame(frame)
         in_scan = frame == 'scan'
         with torch.no_grad():
             shift_yx_ang = self.get_yx_shifts_ang(frame=frame)
             kx, ky = self._get_transformed_bf_coordinates(in_scan_frame=in_scan)
-
         k_max = self.max_alpha / 1e3 / self.wavelength
         return plotting.plot_shift_quiver(
             kx=kx.cpu().numpy(),
