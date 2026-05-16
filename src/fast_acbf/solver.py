@@ -263,12 +263,6 @@ class BFSolver:
     def rotation_deg(self) -> float:
         return self._recon.rotation_deg
 
-    # TODO: remove when _build_roi_solver uses source.crop_scan_roi()
-    @property
-    def dataset(self) -> np.ndarray:
-        """Transitional: provides raw array access for ROI refinement."""
-        return self._source.get_array()
-
     # ------------------------------------------------------------------
     # Cache / state management (public interface mirroring BFReconstructor)
     # ------------------------------------------------------------------
