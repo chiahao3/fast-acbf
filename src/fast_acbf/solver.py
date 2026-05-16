@@ -302,18 +302,6 @@ class BFSolver:
     def _get_scan_frame_coeffs(self) -> torch.Tensor:
         return self._recon._get_scan_frame_coeffs()
 
-    def _flat_to_cartesian_dict(self, flat: torch.Tensor) -> dict:
-        out = {}
-        idx = 0
-        for (n, m) in self.ab_state.order_keys:
-            if m == 0:
-                out[(n, m)] = flat[idx].item()
-                idx += 1
-            else:
-                out[(n, m)] = {'a': flat[idx].item(), 'b': flat[idx + 1].item()}
-                idx += 2
-        return out
-
     def _get_transformed_bf_coordinates(self, in_scan_frame: bool = True) -> tuple[torch.Tensor, torch.Tensor]:
         return self._recon._get_transformed_centers(in_scan_frame=in_scan_frame)
 
@@ -380,7 +368,7 @@ class BFSolver:
         if frame == 'detector':
             ab_dict = self.ab_state.get_cartesian_dict()
         else:
-            ab_dict = self._flat_to_cartesian_dict(self._get_scan_frame_coeffs())
+            ab_dict = self.ab_state.flat_to_cartesian_dict(self._get_scan_frame_coeffs())
         return Aberrations(ab_dict).export(notation=notation, style=style, layout=layout)
 
     def print_aberrations(self, frame: str = 'detector') -> None:

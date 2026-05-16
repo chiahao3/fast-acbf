@@ -130,6 +130,19 @@ class AberrationState(torch.nn.Module):
         with torch.no_grad():
             self.coeffs[key].copy_(torch.tensor(norm_val, dtype=torch.float32, device=self.device))
 
+    def flat_to_cartesian_dict(self, flat: torch.Tensor) -> dict:
+        """Convert a flat physical-unit coefficient tensor to the cartesian dict format."""
+        out = {}
+        idx = 0
+        for (n, m) in self.order_keys:
+            if m == 0:
+                out[(n, m)] = flat[idx].item()
+                idx += 1
+            else:
+                out[(n, m)] = {'a': flat[idx].item(), 'b': flat[idx + 1].item()}
+                idx += 2
+        return out
+
     def rebuild_normalization(self, new_tolerance_factors: dict):
         """Re-normalize all parameters under a new set of tolerance factors.
 

@@ -651,7 +651,7 @@ class TestGetAberrationsDict:
         )
 
         exported = solver.get_aberrations_dict(frame='scan', layout='nested')
-        expected = solver._flat_to_cartesian_dict(solver.ab_state.to_scan_frame(solver.rotation_deg))
+        expected = solver.ab_state.flat_to_cartesian_dict(solver.ab_state.to_scan_frame(solver.rotation_deg))
 
         assert exported[(1, 0)] == pytest.approx(expected[(1, 0)], abs=1e-4)
         assert exported[(1, 2)]['a'] == pytest.approx(expected[(1, 2)]['a'], abs=1e-3)
