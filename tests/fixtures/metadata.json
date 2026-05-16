@@ -10,5 +10,5 @@
   },
   "max_order": 2,
   "device_used": "cuda",
-  "fast_acbf_version": "0.0.1"
+  "fast_acbf_version": "0.2.0"
 }
