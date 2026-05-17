@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 import os
+import warnings
 from pathlib import Path
 
 import numpy as np
@@ -103,22 +104,30 @@ class BFSolver:
         cache_mode: str = 'auto',
         basis_mode: str = 'on_the_fly',
         eps: float = 1e-3,
+        normalize: bool = False,
     ) -> None:
         if aberrations is None:
             aberrations = {}
 
         # Dispatch → Dataset4D
         if isinstance(dataset, Dataset4D):
+            if normalize:
+                warnings.warn(
+                    "normalize=True has no effect when dataset is an already-constructed Dataset4D. "
+                    "Pass normalize=True to Dataset4D(...) or its classmethods at construction time.",
+                    UserWarning,
+                    stacklevel=2,
+                )
             ds = dataset
         elif isinstance(dataset, (str, os.PathLike)):
             path = Path(dataset)
             suffix = path.suffix.lower()
             if suffix in ('.h5', '.hdf5'):
-                ds = Dataset4D.from_hdf5(path)
+                ds = Dataset4D.from_hdf5(path, normalize=normalize)
             else:
-                ds = Dataset4D.from_zarr(path)
+                ds = Dataset4D.from_zarr(path, normalize=normalize)
         else:
-            ds = Dataset4D(dataset)
+            ds = Dataset4D(dataset, normalize=normalize)
 
         parsed_aberrations = Aberrations(aberrations).export(
             notation='krivanek', style='cartesian', layout='nested'

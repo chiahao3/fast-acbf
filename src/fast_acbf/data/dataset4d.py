@@ -20,10 +20,23 @@ class Dataset4D:
     (1,1,Ky,Kx), each slice decompresses Ry×Rx disk chunks. Detector-major chunking
     (Ry,Rx,1,1) gives one disk read per pixel. Performance is inherent to the storage
     format; on_the_fly mode with HDF5/zarr may be slow for scan-major layouts.
+
+    Normalization invariant:
+      In-memory (is_lazy=False): _array is already divided by _norm_factor.
+        Getters return _array directly — _norm_factor is documentary metadata only.
+      Lazy (is_lazy=True): disk data is untouched. Getters divide on the fly.
+      _norm_factor=None means no normalization was requested.
     """
 
     # --- Array-backed constructor ---
-    def __init__(self, array: np.ndarray | torch.Tensor) -> None:
+    def __init__(self, array: np.ndarray | torch.Tensor, *, normalize: bool = False) -> None:
+        """
+        Args:
+            array: (Ry, Rx, Ky, Kx) array or tensor.
+            normalize: If True, divide all data by the maximum of the mean diffraction
+                pattern (PACBED). For a full dataset, PACBED max ≈ 1 after normalization.
+                Disk data is never modified. The factor is accessible via norm_factor.
+        """
         if isinstance(array, torch.Tensor):
             if array.is_cuda:
                 array = array.cpu()
@@ -35,14 +48,31 @@ class Dataset4D:
         self._array = np.ascontiguousarray(array, dtype=np.float32)
         self._handle = None
         self._h5_file = None
+        self._norm_factor: float | None = None
+        if normalize:
+            self._apply_normalization()
 
     @property
     def is_lazy(self) -> bool:
         return self._handle is not None
 
+    @property
+    def norm_factor(self) -> float | None:
+        """Normalization factor applied at construction, or None if normalize=False."""
+        return self._norm_factor
+
     # --- Lazy constructors ---
     @classmethod
-    def from_hdf5(cls, path, key: str = 'data', *, materialize: bool = False) -> Dataset4D:
+    def from_hdf5(cls, path, key: str = 'data', *, materialize: bool = False, normalize: bool = False) -> Dataset4D:
+        """
+        Args:
+            path: Path to HDF5 file.
+            key: Dataset key inside the file.
+            materialize: If True, load the full array into RAM immediately.
+            normalize: If True, divide all data by the maximum of the mean diffraction
+                pattern (PACBED). For a full dataset, PACBED max ≈ 1 after normalization.
+                Disk data is never modified. The factor is accessible via norm_factor.
+        """
         try:
             import h5py
         except ImportError:
@@ -51,14 +81,30 @@ class Dataset4D:
         obj._array = None
         obj._h5_file = h5py.File(path, 'r')
         obj._handle = obj._h5_file[key]
+        obj._norm_factor = None  # must be set before _force_materialize()
         if obj._handle.ndim != 4:
             raise ValueError(f"HDF5 dataset '{key}' must be 4D, got shape {obj._handle.shape}")
         if materialize:
             obj._force_materialize()
+        if normalize:
+            try:
+                obj._apply_normalization()
+            except Exception:
+                obj.close()
+                raise
         return obj
 
     @classmethod
-    def from_zarr(cls, path, key: str = 'data', *, materialize: bool = False) -> Dataset4D:
+    def from_zarr(cls, path, key: str = 'data', *, materialize: bool = False, normalize: bool = False) -> Dataset4D:
+        """
+        Args:
+            path: Path to zarr store.
+            key: Array key inside the store.
+            materialize: If True, load the full array into RAM immediately.
+            normalize: If True, divide all data by the maximum of the mean diffraction
+                pattern (PACBED). For a full dataset, PACBED max ≈ 1 after normalization.
+                Disk data is never modified. The factor is accessible via norm_factor.
+        """
         try:
             import zarr
         except ImportError:
@@ -70,8 +116,15 @@ class Dataset4D:
         if obj._handle.ndim != 4:
             raise ValueError(f"Zarr array '{key}' must be 4D, got shape {obj._handle.shape}")
         obj._h5_file = None
+        obj._norm_factor = None  # must be set before _force_materialize()
         if materialize:
             obj._force_materialize()
+        if normalize:
+            try:
+                obj._apply_normalization()
+            except Exception:
+                obj.close()
+                raise
         return obj
 
     def close(self) -> None:
@@ -102,7 +155,10 @@ class Dataset4D:
     def get_virtual_img(self, ky: int, kx: int) -> np.ndarray:
         """Return (Ry, Rx) float32. Single detector pixel. Disk read for lazy."""
         if self.is_lazy:
-            return np.asarray(self._handle[:, :, ky, kx], dtype=np.float32)
+            result = np.asarray(self._handle[:, :, ky, kx], dtype=np.float32)
+            if self._norm_factor is not None:
+                result = result / np.float32(self._norm_factor)
+            return result
         return self._array[:, :, ky, kx]
 
     def get_bf_chunk(self, iy: np.ndarray, ix: np.ndarray) -> np.ndarray:
@@ -112,10 +168,13 @@ class Dataset4D:
         Lazy path: per-pixel loop — slow, but disk-backed I/O is inherently slow.
         """
         if self.is_lazy:
-            return np.stack(
+            raw = np.stack(
                 [np.asarray(self._handle[:, :, int(i), int(j)], dtype=np.float32)
                  for i, j in zip(iy, ix)], axis=0
             )
+            if self._norm_factor is not None:
+                raw = raw / np.float32(self._norm_factor)
+            return raw
         raw = self._array[:, :, iy, ix]            # (Ry, Rx, chunk_size) view
         return np.ascontiguousarray(raw.transpose(2, 0, 1), dtype=np.float32)
 
@@ -134,6 +193,10 @@ class Dataset4D:
         On success: self._array is populated as a contiguous float32 ndarray in host RAM,
         self._handle is cleared, and is_lazy becomes False.
         On MemoryError: raises RuntimeError with dataset size and cache_mode suggestions.
+
+        If _norm_factor is already set (lazy-normalized dataset), the loaded array is
+        divided by _norm_factor so the in-memory invariant holds. The load reads
+        self._handle[:] directly — never via getters — to avoid double-normalization.
         """
         if not self.is_lazy:
             return self._array
@@ -149,20 +212,69 @@ class Dataset4D:
                 f"or cache_mode='on_the_fly' to avoid caching entirely."
             )
         self._array = np.ascontiguousarray(arr)
+        if self._norm_factor is not None:
+            self._array = self._array / np.float32(self._norm_factor)
         if self._h5_file is not None:
             self._h5_file.close()
             self._h5_file = None
         self._handle = None
         return self._array
 
+    # --- Normalization ---
+    def _compute_lazy_norm_factor(self) -> float:
+        """Row-by-row PACBED mean without loading the full 4D array into RAM."""
+        Ry, Rx, Ky, Kx = self._handle.shape
+        if Ry == 0 or Rx == 0:
+            raise ValueError("Cannot normalize: dataset has zero scan positions.")
+        accum = np.zeros((Ky, Kx), dtype=np.float32)
+        for iy in range(Ry):
+            row = np.asarray(self._handle[iy, :, :, :], dtype=np.float32)  # (Rx, Ky, Kx)
+            accum += row.sum(axis=0, dtype=np.float32)
+        mean_dp = accum / np.float32(Ry * Rx)
+        return float(mean_dp.max())
+
+    def _apply_normalization(self) -> None:
+        """Compute and apply PACBED-max normalization. Call once at construction only."""
+        if self._norm_factor is not None:
+            raise RuntimeError(
+                "_apply_normalization() called on an already-normalized Dataset4D. "
+                "Normalize only once at construction."
+            )
+        if self.is_lazy:
+            factor = self._compute_lazy_norm_factor()
+        else:
+            Ry, Rx = self._array.shape[:2]
+            if Ry == 0 or Rx == 0:
+                raise ValueError("Cannot normalize: dataset has zero scan positions.")
+            mean_dp = self._array.mean(axis=(0, 1), dtype=np.float32)  # (Ky, Kx)
+            factor = float(mean_dp.max())
+        if not (factor > 0 and np.isfinite(factor)):
+            raise ValueError(
+                f"Cannot normalize: norm_factor={factor!r} is not a finite positive number. "
+                "Check that the dataset contains valid, non-zero intensities."
+            )
+        if not self.is_lazy:
+            # Non-in-place division ensures we never mutate the caller's array
+            # (np.ascontiguousarray may return the same object for contiguous float32 inputs).
+            self._array = self._array / np.float32(factor)
+        self._norm_factor = factor
+
     def crop_scan_roi(self, y0: int, y1: int, x0: int, x1: int) -> Dataset4D:
         """Return a new in-memory Dataset4D cropped in scan space.
 
         For lazy backends, the cropped region is loaded to RAM. This is
         acceptable because ROI refinement targets small subregions.
+
+        The child dataset uses the parent's global normalization factor (same absolute
+        scale), not a re-normalized PACBED. norm_factor is propagated as metadata.
         """
         if self.is_lazy:
             cropped = np.asarray(self._handle[y0:y1, x0:x1, :, :], dtype=np.float32)
+            if self._norm_factor is not None:
+                cropped = cropped / np.float32(self._norm_factor)
         else:
             cropped = np.ascontiguousarray(self._array[y0:y1, x0:x1])
-        return Dataset4D(cropped)
+            # _array already normalized; slice inherits the correct scale
+        new_ds = Dataset4D(cropped)
+        new_ds._norm_factor = self._norm_factor
+        return new_ds
