@@ -15,11 +15,29 @@ class Dataset4D:
                     get_full_array() raises RuntimeError.
                     cache_mode='device' is incompatible with lazy backends.
 
-    Note on HDF5/zarr access patterns: get_bf_chunk reads chunk_size detector-pixel
-    slices in a per-pixel loop for lazy backends. For scan-major HDF5 chunking
-    (1,1,Ky,Kx), each slice decompresses Ry×Rx disk chunks. Detector-major chunking
-    (Ry,Rx,1,1) gives one disk read per pixel. Performance is inherent to the storage
-    format; on_the_fly mode with HDF5/zarr may be slow for scan-major layouts.
+    Lazy read strategies (``lazy_read_mode``):
+      ``'per_pixel'`` — original baseline: per-detector-pixel loop, each call
+          reads ``handle[:,:,ky,kx]``. For contiguous C-order HDF5 storage
+          (Ry,Rx,Ky,Kx) this produces a highly strided read (stride = Ky*Kx*4 B
+          between consecutive Rx elements), which is slow on spinning disks.
+          Optimal only when chunks are detector-major ``(Ry,Rx,1,1)``.
+
+      ``'scan_row'`` — sequential scan-row gather: loop over Ry scan rows reading
+          ``handle[iy,:,:,:]`` — a contiguous (Rx,Ky,Kx) block per row — then
+          extract the requested BF pixels. Best for contiguous or scan-major
+          ``(1,1,Ky,Kx)`` storage where per-pixel reads are catastrophically
+          slow; reads the full dataset volume but sequentially.
+
+      ``'slab'`` — ky bounding-box hyperslab: reads
+          ``handle[:,:,ky_min:ky_max,:]`` in one HDF5 hyperslab call, covering
+          the smallest ky-range that contains all BF pixels, then extracts with
+          numpy fancy indexing. Reads less than scan_row for small BF disks but
+          more than per_pixel; access is strided at the (ry,rx) level but
+          contiguous within each (ky,kx) tile.
+
+      ``'auto'`` — inspect ``_handle.chunks`` (HDF5) or chunk sizes (zarr) and
+          pick per_pixel for detector-major chunking, scan_row for contiguous
+          or scan-major storage.
 
     Normalization invariant:
       In-memory (is_lazy=False): _array is already divided by _norm_factor.
@@ -27,6 +45,8 @@ class Dataset4D:
       Lazy (is_lazy=True): disk data is untouched. Getters divide on the fly.
       _norm_factor=None means no normalization was requested.
     """
+
+    LAZY_READ_MODES = ('auto', 'per_pixel', 'scan_row', 'slab')
 
     # --- Array-backed constructor ---
     def __init__(self, array: np.ndarray | torch.Tensor, *, normalize: bool = False) -> None:
@@ -49,6 +69,7 @@ class Dataset4D:
         self._handle = None
         self._h5_file = None
         self._norm_factor: float | None = None
+        self._lazy_read_mode: str = 'per_pixel'
         if normalize:
             self._apply_normalization()
 
@@ -63,7 +84,15 @@ class Dataset4D:
 
     # --- Lazy constructors ---
     @classmethod
-    def from_hdf5(cls, path, key: str = 'data', *, materialize: bool = False, normalize: bool = False) -> Dataset4D:
+    def from_hdf5(
+        cls,
+        path,
+        key: str = 'data',
+        *,
+        materialize: bool = False,
+        normalize: bool = False,
+        lazy_read_mode: str = 'auto',
+    ) -> Dataset4D:
         """
         Args:
             path: Path to HDF5 file.
@@ -72,7 +101,15 @@ class Dataset4D:
             normalize: If True, divide all data by the maximum of the mean diffraction
                 pattern (PACBED). For a full dataset, PACBED max ≈ 1 after normalization.
                 Disk data is never modified. The factor is accessible via norm_factor.
+            lazy_read_mode: Strategy for lazy get_bf_chunk reads. One of
+                ``'auto'`` (default), ``'per_pixel'``, ``'scan_row'``, ``'slab'``.
+                See class docstring for trade-offs. ``'auto'`` inspects the
+                HDF5 chunk layout to pick the best strategy.
         """
+        if lazy_read_mode not in cls.LAZY_READ_MODES:
+            raise ValueError(
+                f"lazy_read_mode must be one of {cls.LAZY_READ_MODES}, got {lazy_read_mode!r}"
+            )
         try:
             import h5py
         except ImportError:
@@ -84,6 +121,9 @@ class Dataset4D:
         obj._norm_factor = None  # must be set before _force_materialize()
         if obj._handle.ndim != 4:
             raise ValueError(f"HDF5 dataset '{key}' must be 4D, got shape {obj._handle.shape}")
+        obj._lazy_read_mode = (
+            obj._detect_lazy_read_mode() if lazy_read_mode == 'auto' else lazy_read_mode
+        )
         if materialize:
             obj._force_materialize()
         if normalize:
@@ -95,7 +135,15 @@ class Dataset4D:
         return obj
 
     @classmethod
-    def from_zarr(cls, path, key: str = 'data', *, materialize: bool = False, normalize: bool = False) -> Dataset4D:
+    def from_zarr(
+        cls,
+        path,
+        key: str = 'data',
+        *,
+        materialize: bool = False,
+        normalize: bool = False,
+        lazy_read_mode: str = 'auto',
+    ) -> Dataset4D:
         """
         Args:
             path: Path to zarr store.
@@ -104,7 +152,14 @@ class Dataset4D:
             normalize: If True, divide all data by the maximum of the mean diffraction
                 pattern (PACBED). For a full dataset, PACBED max ≈ 1 after normalization.
                 Disk data is never modified. The factor is accessible via norm_factor.
+            lazy_read_mode: Strategy for lazy get_bf_chunk reads. One of
+                ``'auto'`` (default), ``'per_pixel'``, ``'scan_row'``, ``'slab'``.
+                See class docstring for trade-offs.
         """
+        if lazy_read_mode not in cls.LAZY_READ_MODES:
+            raise ValueError(
+                f"lazy_read_mode must be one of {cls.LAZY_READ_MODES}, got {lazy_read_mode!r}"
+            )
         try:
             import zarr
         except ImportError:
@@ -117,6 +172,9 @@ class Dataset4D:
             raise ValueError(f"Zarr array '{key}' must be 4D, got shape {obj._handle.shape}")
         obj._h5_file = None
         obj._norm_factor = None  # must be set before _force_materialize()
+        obj._lazy_read_mode = (
+            obj._detect_lazy_read_mode() if lazy_read_mode == 'auto' else lazy_read_mode
+        )
         if materialize:
             obj._force_materialize()
         if normalize:
@@ -165,18 +223,102 @@ class Dataset4D:
         """Return (chunk_size, Ry, Rx) float32 for a batch of detector coords.
 
         In-memory path: numpy fancy indexing — fast, one pass.
-        Lazy path: per-pixel loop — slow, but disk-backed I/O is inherently slow.
+        Lazy path: dispatch to strategy set by lazy_read_mode at construction
+            (``'per_pixel'``, ``'scan_row'``, or ``'slab'``).
         """
         if self.is_lazy:
-            raw = np.stack(
-                [np.asarray(self._handle[:, :, int(i), int(j)], dtype=np.float32)
-                 for i, j in zip(iy, ix)], axis=0
-            )
-            if self._norm_factor is not None:
-                raw = raw / np.float32(self._norm_factor)
-            return raw
+            if self._lazy_read_mode == 'scan_row':
+                return self._get_bf_chunk_scan_row(iy, ix)
+            if self._lazy_read_mode == 'slab':
+                return self._get_bf_chunk_slab(iy, ix)
+            return self._get_bf_chunk_per_pixel(iy, ix)
         raw = self._array[:, :, iy, ix]            # (Ry, Rx, chunk_size) view
         return np.ascontiguousarray(raw.transpose(2, 0, 1), dtype=np.float32)
+
+    # --- Lazy read strategy implementations ---
+
+    def _get_bf_chunk_per_pixel(self, iy: np.ndarray, ix: np.ndarray) -> np.ndarray:
+        """Original strategy: one handle[:,:,ky,kx] read per BF pixel.
+
+        Access pattern for C-order contiguous storage: stride = Ky*Kx*4 bytes
+        between consecutive Rx elements — highly non-sequential.
+        Best for detector-major HDF5 chunking (Ry,Rx,1,1) where each pixel is
+        one decompression unit.
+        """
+        raw = np.stack(
+            [np.asarray(self._handle[:, :, int(i), int(j)], dtype=np.float32)
+             for i, j in zip(iy, ix)], axis=0
+        )
+        if self._norm_factor is not None:
+            raw = raw / np.float32(self._norm_factor)
+        return raw
+
+    def _get_bf_chunk_scan_row(self, iy: np.ndarray, ix: np.ndarray) -> np.ndarray:
+        """Scan-row gather: read one full (Rx,Ky,Kx) row at a time.
+
+        Reads Ry sequential blocks of Rx*Ky*Kx*4 bytes each (= full dataset).
+        Access is sequential → better for contiguous or scan-major storage.
+        Trades extra I/O volume for sequential access patterns.
+        """
+        Ry, Rx = self.scan_shape
+        chunk_size = len(iy)
+        out = np.empty((chunk_size, Ry, Rx), dtype=np.float32)
+        for scan_y in range(Ry):
+            # (Rx, Ky, Kx) — one contiguous block per scan row
+            row = np.asarray(self._handle[scan_y, :, :, :], dtype=np.float32)
+            # row[:, iy, ix] → (Rx, chunk_size) via element-wise fancy index
+            out[:, scan_y, :] = row[:, iy, ix].T
+        if self._norm_factor is not None:
+            out /= np.float32(self._norm_factor)
+        return out
+
+    def _get_bf_chunk_slab(self, iy: np.ndarray, ix: np.ndarray) -> np.ndarray:
+        """Ky bounding-box hyperslab: read handle[:,:,ky_min:ky_max,:] once.
+
+        Reads a slab bounded by the ky-extent of the requested pixels across
+        all scan positions and all kx.  For a BF disk that spans only a fraction
+        of the detector height, this reads less data than scan_row while using a
+        single HDF5 hyperslab call instead of Ry separate calls.
+        """
+        ky_min = int(iy.min())
+        ky_max = int(iy.max()) + 1
+        # (Ry, Rx, slab_Ky, Kx) — one hyperslab read
+        slab = np.asarray(
+            self._handle[:, :, ky_min:ky_max, :], dtype=np.float32
+        )
+        iy_local = iy - ky_min
+        # slab[:, :, iy_local, ix] → (Ry, Rx, chunk_size) via fancy indexing
+        raw = slab[:, :, iy_local, ix]
+        out = np.ascontiguousarray(raw.transpose(2, 0, 1))
+        if self._norm_factor is not None:
+            out = out / np.float32(self._norm_factor)
+        return out
+
+    def _detect_lazy_read_mode(self) -> str:
+        """Inspect handle chunk layout and return the best lazy_read_mode.
+
+        Rules:
+          - h5py chunks=None (contiguous): 'scan_row' — sequential 8 MB reads
+            beat the highly-strided per-pixel pattern.
+          - Detector-major chunks (c2==1 and c3==1): 'per_pixel' — each
+            (ky,kx) pixel is its own decompression unit.
+          - Scan-major chunks (c0==1 and c1==1): 'scan_row' — each diffraction
+            pattern is one chunk; reading by scan row amortises decompression.
+          - Mixed/unknown chunking: 'per_pixel' (safe conservative default).
+        """
+        handle = self._handle
+        # h5py.Dataset exposes chunks as None (contiguous) or a tuple.
+        # zarr.Array exposes chunks as a tuple (always chunked).
+        chunks = getattr(handle, 'chunks', None)
+        if chunks is None:
+            # h5py contiguous — no chunking at all
+            return 'scan_row'
+        c0, c1, c2, c3 = chunks
+        if c2 == 1 and c3 == 1:
+            return 'per_pixel'   # detector-major: one chunk per (ky,kx) image
+        if c0 == 1 and c1 == 1:
+            return 'scan_row'    # scan-major: one chunk per diffraction pattern
+        return 'per_pixel'
 
     def get_full_array(self) -> np.ndarray:
         """Return full (Ry, Rx, Ky, Kx) float32 numpy array. In-memory backends only."""

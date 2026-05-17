@@ -125,6 +125,53 @@ def test_normalize_crop_roi_unnormalized_inmemory():
 
 # ── lazy HDF5 tests ───────────────────────────────────────────────────────────
 
+class TestLazyReadModeHDF5:
+    """Parity tests: scan_row and slab strategies must match per_pixel output."""
+
+    @pytest.fixture(autouse=True)
+    def _h5file(self, tmp_path):
+        h5py = pytest.importorskip("h5py")
+        rng = np.random.default_rng(7)
+        self.arr = rng.uniform(0.1, 1.0, (8, 8, 16, 16)).astype(np.float32)
+        self.path = tmp_path / "parity.h5"
+        with h5py.File(self.path, 'w') as f:
+            f.create_dataset('data', data=self.arr)
+        ky = np.array([0, 1, 2, 3, 3, 4])
+        kx = np.array([0, 1, 3, 0, 5, 5])
+        self.iy, self.ix = ky, kx
+
+    @pytest.mark.parametrize("mode", ["scan_row", "slab"])
+    def test_parity_unnormalized(self, mode):
+        ref = Dataset4D.from_hdf5(self.path, lazy_read_mode='per_pixel')
+        ds = Dataset4D.from_hdf5(self.path, lazy_read_mode=mode)
+        np.testing.assert_allclose(
+            ds.get_bf_chunk(self.iy, self.ix),
+            ref.get_bf_chunk(self.iy, self.ix),
+            atol=1e-6,
+            err_msg=f"lazy_read_mode={mode!r} disagrees with per_pixel (unnormalized)",
+        )
+
+    @pytest.mark.parametrize("mode", ["scan_row", "slab"])
+    def test_parity_normalized(self, mode):
+        ref = Dataset4D.from_hdf5(self.path, normalize=True, lazy_read_mode='per_pixel')
+        ds = Dataset4D.from_hdf5(self.path, normalize=True, lazy_read_mode=mode)
+        np.testing.assert_allclose(
+            ds.get_bf_chunk(self.iy, self.ix),
+            ref.get_bf_chunk(self.iy, self.ix),
+            atol=1e-5,
+            err_msg=f"lazy_read_mode={mode!r} disagrees with per_pixel (normalized)",
+        )
+
+    def test_auto_detects_scan_row_for_contiguous(self):
+        ds = Dataset4D.from_hdf5(self.path, lazy_read_mode='auto')
+        # contiguous HDF5 → auto should pick scan_row
+        assert ds._lazy_read_mode == 'scan_row'
+
+    def test_invalid_lazy_read_mode_raises(self):
+        with pytest.raises(ValueError, match="lazy_read_mode"):
+            Dataset4D.from_hdf5(self.path, lazy_read_mode='bad_mode')
+
+
 class TestNormalizeLazyHDF5:
     @pytest.fixture(autouse=True)
     def _h5file(self, tmp_path):
