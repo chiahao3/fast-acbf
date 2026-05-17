@@ -61,10 +61,7 @@ class ImageFFTProvider:
         if mode == 'auto':
             return self._resolve_auto()
         if mode == 'device' and self.dataset.is_lazy:
-            raise ValueError(
-                "cache_mode='device' requires an in-memory Dataset4D. "
-                "Disk-backed datasets must use cache_mode='host' or 'on_the_fly'."
-            )
+            self.dataset._force_materialize()
         return mode
 
     def _resolve_auto(self) -> str:

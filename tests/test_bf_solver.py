@@ -1111,27 +1111,117 @@ class TestImageFFTCacheMode:
         solver.get_tcBF(chunk_size=8)
         assert id(provider._device_cache) == cache_id, "_device_cache must not be reallocated during reconstruction"
 
-    # -- guards ------------------------------------------------------------
+    # -- guards / materialize ----------------------------------------------
 
-    def test_device_mode_lazy_dataset_raises(self, synth_params):
+    def _make_det_geom(self, synth_params, device='cpu'):
         from fast_acbf.data.geometry import DetectorGeometry
-        from fast_acbf.data.imagefft_provider import ImageFFTProvider
-
-        class _FakeLazyDataset:
-            is_lazy = True
-            scan_shape = (8, 8)
-            detector_shape = (32, 32)
-
         p = synth_params
-        det_geom = DetectorGeometry.from_params(
+        return DetectorGeometry.from_params(
             detector_shape=(p["Npix"], p["Npix"]),
             max_alpha=p["max_alpha"],
             dk=p["dk"],
             wavelength=p["wavelength"],
-            device='cpu',
+            device=device,
         )
-        with pytest.raises(ValueError, match="device"):
-            ImageFFTProvider(_FakeLazyDataset(), det_geom, 'cpu', cache_mode='device')
+
+    def _make_fake_lazy(self, arr: np.ndarray):
+        """Convert an in-memory Dataset4D to a fake-lazy one for testing."""
+        from fast_acbf.data.dataset4d import Dataset4D
+        ds = Dataset4D(arr.copy())
+        ds._handle = ds._array
+        ds._array = None
+        return ds
+
+    def test_force_materialize_converts_lazy_to_host_ram(self):
+        original = np.random.rand(4, 4, 8, 8).astype(np.float32)
+        ds = self._make_fake_lazy(original)
+        assert ds.is_lazy
+
+        result = ds._force_materialize()
+
+        assert not ds.is_lazy
+        assert isinstance(result, np.ndarray)        # host RAM, not GPU tensor
+        assert result.dtype == np.float32
+        assert result.data.contiguous
+        assert ds._handle is None
+        np.testing.assert_array_equal(result, original)
+
+    def test_force_materialize_noop_if_already_in_memory(self):
+        from fast_acbf.data.dataset4d import Dataset4D
+        arr = np.zeros((4, 4, 8, 8), dtype=np.float32)
+        ds = Dataset4D(arr)
+        result = ds._force_materialize()
+        assert not ds.is_lazy
+        assert result is ds._array
+
+    def test_device_mode_lazy_dataset_materializes_and_caches(self, synth_dataset, synth_params, device):
+        from fast_acbf.data.imagefft_provider import ImageFFTProvider
+        ds = self._make_fake_lazy(synth_dataset)
+        assert ds.is_lazy
+
+        provider = ImageFFTProvider(ds, self._make_det_geom(synth_params, device), device, cache_mode='device')
+
+        assert not ds.is_lazy
+        assert isinstance(ds._array, np.ndarray)        # raw data stays in host RAM
+        assert provider._device_cache is not None        # FFT cache on device
+        assert provider.cache_mode == 'device'
+
+    def test_device_mode_lazy_oom_raises_informative_error(self, synth_params, monkeypatch):
+        from fast_acbf.data.imagefft_provider import ImageFFTProvider
+        import fast_acbf.data.dataset4d as ds_mod
+
+        ds = self._make_fake_lazy(np.zeros((4, 4, 8, 8), dtype=np.float32))
+
+        def _oom(*_, **__):
+            raise MemoryError
+        monkeypatch.setattr(ds_mod.np, 'asarray', _oom)
+
+        with pytest.raises(RuntimeError, match="GB") as exc_info:
+            ImageFFTProvider(ds, self._make_det_geom(synth_params), 'cpu', cache_mode='device')
+        msg = str(exc_info.value)
+        assert "host" in msg or "on_the_fly" in msg
+
+    def test_from_hdf5_materialize_true_loads_to_host_ram(self, tmp_path):
+        h5py = pytest.importorskip("h5py")
+        from fast_acbf.data.dataset4d import Dataset4D
+        data = np.random.rand(4, 4, 8, 8).astype(np.float32)
+        p = tmp_path / "test.h5"
+        with h5py.File(p, 'w') as f:
+            f.create_dataset('data', data=data)
+
+        ds = Dataset4D.from_hdf5(p, materialize=True)
+
+        assert not ds.is_lazy
+        assert isinstance(ds._array, np.ndarray)        # host RAM, not GPU tensor
+        assert ds._array.dtype == np.float32
+        assert ds._array.data.contiguous
+        np.testing.assert_array_equal(ds._array, data)
+
+    def test_from_hdf5_materialize_downstream_cache_modes(self, tmp_path, synth_params, device):
+        """After materialize=True, all three cache_modes must work correctly.
+
+        cache_mode governs FFT caching, not where the 4D dataset lives.
+        The raw dataset is always in host RAM; only FFT slices move to device.
+        """
+        h5py = pytest.importorskip("h5py")
+        from fast_acbf.data.dataset4d import Dataset4D
+        from fast_acbf.data.imagefft_provider import ImageFFTProvider
+        p = synth_params
+        arr = np.random.rand(p["Ny"], p["Nx"], p["Npix"], p["Npix"]).astype(np.float32)
+        hf = tmp_path / "test.h5"
+        with h5py.File(hf, 'w') as f:
+            f.create_dataset('data', data=arr)
+        det_geom = self._make_det_geom(synth_params, device)
+
+        for mode in ('on_the_fly', 'host', 'device'):
+            ds = Dataset4D.from_hdf5(hf, materialize=True)
+            assert not ds.is_lazy                       # pre-condition: in host RAM
+            provider = ImageFFTProvider(ds, det_geom, device, cache_mode=mode)
+            assert provider.cache_mode == mode
+            # Raw 4D data is still in host RAM regardless of cache_mode
+            assert isinstance(ds._array, np.ndarray)
+            # Smoke-test: chunk fetch must not raise
+            provider.get_chunk(0, min(4, provider.nb))
 
     def test_cache_mode_property_reports_resolved_string(self, synth_dataset, synth_params, device):
         for mode in ('on_the_fly', 'host', 'device'):

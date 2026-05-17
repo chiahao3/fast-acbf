@@ -42,7 +42,7 @@ class Dataset4D:
 
     # --- Lazy constructors ---
     @classmethod
-    def from_hdf5(cls, path, key: str = 'data') -> Dataset4D:
+    def from_hdf5(cls, path, key: str = 'data', *, materialize: bool = False) -> Dataset4D:
         try:
             import h5py
         except ImportError:
@@ -53,10 +53,12 @@ class Dataset4D:
         obj._handle = obj._h5_file[key]
         if obj._handle.ndim != 4:
             raise ValueError(f"HDF5 dataset '{key}' must be 4D, got shape {obj._handle.shape}")
+        if materialize:
+            obj._force_materialize()
         return obj
 
     @classmethod
-    def from_zarr(cls, path, key: str = 'data') -> Dataset4D:
+    def from_zarr(cls, path, key: str = 'data', *, materialize: bool = False) -> Dataset4D:
         try:
             import zarr
         except ImportError:
@@ -68,6 +70,8 @@ class Dataset4D:
         if obj._handle.ndim != 4:
             raise ValueError(f"Zarr array '{key}' must be 4D, got shape {obj._handle.shape}")
         obj._h5_file = None
+        if materialize:
+            obj._force_materialize()
         return obj
 
     def close(self) -> None:
@@ -122,6 +126,33 @@ class Dataset4D:
                 "get_full_array() is not supported for disk-backed Dataset4D. "
                 "Use cache_mode='host' or 'on_the_fly', or load data into RAM first."
             )
+        return self._array
+
+    def _force_materialize(self) -> np.ndarray:
+        """Load a lazy (disk-backed) dataset fully into host RAM and convert to in-memory.
+
+        On success: self._array is populated as a contiguous float32 ndarray in host RAM,
+        self._handle is cleared, and is_lazy becomes False.
+        On MemoryError: raises RuntimeError with dataset size and cache_mode suggestions.
+        """
+        if not self.is_lazy:
+            return self._array
+        shape = self._handle.shape  # (Ry, Rx, Ky, Kx)
+        size_gb = (shape[0] * shape[1] * shape[2] * shape[3] * 4) / (1024 ** 3)
+        try:
+            arr = np.asarray(self._handle[:], dtype=np.float32)
+        except MemoryError:
+            raise RuntimeError(
+                f"Cannot materialize disk-backed Dataset4D into RAM: "
+                f"dataset shape {shape} requires {size_gb:.2f} GB as float32. "
+                f"Use cache_mode='host' to cache FFTs incrementally in RAM, "
+                f"or cache_mode='on_the_fly' to avoid caching entirely."
+            )
+        self._array = np.ascontiguousarray(arr)
+        if self._h5_file is not None:
+            self._h5_file.close()
+            self._h5_file = None
+        self._handle = None
         return self._array
 
     def crop_scan_roi(self, y0: int, y1: int, x0: int, x1: int) -> Dataset4D:
