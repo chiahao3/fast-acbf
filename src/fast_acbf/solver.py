@@ -105,6 +105,7 @@ class BFSolver:
         basis_mode: str = 'on_the_fly',
         eps: float = 1e-3,
         normalize: bool = False,
+        lazy_read_mode: str = 'auto',
     ) -> None:
         if aberrations is None:
             aberrations = {}
@@ -123,9 +124,9 @@ class BFSolver:
             path = Path(dataset)
             suffix = path.suffix.lower()
             if suffix in ('.h5', '.hdf5'):
-                ds = Dataset4D.from_hdf5(path, normalize=normalize)
+                ds = Dataset4D.from_hdf5(path, normalize=normalize, lazy_read_mode=lazy_read_mode)
             else:
-                ds = Dataset4D.from_zarr(path, normalize=normalize)
+                ds = Dataset4D.from_zarr(path, normalize=normalize, lazy_read_mode=lazy_read_mode)
         else:
             ds = Dataset4D(dataset, normalize=normalize)
 
