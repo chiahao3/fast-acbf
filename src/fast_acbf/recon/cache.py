@@ -66,7 +66,7 @@ def build_acbf_geometry_cache(
     """Chunk detector k-coords and bundle physics params needed to derive optics later.
 
     Always built (mode-independent). Optics are materialized separately via
-    build_acbf_optics_cache when cache_mode='full'.
+    build_acbf_optics_cache when basis_mode='precompute'.
     """
     Nb = kX_full.shape[0]
     kX_full = kX_full.view(Nb, 1, 1)
