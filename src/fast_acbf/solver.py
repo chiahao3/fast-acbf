@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import logging
+import os
+from pathlib import Path
 
 import numpy as np
 import torch
@@ -14,9 +16,9 @@ from ptyrad.utils.image_proc import mfft2
 
 from fast_acbf.core.aberrations import AberrationState
 from fast_acbf.core.functional import generate_aberration_basis, generate_shift_basis, make_probe_from_chi
+from fast_acbf.data.dataset4d import Dataset4D
 from fast_acbf.data.geometry import CoordinateTransform, DetectorGeometry, ScanGeometry
-from fast_acbf.data.prepared import PreparedBFDataset
-from fast_acbf.data.source import ArrayDatasetSource
+from fast_acbf.data.imagefft_provider import ImageFFTProvider
 from fast_acbf.recon.reconstructor import BFReconstructor
 
 logger = logging.getLogger(__name__)
@@ -75,7 +77,6 @@ def _build_c10_axis(
             return torch.tensor([start], dtype=torch.float32, device=device)
 
         direction = 1.0 if delta > 0 else -1.0
-        # Add epsilon before floor to absorb fp roundoff when range divides evenly.
         steps = int(np.floor(abs(delta) / slice_thickness + 1e-9))
         offsets = torch.arange(steps + 1, device=device, dtype=torch.float32)
         return start + direction * slice_thickness * offsets
@@ -86,25 +87,11 @@ def _build_c10_axis(
 
 
 class BFSolver:
-    """Offline/notebook facade for tcBF and acBF reconstruction.
+    """Offline/notebook facade for tcBF and acBF reconstruction."""
 
-    Primary constructor: BFSolver.from_array(...)
-    """
-
-    def __init__(self, recon: BFReconstructor, source: ArrayDatasetSource) -> None:
-        self._recon = recon
-        self._source = source
-        self.reconstructed_image: torch.Tensor | None = None
-        self.last_c10_stack_axis: torch.Tensor | None = None
-
-    # ------------------------------------------------------------------
-    # Primary constructor
-    # ------------------------------------------------------------------
-
-    @classmethod
-    def from_array(
-        cls,
-        dataset: np.ndarray,
+    def __init__(
+        self,
+        dataset: np.ndarray | torch.Tensor | os.PathLike | Dataset4D,
         max_alpha: float,
         scan_step_size: float,
         dk: float,
@@ -113,13 +100,25 @@ class BFSolver:
         aberrations: dict | None = None,
         device: str = 'cuda',
         coord_transform: dict | None = None,
-        cache_mode: str = 'lazy',
+        cache_mode: str = 'auto',
+        basis_mode: str = 'on_the_fly',
         eps: float = 1e-3,
-    ) -> BFSolver:
+    ) -> None:
         if aberrations is None:
             aberrations = {}
 
-        source = ArrayDatasetSource(dataset)
+        # Dispatch → Dataset4D
+        if isinstance(dataset, Dataset4D):
+            ds = dataset
+        elif isinstance(dataset, (str, os.PathLike)):
+            path = Path(dataset)
+            suffix = path.suffix.lower()
+            if suffix in ('.h5', '.hdf5'):
+                ds = Dataset4D.from_hdf5(path)
+            else:
+                ds = Dataset4D.from_zarr(path)
+        else:
+            ds = Dataset4D(dataset)
 
         parsed_aberrations = Aberrations(aberrations).export(
             notation='krivanek', style='cartesian', layout='nested'
@@ -138,8 +137,8 @@ class BFSolver:
 
         ct = CoordinateTransform.from_dict(coord_transform)
 
-        Ry, Rx = source.scan_shape
-        Ky, Kx = source.detector_shape
+        Ry, Rx = ds.scan_shape
+        Ky, Kx = ds.detector_shape
         det_geom = DetectorGeometry.from_params(
             detector_shape=(Ky, Kx),
             max_alpha=max_alpha,
@@ -152,21 +151,28 @@ class BFSolver:
             scan_step_size=scan_step_size,
             device=device,
         )
-        prepared = PreparedBFDataset.build(source, det_geom, device)
+
+        provider = ImageFFTProvider(ds, det_geom, device, cache_mode)
+
+        Nb = provider.nb
+        print(
+            f"Extracted {Nb} vBF images within max_alpha = {max_alpha} mrad."
+        )
 
         recon = BFReconstructor(
-            prepared=prepared,
+            provider=provider,
             scan_geom=scan_geom,
             ab_state=ab_state,
             coord_transform=ct,
-            cache_mode=cache_mode,
+            basis_mode=basis_mode,
             eps=eps,
         )
 
-        solver = cls(recon=recon, source=source)
-        # Store tolerance_factors for refinement access.
-        solver.tolerance_factors = tolerance_factors
-        return solver
+        self._dataset = ds
+        self._recon = recon
+        self.reconstructed_image: torch.Tensor | None = None
+        self.last_c10_stack_axis: torch.Tensor | None = None
+        self.tolerance_factors = tolerance_factors
 
     # ------------------------------------------------------------------
     # Delegated properties — expose only what refinement/users actually need
@@ -178,27 +184,34 @@ class BFSolver:
 
     @property
     def vbf_images(self) -> torch.Tensor:
-        return self._recon.prepared.vbf_images
+        """Return (Nb, Ry, Rx) float32 BF image stack.
+
+        For device/host cache modes, vBF is not stored persistently — this
+        reconstructs it from the raw dataset each call. For lazy backends
+        (on_the_fly), this triggers Nb disk reads.
+        """
+        p = self._recon.provider
+        return torch.from_numpy(p.dataset.get_bf_chunk(p._bf_iy, p._bf_ix))
 
     @property
     def bf_mask(self) -> torch.Tensor:
-        return self._recon.prepared.detector_geom.bf_mask
+        return self._recon.provider.detector_geom.bf_mask
 
     @property
     def kY_centers(self) -> torch.Tensor:
-        return self._recon.prepared.detector_geom.kY_centers
+        return self._recon.provider.detector_geom.kY_centers
 
     @property
     def kX_centers(self) -> torch.Tensor:
-        return self._recon.prepared.detector_geom.kX_centers
+        return self._recon.provider.detector_geom.kX_centers
 
     @property
     def kY_grid(self) -> torch.Tensor:
-        return self._recon.prepared.detector_geom.kY_grid
+        return self._recon.provider.detector_geom.kY_grid
 
     @property
     def kX_grid(self) -> torch.Tensor:
-        return self._recon.prepared.detector_geom.kX_grid
+        return self._recon.provider.detector_geom.kX_grid
 
     @property
     def device(self) -> str:
@@ -206,15 +219,15 @@ class BFSolver:
 
     @property
     def max_alpha(self) -> float:
-        return self._recon.prepared.detector_geom.max_alpha
+        return self._recon.provider.detector_geom.max_alpha
 
     @property
     def dk(self) -> float:
-        return self._recon.prepared.detector_geom.dk
+        return self._recon.provider.detector_geom.dk
 
     @property
     def wavelength(self) -> float:
-        return self._recon.prepared.detector_geom.wavelength
+        return self._recon.provider.detector_geom.wavelength
 
     @property
     def scan_step_size(self) -> float:
@@ -238,11 +251,15 @@ class BFSolver:
 
     @property
     def cache_mode(self) -> str:
-        return self._recon.cache_mode
+        return self._recon.provider.cache_mode
 
-    @cache_mode.setter
-    def cache_mode(self, value: str) -> None:
-        self._recon.cache_mode = value
+    @property
+    def basis_mode(self) -> str:
+        return self._recon.basis_mode
+
+    @basis_mode.setter
+    def basis_mode(self, value: str) -> None:
+        self._recon.basis_mode = value
 
     @property
     def coord_transform(self) -> dict:
@@ -308,7 +325,6 @@ class BFSolver:
     def _get_transformed_k_grids(self, in_scan_frame: bool = True) -> tuple[torch.Tensor, torch.Tensor]:
         return self._recon._get_transformed_grids(in_scan_frame=in_scan_frame)
 
-    # Internal: apply a raw dict to coord_transform + clear basis (used by refinement).
     def _apply_coord_transform_dict(self, d: dict) -> None:
         ct = CoordinateTransform.from_dict(d)
         self._recon.set_coord_transform(ct, clear_basis=True)
@@ -435,15 +451,14 @@ class BFSolver:
         return self.get_reconstructed_image(mode='acBF', frame=frame, **kwargs)
 
     def get_acBF_diagnostics(self, **kwargs) -> dict:
-        from fast_acbf.recon.cache import build_acbf_optics_cache
         rolloff = kwargs.get('rolloff', 0)
         chunk_size = kwargs.get('chunk_size', 64)
         with torch.no_grad():
             geometry, optics = self._recon._get_acbf_cache(rolloff=rolloff, chunk_size=chunk_size)
-            image_fft = self._recon._get_image_fft()
             from fast_acbf.core.acbf import reconstruct_acbf_complex_inversion
             return reconstruct_acbf_complex_inversion(
-                image_fft, self._recon.scan_geom.qx_grid, self._recon.scan_geom.qy_grid,
+                self._recon.provider,
+                self._recon.scan_geom.qx_grid, self._recon.scan_geom.qy_grid,
                 geometry, optics,
                 self._get_scan_frame_coeffs(),
                 self.device,

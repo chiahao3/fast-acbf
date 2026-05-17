@@ -63,7 +63,7 @@ def main():
     dataset = np.array(z[0]).reshape(64, 64, NPIX, NPIX)
     print(f"Loaded dataset: shape={dataset.shape}, dtype={dataset.dtype}")
 
-    solver = BFSolver.from_array(
+    solver = BFSolver(
         dataset=dataset,
         max_alpha=MAX_ALPHA,
         scan_step_size=SCAN_STEP,

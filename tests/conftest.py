@@ -86,7 +86,7 @@ def synth_dataset():
 def solver_zero_ab(synth_dataset, synth_params, device):
     from fast_acbf import BFSolver
     p = synth_params
-    return BFSolver.from_array(
+    return BFSolver(
         dataset=synth_dataset,
         max_alpha=p["max_alpha"],
         scan_step_size=p["scan_step_size"],
@@ -102,7 +102,7 @@ def solver_zero_ab(synth_dataset, synth_params, device):
 def solver_nonzero_ab(synth_dataset, synth_params, device):
     from fast_acbf import BFSolver
     p = synth_params
-    return BFSolver.from_array(
+    return BFSolver(
         dataset=synth_dataset,
         max_alpha=p["max_alpha"],
         scan_step_size=p["scan_step_size"],

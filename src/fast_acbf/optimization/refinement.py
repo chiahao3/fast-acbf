@@ -55,11 +55,10 @@ def _build_roi_solver(solver, scan_roi):
     """Create a temporary solver on a scan-space crop with matching physics state."""
     from fast_acbf.solver import BFSolver
 
-    y0, y1, x0, x1 = _validate_scan_roi(scan_roi, solver._source.scan_shape)
-    roi_source = solver._source.crop_scan_roi(y0, y1, x0, x1)
-    dataset_roi = roi_source.get_array()
-    return BFSolver.from_array(
-        dataset=dataset_roi,
+    y0, y1, x0, x1 = _validate_scan_roi(scan_roi, solver._dataset.scan_shape)
+    roi_dataset = solver._dataset.crop_scan_roi(y0, y1, x0, x1)
+    return BFSolver(
+        dataset=roi_dataset,
         max_alpha=solver.max_alpha,
         scan_step_size=solver.scan_step_size,
         dk=solver.dk,
@@ -70,6 +69,7 @@ def _build_roi_solver(solver, scan_roi):
         coord_transform=solver.coord_transform,  # returns a dict
         eps=solver.eps,
         cache_mode=solver.cache_mode,
+        basis_mode=solver.basis_mode,
     )
 
 
