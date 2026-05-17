@@ -1,0 +1,59 @@
+Benchmark: scripts/benchmark_lazy_loading.py --runs 2
+Date: 2026-05-17
+File: ~/scratch/Figure 4/scan_x128_y128.hdf5
+Key: array
+Shape: (128, 128, 128, 128)  1.07 GB
+Chunks: None  compression: None
+max_alpha: 25.0 mrad   wavelength: 0.04176 Å
+dk: 0.01849 Å⁻¹/pixel
+N_bf: 3297 / 16384 detector pixels (20.1%)
+Output: (3297, 128, 128) float32 = 216 MB
+OS page cache: warm (second run reflects cache-warm performance)
+
+============================================================
+Scenario 1 — full_pass (single get_bf_chunk call, all N_bf pixels)
+  Note: per_pixel* is extrapolated from 50-pixel sample × 65.9
+============================================================
+  strategy       best (s)   mean (s)   data_read              speedup   notes
+  ----------     --------   --------   --------------------   -------   -----
+  per_pixel*      352.11     352.66     216 MB  (strided)       ×1.0    ~3297 h5py calls, ~107 ms/call scatter-gather
+  scan_row          0.274      0.276   1074 MB  (sequential)  ×1283     128 h5py calls, contiguous 8 MB reads
+  slab              0.633      0.634    545 MB  (1 hyperslab)   ×557     1 h5py call, ky-bbox slab (65×128 det)
+  host (mat+idx)    1.075      1.085   1074 MB  (sequential)   ×328     0.393s materialize + 0.682s numpy fancy-index
+
+============================================================
+Scenario 2 — chunked (chunk_size=64, 52 calls per full pass)
+  Note: scan_row omitted — reads full 1 GB per call → 52 GB total I/O
+============================================================
+  strategy       best (s)   mean (s)   speedup vs per_pixel
+  ----------     --------   --------   --------------------
+  per_pixel       358.36     360.53     ×1.0   (same scatter-gather bottleneck)
+  slab              6.05       6.10    ×59     (~19 MB/call, ky_range≈2.2 rows per chunk)
+
+============================================================
+Root cause analysis
+============================================================
+Bottleneck is h5py per-call overhead (~107 ms/call) for strided hyperslab reads
+on contiguous C-order HDF5, NOT disk I/O.  The file is fully in the OS page
+cache yet per_pixel still takes ~352s because each handle[:,:,ky,kx] triggers
+HDF5 scatter-gather over 16384 elements with 64 KB stride.
+
+scan_row reads Ry=128 contiguous 8 MB blocks — h5py sees a sequential read,
+no scatter-gather → 128× fewer h5py calls → ×1283 speedup for the full pass.
+
+slab reads one ky bounding-box hyperslab per chunk.  For sorted BF pixels
+(np.where output), chunks span ky_range≈2.2 rows on average → ~19 MB/call.
+h5py scatter-gather is bounded by ky_range × Kx elements (not N_bf × 1)
+→ ×59 speedup over per_pixel in chunked reconstruction.
+
+============================================================
+Auto-detection
+============================================================
+chunks=None (contiguous HDF5) → auto selects 'slab'
+  Rationale: slab balances full-pass speed (×557 vs per_pixel) with chunked
+  reconstruction speed (×59) without loading the full file per chunk call.
+  scan_row would be ×1283 in full_pass but catastrophic in chunked mode.
+
+Note: the benchmark output above shows "auto-detected mode: scan_row" because
+the benchmark ran against an earlier code version.  Commit c3b5b48 corrected
+auto-detection for contiguous HDF5 (chunks=None) from scan_row → slab.
