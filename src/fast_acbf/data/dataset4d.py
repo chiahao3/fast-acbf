@@ -36,8 +36,9 @@ class Dataset4D:
           contiguous within each (ky,kx) tile.
 
       ``'auto'`` — inspect ``_handle.chunks`` (HDF5) or chunk sizes (zarr) and
-          pick per_pixel for detector-major chunking, scan_row for contiguous
-          or scan-major storage.
+          pick: ``slab`` for contiguous C-order (chunks=None); ``per_pixel``
+          for detector-major (Ry,Rx,1,1); ``scan_row`` for scan-major
+          (1,1,Ky,Kx); ``per_pixel`` otherwise (safe default).
 
     Normalization invariant:
       In-memory (is_lazy=False): _array is already divided by _norm_factor.
