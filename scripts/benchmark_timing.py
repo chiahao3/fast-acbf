@@ -461,7 +461,7 @@ def write_summary_tables(f, rows: list[dict]) -> None:
     f.write("| recon | cache | max_order | Nb~512 | Nb=1024 | Nb~2048 | Nb=4096 |\n")
     f.write("|---|---|---:|---:|---:|---:|---:|\n")
     for recon_mode in ("acbf", "tcbf"):
-        for cache_mode in ("lazy", "full"):
+        for cache_mode in ("on_the_fly", "host", "device"):
             for max_order in (1, 2, 3, 4):
                 vals = []
                 for nb in (512, 1024, 2048, 4096):
@@ -477,7 +477,7 @@ def write_summary_tables(f, rows: list[dict]) -> None:
     f.write("| recon | cache | max_order | Nb~512 | Nb=1024 | Nb~2048 | Nb=4096 |\n")
     f.write("|---|---|---:|---:|---:|---:|---:|\n")
     for recon_mode in ("acbf", "tcbf"):
-        for cache_mode in ("lazy", "full"):
+        for cache_mode in ("on_the_fly", "host", "device"):
             for max_order in (1, 2, 3, 4):
                 vals = []
                 for nb in (512, 1024, 2048, 4096):
@@ -489,11 +489,11 @@ def write_summary_tables(f, rows: list[dict]) -> None:
                 )
 
     f.write("\nRepresentative transfer and initialization timings at scan `256 x 256` ")
-    f.write("from `acbf/lazy/max_order=1` rows:\n\n")
+    f.write("from `acbf/on_the_fly/max_order=1` rows:\n\n")
     f.write("| requested Nb | actual Nb | raw dataset MiB | vBF stack MiB | raw H2D s | vBF H2D s | BFSolver init s |\n")
     f.write("|---:|---:|---:|---:|---:|---:|---:|\n")
     for nb in (512, 1024, 2048, 4096):
-        row = find_row(rows, "acbf", "lazy", 1, 256, nb)
+        row = find_row(rows, "acbf", "on_the_fly", 1, 256, nb)
         if not row:
             continue
         f.write(
@@ -529,7 +529,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--single-json", action="store_true")
     parser.add_argument("--device", default="cuda", choices=("cuda", "cpu"))
     parser.add_argument("--recon-mode", choices=common.DEFAULT_RECON_MODES, default="acbf")
-    parser.add_argument("--cache-mode", choices=common.DEFAULT_CACHE_MODES, default="lazy")
+    parser.add_argument("--cache-mode", choices=common.DEFAULT_CACHE_MODES, default="on_the_fly")
     parser.add_argument("--nb", type=int, default=512)
     parser.add_argument("--ry", type=int, default=64)
     parser.add_argument("--rx", type=int, default=64)

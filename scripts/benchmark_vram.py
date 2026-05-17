@@ -25,7 +25,7 @@ import numpy as np
 DEFAULT_NB = (512, 1024, 2048, 4096)
 DEFAULT_SCAN = (64, 128, 256)
 DEFAULT_MAX_ORDER = (1, 2, 3, 4)
-DEFAULT_CACHE_MODES = ("lazy", "full")
+DEFAULT_CACHE_MODES = ("on_the_fly", "host", "device")
 DEFAULT_RECON_MODES = ("acbf", "tcbf")
 DEFAULT_WAVELENGTH = 0.04176
 DEFAULT_DK = 0.01
@@ -408,19 +408,22 @@ def write_report_summary(f, rows: list[dict]) -> None:
     """Write compact conclusions and sizing equations to the markdown report."""
     f.write("## Summary Report\n\n")
     f.write(
-        "For this implementation, VRAM is driven by the extracted virtual-BF stack "
-        "`vbf_images` as `float32` plus its `complex64` FFT cache. acBF `full` mode "
-        "then stores detector-wide aperture and aberration-basis tensors, while acBF "
-        "`lazy` mode regenerates those tensors per chunk. tcBF uses the same FFT cache "
-        "but only stores small shift-basis vectors, so its peak is much closer to the "
-        "common stack/FFT footprint and is effectively independent of `cache_mode`.\n\n"
+        "For this implementation, VRAM is driven by `cache_mode` (controls ImageFFT storage) "
+        "and `basis_mode` (controls aberration-basis precomputation). `cache_mode='device'` "
+        "stores the full `(Nb, Ry, Rx)` complex64 FFT cache in VRAM. `cache_mode='host'` "
+        "fills a RAM numpy cache lazily per chunk, copying only the active chunk to GPU. "
+        "`cache_mode='on_the_fly'` recomputes FFTs every pass with no persistent cache. "
+        "acBF with `basis_mode='precompute'` additionally stores aperture and basis tensors "
+        "for all Nb pixels; `basis_mode='on_the_fly'` (default) regenerates them per chunk. "
+        "tcBF only needs small shift-basis vectors, so its peak is nearly independent of "
+        "cache settings.\n\n"
     )
 
     f.write("Peak allocated VRAM at scan `256 x 256`:\n\n")
     f.write("| recon | cache | max_order | Nb~512 | Nb=1024 | Nb~2048 | Nb=4096 |\n")
     f.write("|---|---|---:|---:|---:|---:|---:|\n")
     for recon_mode in ("acbf", "tcbf"):
-        for cache_mode in ("lazy", "full"):
+        for cache_mode in ("on_the_fly", "host", "device"):
             for max_order in (1, 2, 3, 4):
                 vals = []
                 for nb in (512, 1024, 2048, 4096):
@@ -455,27 +458,28 @@ def write_report_summary(f, rows: list[dict]) -> None:
         "`C = min(chunk_size, B)`. The benchmark used `chunk_size = 64`. "
         "The relevant dtypes are `float32 = 4 bytes` and `complex64 = 8 bytes`.\n\n"
     )
-    f.write("Common persistent stack/cache footprint:\n\n")
+    f.write("Persistent FFT cache footprint by cache_mode:\n\n")
     f.write("```text\n")
-    f.write("common_bytes ~= 4*B*S       # vBF image stack, float32\n")
-    f.write("              + 8*B*S       # FFT cache, complex64\n")
-    f.write("              = 12*B*S\n")
+    f.write("device   : fft_bytes = 8*B*S       # full (Nb, Ry, Rx) complex64 in VRAM\n")
+    f.write("host     : fft_bytes = 8*C*S       # only active chunk in VRAM; rest in RAM\n")
+    f.write("on_the_fly: fft_bytes = 8*C*S      # recomputed per chunk; no persistent VRAM\n")
     f.write("```\n\n")
     f.write("tcBF peak estimate:\n\n")
     f.write("```text\n")
-    f.write("tcBF_bytes ~= 12*B*S        # common vBF + FFT cache\n")
-    f.write("             + 8*K*B        # b_dx and b_dy shift basis, float32\n")
-    f.write("             + 28*C*S       # per-chunk ramp, phasor, multiply, ifft workspaces\n")
+    f.write("tcBF_bytes ~= fft_bytes             # FFT cache (mode-dependent above)\n")
+    f.write("             + 8*K*B                # b_dx and b_dy shift basis, float32\n")
+    f.write("             + 28*C*S               # per-chunk ramp, phasor, multiply, ifft workspaces\n")
     f.write("```\n\n")
-    f.write("acBF lazy peak estimate:\n\n")
+    f.write("acBF on_the_fly basis peak estimate (default basis_mode):\n\n")
     f.write("```text\n")
-    f.write("acBF_lazy_bytes ~= 12*B*S\n")
-    f.write("                  + (64 + 12*K)*C*S   # regenerated aperture, basis, chi, transfer, FFT workspaces\n")
+    f.write("acBF_otf_bytes ~= fft_bytes\n")
+    f.write("                 + (64 + 12*K)*C*S  # regenerated aperture, basis, chi, transfer, FFT workspaces\n")
     f.write("```\n\n")
-    f.write("acBF full peak estimate:\n\n")
+    f.write("acBF precompute basis peak estimate (basis_mode='precompute'):\n\n")
     f.write("```text\n")
-    f.write("acBF_full_bytes ~= (20 + 8*K)*B*S      # common + cached ap_t/ap_mt + cached b_t/b_mt\n")
-    f.write("                  + (32 + 4*K)*C*S     # reconstruction-time chunk workspaces\n")
+    f.write("acBF_pre_bytes ~= fft_bytes\n")
+    f.write("                 + (16 + 8*K)*B*S   # cached ap_t/ap_mt + b_tr/b_t/b_mt for all B\n")
+    f.write("                 + (32 + 4*K)*C*S   # reconstruction-time chunk workspaces\n")
     f.write("```\n\n")
     f.write(
         "Convert bytes to GiB by dividing by `1024**3`. These formulas track the "
@@ -498,9 +502,9 @@ def _estimate_features(row: dict) -> tuple[float, float, float]:
     chunk_cells = chunk * ry * rx
     if recon_mode == "tcbf":
         return (1.0, cells / 1e8, chunk_cells / 1e8)
-    if row.get("cache_mode") == "full":
-        return (1.0, cells / 1e8, cells * coeffs / 1e8)
-    return (1.0, cells / 1e8, chunk_cells * coeffs / 1e8)
+    if row.get("cache_mode") == "device":
+        return (1.0, cells / 1e8, chunk_cells * coeffs / 1e8)
+    return (1.0, chunk_cells / 1e8, chunk_cells * coeffs / 1e8)
 
 
 def _analytic_peak_estimate_gib(row: dict) -> float:
@@ -518,11 +522,11 @@ def _analytic_peak_estimate_gib(row: dict) -> float:
     # and per-chunk temporary workspaces. This is a fallback when too few empirical
     # points exist for least-squares interpolation.
     if recon_mode == "tcbf":
-        bytes_est = 12.0 * cells + 8.0 * coeffs * actual_nb + 28.0 * chunk_cells
-    elif row.get("cache_mode") == "full":
-        bytes_est = (20.0 + 8.0 * coeffs) * cells + (32.0 + 4.0 * coeffs) * chunk_cells
+        bytes_est = 8.0 * cells + 8.0 * coeffs * actual_nb + 28.0 * chunk_cells
+    elif row.get("cache_mode") == "device":
+        bytes_est = 8.0 * cells + (64.0 + 12.0 * coeffs) * chunk_cells
     else:
-        bytes_est = 12.0 * cells + (64.0 + 12.0 * coeffs) * chunk_cells
+        bytes_est = 8.0 * chunk_cells + (64.0 + 12.0 * coeffs) * chunk_cells
     return bytes_est / 1024**3
 
 
@@ -581,7 +585,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--ry", type=int, default=64)
     parser.add_argument("--rx", type=int, default=64)
     parser.add_argument("--max-order", type=int, default=1)
-    parser.add_argument("--cache-mode", choices=DEFAULT_CACHE_MODES, default="lazy")
+    parser.add_argument("--cache-mode", choices=DEFAULT_CACHE_MODES, default="on_the_fly")
     parser.add_argument("--recon-mode", choices=DEFAULT_RECON_MODES, default="acbf")
     parser.add_argument("--chunk-size", type=int, default=64)
     parser.add_argument("--scan-step-size", type=float, default=0.2)
