@@ -52,10 +52,9 @@ class BFReconstructor:
         self.ab_state = ab_state
         self.coord_transform = coord_transform
         self.eps = eps
-        self.basis_mode = basis_mode  # validated via property setter
-
         self._tcbf_cache: dict[tuple, TCBFCache] = {}
         self._acbf_cache: dict[tuple, tuple[ACBFGeometryCache, ACBFOpticsCache | None]] = {}
+        self.basis_mode = basis_mode  # validated via property setter (accesses _acbf_cache)
 
     @property
     def basis_mode(self) -> str:
