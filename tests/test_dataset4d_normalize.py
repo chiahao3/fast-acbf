@@ -162,10 +162,10 @@ class TestLazyReadModeHDF5:
             err_msg=f"lazy_read_mode={mode!r} disagrees with per_pixel (normalized)",
         )
 
-    def test_auto_detects_scan_row_for_contiguous(self):
+    def test_auto_detects_slab_for_contiguous(self):
         ds = Dataset4D.from_hdf5(self.path, lazy_read_mode='auto')
-        # contiguous HDF5 → auto should pick scan_row
-        assert ds._lazy_read_mode == 'scan_row'
+        # contiguous HDF5 (chunks=None) → auto should pick slab
+        assert ds._lazy_read_mode == 'slab'
 
     def test_invalid_lazy_read_mode_raises(self):
         with pytest.raises(ValueError, match="lazy_read_mode"):

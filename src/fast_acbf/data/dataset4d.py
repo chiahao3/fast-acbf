@@ -298,8 +298,12 @@ class Dataset4D:
         """Inspect handle chunk layout and return the best lazy_read_mode.
 
         Rules:
-          - h5py chunks=None (contiguous): 'scan_row' — sequential 8 MB reads
-            beat the highly-strided per-pixel pattern.
+          - h5py chunks=None (contiguous C-order): 'slab' — each chunk call
+            reads a small ky bounding-box (~2 rows for sorted BF pixels),
+            minimises h5py call count while keeping per-call I/O tiny.
+            scan_row is 2× faster for single full-pass calls but requires
+            all N_bf pixels in one call; slab is better for the chunked
+            reconstruction loop.
           - Detector-major chunks (c2==1 and c3==1): 'per_pixel' — each
             (ky,kx) pixel is its own decompression unit.
           - Scan-major chunks (c0==1 and c1==1): 'scan_row' — each diffraction
@@ -311,8 +315,8 @@ class Dataset4D:
         # zarr.Array exposes chunks as a tuple (always chunked).
         chunks = getattr(handle, 'chunks', None)
         if chunks is None:
-            # h5py contiguous — no chunking at all
-            return 'scan_row'
+            # h5py contiguous — adaptive ky-slab is best for chunked access
+            return 'slab'
         c0, c1, c2, c3 = chunks
         if c2 == 1 and c3 == 1:
             return 'per_pixel'   # detector-major: one chunk per (ky,kx) image
