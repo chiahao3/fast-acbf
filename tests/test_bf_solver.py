@@ -1026,6 +1026,135 @@ class TestACBFGeometryOpticsSplit:
         solver.get_acBF(chunk_size=8)
 
 
+# ── ImageFFT cache mode behavior ──────────────────────────────────────────────
+
+class TestImageFFTCacheMode:
+    """Verify that each cache_mode allocates/fills storage exactly as claimed.
+
+    Tests check the internal fields _device_cache, _host_cache, _host_filled
+    directly so that bugs in the cache logic surface immediately.
+    """
+
+    def _make_solver(self, cache_mode, synth_dataset, synth_params, device):
+        p = synth_params
+        return BFSolver(
+            dataset=synth_dataset,
+            max_alpha=p["max_alpha"],
+            scan_step_size=p["scan_step_size"],
+            dk=p["dk"],
+            wavelength=p["wavelength"],
+            max_order=2,
+            aberrations={"C10": 50.0},
+            device=device,
+            cache_mode=cache_mode,
+        )
+
+    # -- on_the_fly --------------------------------------------------------
+
+    def test_on_the_fly_never_allocates_cache(self, synth_dataset, synth_params, device):
+        solver = self._make_solver('on_the_fly', synth_dataset, synth_params, device)
+        provider = solver._recon.provider
+        assert provider._device_cache is None
+        assert provider._host_cache is None
+        solver.get_tcBF(chunk_size=8)
+        assert provider._device_cache is None, "on_the_fly must not allocate _device_cache"
+        assert provider._host_cache is None, "on_the_fly must not allocate _host_cache"
+
+    # -- host --------------------------------------------------------------
+
+    def test_host_cache_is_none_before_reconstruction(self, synth_dataset, synth_params, device):
+        solver = self._make_solver('host', synth_dataset, synth_params, device)
+        provider = solver._recon.provider
+        assert provider._device_cache is None
+        assert provider._host_cache is None
+        assert provider._host_filled is None
+
+    def test_host_cache_fills_lazily_after_reconstruction(self, synth_dataset, synth_params, device):
+        solver = self._make_solver('host', synth_dataset, synth_params, device)
+        provider = solver._recon.provider
+        solver.get_tcBF(chunk_size=8)
+        assert provider._device_cache is None, "host mode must not touch _device_cache"
+        assert provider._host_cache is not None
+        assert provider._host_filled is not None
+        Ry, Rx = provider.scan_shape
+        assert provider._host_cache.shape == (provider.nb, Ry, Rx)
+        assert provider._host_cache.dtype == np.complex64
+        assert provider._host_filled.all(), "all BF pixels must be filled after a full reconstruction"
+
+    def test_host_cache_is_reused_on_second_call(self, synth_dataset, synth_params, device):
+        solver = self._make_solver('host', synth_dataset, synth_params, device)
+        provider = solver._recon.provider
+        solver.get_tcBF(chunk_size=8)
+        cache_id = id(provider._host_cache)
+        solver.get_tcBF(chunk_size=8)
+        assert id(provider._host_cache) == cache_id, "_host_cache must be the same object on second call"
+
+    # -- device ------------------------------------------------------------
+
+    def test_device_cache_populated_at_construction(self, synth_dataset, synth_params, device):
+        solver = self._make_solver('device', synth_dataset, synth_params, device)
+        provider = solver._recon.provider
+        assert provider._device_cache is not None, "_device_cache must be allocated eagerly at construction"
+        assert provider._host_cache is None
+
+    def test_device_cache_shape_and_dtype(self, synth_dataset, synth_params, device):
+        solver = self._make_solver('device', synth_dataset, synth_params, device)
+        provider = solver._recon.provider
+        Ry, Rx = provider.scan_shape
+        assert provider._device_cache.shape == (provider.nb, Ry, Rx)
+        assert provider._device_cache.dtype == torch.complex64
+
+    def test_device_cache_unchanged_after_reconstruction(self, synth_dataset, synth_params, device):
+        solver = self._make_solver('device', synth_dataset, synth_params, device)
+        provider = solver._recon.provider
+        cache_id = id(provider._device_cache)
+        solver.get_tcBF(chunk_size=8)
+        assert id(provider._device_cache) == cache_id, "_device_cache must not be reallocated during reconstruction"
+
+    # -- guards ------------------------------------------------------------
+
+    def test_device_mode_lazy_dataset_raises(self, synth_params):
+        from fast_acbf.data.geometry import DetectorGeometry
+        from fast_acbf.data.imagefft_provider import ImageFFTProvider
+
+        class _FakeLazyDataset:
+            is_lazy = True
+            scan_shape = (8, 8)
+            detector_shape = (32, 32)
+
+        p = synth_params
+        det_geom = DetectorGeometry.from_params(
+            detector_shape=(p["Npix"], p["Npix"]),
+            max_alpha=p["max_alpha"],
+            dk=p["dk"],
+            wavelength=p["wavelength"],
+            device='cpu',
+        )
+        with pytest.raises(ValueError, match="device"):
+            ImageFFTProvider(_FakeLazyDataset(), det_geom, 'cpu', cache_mode='device')
+
+    def test_cache_mode_property_reports_resolved_string(self, synth_dataset, synth_params, device):
+        for mode in ('on_the_fly', 'host', 'device'):
+            solver = self._make_solver(mode, synth_dataset, synth_params, device)
+            assert solver.cache_mode == mode
+
+    # -- numerical parity --------------------------------------------------
+
+    def test_numerical_parity_tcbf_all_modes(self, synth_dataset, synth_params, device):
+        ref  = self._make_solver('on_the_fly', synth_dataset, synth_params, device).get_tcBF(chunk_size=8)
+        host = self._make_solver('host',       synth_dataset, synth_params, device).get_tcBF(chunk_size=8)
+        dev  = self._make_solver('device',     synth_dataset, synth_params, device).get_tcBF(chunk_size=8)
+        torch.testing.assert_close(host, ref, atol=1e-5, rtol=1e-5)
+        torch.testing.assert_close(dev,  ref, atol=1e-5, rtol=1e-5)
+
+    def test_numerical_parity_acbf_all_modes(self, synth_dataset, synth_params, device):
+        ref  = self._make_solver('on_the_fly', synth_dataset, synth_params, device).get_acBF(chunk_size=8)
+        host = self._make_solver('host',       synth_dataset, synth_params, device).get_acBF(chunk_size=8)
+        dev  = self._make_solver('device',     synth_dataset, synth_params, device).get_acBF(chunk_size=8)
+        torch.testing.assert_close(host, ref, atol=1e-5, rtol=1e-5)
+        torch.testing.assert_close(dev,  ref, atol=1e-5, rtol=1e-5)
+
+
 @pytest.mark.regression
 def test_regression_tcbf(real_solver):
     fixture = os.path.join(FIXTURE_DIR, "tcbf.npy")
