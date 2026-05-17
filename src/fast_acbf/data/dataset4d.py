@@ -82,6 +82,16 @@ class Dataset4D:
         """Normalization factor applied at construction, or None if normalize=False."""
         return self._norm_factor
 
+    @property
+    def lazy_read_mode(self) -> str:
+        """Resolved lazy read strategy ('per_pixel', 'scan_row', or 'slab').
+
+        For in-memory datasets this is always ``'per_pixel'`` (unused).
+        For lazy backends this reflects the strategy selected at construction
+        time (either the explicit value or the auto-detected one).
+        """
+        return self._lazy_read_mode
+
     # --- Lazy constructors ---
     @classmethod
     def from_hdf5(

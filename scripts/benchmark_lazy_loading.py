@@ -300,8 +300,11 @@ def main(argv=None):
             f"{data_reads[m]:>20}  ×{speedup:.1f}  {notes[m]}"
         )
 
-    auto_mode = 'scan_row'
-    print(f"\nauto-detected mode for this file: {auto_mode}  (contiguous HDF5, chunks=None)")
+    from fast_acbf.data.dataset4d import Dataset4D
+    auto_ds = Dataset4D.from_hdf5(args.file, key=args.key, lazy_read_mode='auto')
+    auto_mode = auto_ds.lazy_read_mode
+    auto_ds.close()
+    print(f"\nauto-detected mode for this file: {auto_mode!r}  (chunks={chunks})")
     print("=" * 60)
 
 
