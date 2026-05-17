@@ -14,15 +14,6 @@ from fast_acbf.core.functional import (
 
 
 @dataclass
-class ImageFFT:
-    """Pre-computed FFT of the BF image stack."""
-    img_fft: torch.Tensor  # (Nb, Ry, Rx) complex64
-
-    def fft_chunk(self, start: int, end: int) -> torch.Tensor:
-        return self.img_fft[start:end]
-
-
-@dataclass
 class TCBFCache:
     """Per-chunk shift basis for tcBF. Orientation-dependent."""
     chunks: list  # each: {b_dx, b_dy, start, end}
@@ -43,12 +34,6 @@ class ACBFGeometryCache:
 class ACBFOpticsCache:
     """Per-chunk apertures and aberration bases. Built only in 'full' mode."""
     chunks: list  # each: {ap_t, ap_mt, b_tr, b_t, b_mt, start, end}
-
-
-def build_image_fft(vbf_images: torch.Tensor) -> ImageFFT:
-    """Pre-compute the full-stack FFT. Mode/orientation-independent."""
-    img_fft = torch.fft.fft2(vbf_images, dim=(-2, -1))
-    return ImageFFT(img_fft=img_fft)
 
 
 def build_tcbf_cache(

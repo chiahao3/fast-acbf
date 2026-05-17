@@ -2,13 +2,18 @@
 
 from __future__ import annotations
 
+from typing import TYPE_CHECKING
+
 import torch
 
-from fast_acbf.recon.cache import ImageFFT, TCBFCache
+from fast_acbf.recon.cache import TCBFCache
+
+if TYPE_CHECKING:
+    from fast_acbf.data.imagefft_provider import ImageFFTProvider
 
 
 def reconstruct_tcbf(
-    image_fft: ImageFFT,
+    provider: ImageFFTProvider,
     qx_grid: torch.Tensor,
     qy_grid: torch.Tensor,
     cache: TCBFCache,
@@ -22,7 +27,7 @@ def reconstruct_tcbf(
     shift basis stored in the cache.
 
     Args:
-        image_fft: ImageFFT carrying the pre-computed BF stack FFT.
+        provider:  ImageFFTProvider serving (chunk_size, Ry, Rx) complex64 chunks.
         qx_grid:   Scan-frame frequency grid, shape (1, 1, Rx).
         qy_grid:   Scan-frame frequency grid, shape (1, Ry, 1).
         cache:     TCBFCache built by pipeline.build_tcbf_cache (basis only).
@@ -33,11 +38,11 @@ def reconstruct_tcbf(
         Reconstructed tcBF image, shape (Ry, Rx), float32.
     """
     neg_two_pi_j = torch.tensor(-2.0j * torch.pi, dtype=torch.complex64, device=device)
-    out_shape = image_fft.img_fft.shape[-2:]
+    out_shape = provider.scan_shape
 
     tcBF_total = torch.zeros(out_shape, dtype=torch.float32, device=device)
     for chunk in cache.chunks:
-        img_fft_chunk = image_fft.fft_chunk(chunk['start'], chunk['end'])
+        img_fft_chunk = provider.get_chunk(chunk['start'], chunk['end'])
         shift_dx = torch.einsum('k, kb -> b', coeffs, chunk['b_dx']).view(-1, 1, 1)
         shift_dy = torch.einsum('k, kb -> b', coeffs, chunk['b_dy']).view(-1, 1, 1)
         ramp = shift_dx * qx_grid + shift_dy * qy_grid

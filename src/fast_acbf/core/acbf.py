@@ -2,10 +2,15 @@
 
 from __future__ import annotations
 
+from typing import TYPE_CHECKING
+
 import torch
 
 from fast_acbf.core.functional import generate_aberration_basis, make_soft_aperture_torch
-from fast_acbf.recon.cache import ACBFGeometryCache, ACBFOpticsCache, ImageFFT
+from fast_acbf.recon.cache import ACBFGeometryCache, ACBFOpticsCache
+
+if TYPE_CHECKING:
+    from fast_acbf.data.imagefft_provider import ImageFFTProvider
 
 
 def compute_transfer(
@@ -95,7 +100,7 @@ def _iter_chunks(geometry: ACBFGeometryCache, optics: ACBFOpticsCache | None):
 
 
 def reconstruct_acbf(
-    image_fft: ImageFFT,
+    provider: ImageFFTProvider,
     qx_grid: torch.Tensor,
     qy_grid: torch.Tensor,
     geometry: ACBFGeometryCache,
@@ -110,7 +115,7 @@ def reconstruct_acbf(
     Aligns detector contributions by their phase before summation.
 
     Args:
-        image_fft: ImageFFT carrying the pre-computed BF stack FFT.
+        provider:  ImageFFTProvider serving (chunk_size, Ry, Rx) complex64 chunks.
         qx_grid:   Scan-frame frequency grid, shape (1, 1, Rx).
         qy_grid:   Scan-frame frequency grid, shape (1, Ry, 1).
         geometry:  ACBFGeometryCache built by pipeline.build_acbf_geometry_cache.
@@ -122,10 +127,10 @@ def reconstruct_acbf(
     Returns:
         Reconstructed acBF image, shape (Ry, Rx), float32.
     """
-    out_shape = image_fft.img_fft.shape[-2:]
+    out_shape = provider.scan_shape
     acBF_total = torch.zeros(out_shape, dtype=torch.float32, device=device)
     for geom_chunk, optics_chunk in _iter_chunks(geometry, optics):
-        img_fft_chunk = image_fft.fft_chunk(geom_chunk['start'], geom_chunk['end'])
+        img_fft_chunk = provider.get_chunk(geom_chunk['start'], geom_chunk['end'])
         transfer = compute_transfer(geom_chunk, optics_chunk, coeffs, qx_grid, qy_grid, geometry, device)
         phasor = transfer / (transfer.abs() + eps)
         acBF_total += torch.sum(torch.fft.ifft2(img_fft_chunk * phasor, dim=(-2, -1)).real, dim=0)
@@ -133,7 +138,7 @@ def reconstruct_acbf(
 
 
 def reconstruct_acbf_complex_inversion(
-    image_fft: ImageFFT,
+    provider: ImageFFTProvider,
     qx_grid: torch.Tensor,
     qy_grid: torch.Tensor,
     geometry: ACBFGeometryCache,
@@ -156,7 +161,7 @@ def reconstruct_acbf_complex_inversion(
         S(q) = sum_b |T_b(q)|^2
 
     Args:
-        image_fft:          ImageFFT carrying the pre-computed BF stack FFT.
+        provider:           ImageFFTProvider serving (chunk_size, Ry, Rx) complex64 chunks.
         qx_grid:            Scan-frame frequency grid, shape (1, 1, Rx).
         qy_grid:            Scan-frame frequency grid, shape (1, Ry, 1).
         geometry:           ACBFGeometryCache.
@@ -176,12 +181,12 @@ def reconstruct_acbf_complex_inversion(
     if support_threshold < 0:
         raise ValueError(f"support_threshold must be non-negative, got {support_threshold}.")
 
-    out_shape = image_fft.img_fft.shape[-2:]
+    out_shape = provider.scan_shape
     numerator = torch.zeros(out_shape, dtype=torch.complex64, device=device)
     transfer_power = torch.zeros(out_shape, dtype=torch.float32, device=device)
 
     for geom_chunk, optics_chunk in _iter_chunks(geometry, optics):
-        img_fft_chunk = image_fft.fft_chunk(geom_chunk['start'], geom_chunk['end'])
+        img_fft_chunk = provider.get_chunk(geom_chunk['start'], geom_chunk['end'])
         transfer = compute_transfer(geom_chunk, optics_chunk, coeffs, qx_grid, qy_grid, geometry, device)
         numerator.add_(torch.sum(transfer * img_fft_chunk, dim=0))
         transfer_power.add_(torch.sum(transfer.abs().square(), dim=0))
