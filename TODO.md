@@ -38,6 +38,9 @@
 
 ## Pipeline & Integration
 - Setup a dataloader path so we can run datasets larger than VRAM, or even RAM
+  - `cache_mode='on_the_fly'` now streams directly from disk at practical speeds (see lazy
+    disk-streaming in Existing features). Remaining gap: reconstruction still stalls while
+    waiting for each disk read — prefetching would hide this latency.
 
 
 # Existing features
@@ -49,12 +52,13 @@
 - scan rotation line search (`refine_scan_rotation`): sweep over rotation_deg with cache invalidation
 - flip/transpose exhaustive search (`refine_flips`): scores all 8 combinations of flipud × fliplr × transpose
 - aberration optimization with AD (`refine_aberrations`, controlled by `max_order`, `lr`, and `lr_scales`)
-- 2 static cache modes (`full`, `lazy`) to balance speed and VRAM usage
+- 3 cache modes (`device`, `host`, `on_the_fly`) to trade off speed vs. memory: `device` caches everything on GPU, `host` caches in RAM, `on_the_fly` streams from disk with no caching
 - soft aperture with cosine rolloff (`rolloff` param in `reconstruct()`)
 - multiple focus quality metrics: `laplacian` (variance of Laplacian), `sobel` (Tenengrad), `normalized_std`
 - coordinate transform flags (flipud, fliplr, transpose, rotation_deg) matching PtyRAD's `meas_flipT`; used when computing scan-frame vs detector-frame outputs
 - visualization: shift quiver over BF disk (`plot_shift_quiver`), chi surface (`plot_chi_surface`), reconstruction + probe side-by-side (`plot_reconstruction`), defocus/rotation line searches, flip/transpose search grid
 - `get_acBF_diagnostics`: returns transfer power map, support mask, and complex image channels for complex-inversion debugging
 - Export 3D defocus volume stack (`get_defocus_stack`)
+- Smart disk-streaming for `on_the_fly` mode: automatically selects the best read strategy based on how the file is stored on disk, up to ×1283 faster than the naive approach. Can be overridden via `lazy_read_mode` on `Dataset4D` and `BFSolver`.
 - Modular package structure: `core/` (portable physics), `pipeline.py` (caching), `optimization/` (metrics + refinement), `vis/` (plotting)
 - py4D-browser-fast-acbf as a interactive GUI (currently only in Muller group Github repo @ Cornell)
