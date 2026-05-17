@@ -1,6 +1,6 @@
 """BFReconstructor — minimal BF-specific optimizable model.
 
-Owns: PreparedBFDataset, ScanGeometry, AberrationState, CoordinateTransform,
+Owns: ImageFFTProvider, ScanGeometry, AberrationState, CoordinateTransform,
 and the reconstruction cache workspace. Nothing else.
 
 Strict boundaries:
@@ -19,19 +19,17 @@ from fast_acbf.core.aberrations import AberrationState
 from fast_acbf.core.acbf import reconstruct_acbf, reconstruct_acbf_complex_inversion
 from fast_acbf.core.tcbf import reconstruct_tcbf
 from fast_acbf.data.geometry import CoordinateTransform, ScanGeometry
-from fast_acbf.data.prepared import PreparedBFDataset
+from fast_acbf.data.imagefft_provider import ImageFFTProvider
 from fast_acbf.recon.cache import (
     ACBFGeometryCache,
     ACBFOpticsCache,
-    ImageFFT,
     TCBFCache,
     build_acbf_geometry_cache,
     build_acbf_optics_cache,
-    build_image_fft,
     build_tcbf_cache,
 )
 
-_VALID_CACHE_MODES = ('lazy', 'full')
+_VALID_BASIS_MODES = ('on_the_fly', 'precompute')
 
 
 class BFReconstructor:
@@ -42,39 +40,41 @@ class BFReconstructor:
 
     def __init__(
         self,
-        prepared: PreparedBFDataset,
+        provider: ImageFFTProvider,
         scan_geom: ScanGeometry,
         ab_state: AberrationState,
         coord_transform: CoordinateTransform,
-        cache_mode: str = 'lazy',
+        basis_mode: str = 'on_the_fly',
         eps: float = 1e-3,
     ) -> None:
-        self.prepared = prepared
+        self.provider = provider
         self.scan_geom = scan_geom
         self.ab_state = ab_state
         self.coord_transform = coord_transform
         self.eps = eps
-        self.cache_mode = cache_mode  # validated via property setter
+        self.basis_mode = basis_mode  # validated via property setter
 
-        # Three typed cache fields instead of one untyped dict.
-        self._image_fft: ImageFFT | None = None
         self._tcbf_cache: dict[tuple, TCBFCache] = {}
         self._acbf_cache: dict[tuple, tuple[ACBFGeometryCache, ACBFOpticsCache | None]] = {}
 
     @property
-    def cache_mode(self) -> str:
-        return self._cache_mode
+    def basis_mode(self) -> str:
+        return self._basis_mode
 
-    @cache_mode.setter
-    def cache_mode(self, value: str) -> None:
+    @basis_mode.setter
+    def basis_mode(self, value: str) -> None:
         value = str(value).strip().lower()
-        if value not in _VALID_CACHE_MODES:
-            raise ValueError(f"cache_mode must be one of {_VALID_CACHE_MODES}, got {value!r}.")
-        self._cache_mode = value
+        if value not in _VALID_BASIS_MODES:
+            raise ValueError(f"basis_mode must be one of {_VALID_BASIS_MODES}, got {value!r}.")
+        self._basis_mode = value
+        # Invalidate precomputed optics when switching modes so they rebuild correctly.
+        for key in self._acbf_cache:
+            geometry, _ = self._acbf_cache[key]
+            self._acbf_cache[key] = (geometry, None)
 
     @property
     def device(self) -> str:
-        return self.prepared.device
+        return self.provider.device
 
     @property
     def rotation_deg(self) -> float:
@@ -85,13 +85,13 @@ class BFReconstructor:
     # ------------------------------------------------------------------
 
     def clear_cache(self) -> None:
-        """Full reset — clears image FFT and both basis caches."""
-        self._image_fft = None
+        """Full reset — clears both basis caches and the provider cache."""
         self._tcbf_cache = {}
         self._acbf_cache = {}
+        self.provider.clear_cache()
 
     def clear_basis_cache(self) -> None:
-        """Clear orientation-dependent basis caches; image FFT is preserved."""
+        """Clear orientation-dependent basis caches; provider cache is preserved."""
         self._tcbf_cache = {}
         self._acbf_cache = {}
 
@@ -113,21 +113,16 @@ class BFReconstructor:
         return self.ab_state.to_scan_frame(self.coord_transform.rotation_deg)
 
     def _get_transformed_centers(self, in_scan_frame: bool = True) -> tuple[torch.Tensor, torch.Tensor]:
-        det = self.prepared.detector_geom
+        det = self.provider.detector_geom
         return self.coord_transform.apply_to_centers(det.kY_centers, det.kX_centers, in_scan_frame)
 
     def _get_transformed_grids(self, in_scan_frame: bool = True) -> tuple[torch.Tensor, torch.Tensor]:
-        det = self.prepared.detector_geom
+        det = self.provider.detector_geom
         return self.coord_transform.apply_to_grids(det.kY_grid, det.kX_grid, in_scan_frame)
 
     # ------------------------------------------------------------------
     # Lazy-build cache accessors
     # ------------------------------------------------------------------
-
-    def _get_image_fft(self) -> ImageFFT:
-        if self._image_fft is None:
-            self._image_fft = self.prepared.build_image_fft()
-        return self._image_fft
 
     def _get_tcbf_cache(self, chunk_size: int = 64) -> TCBFCache:
         key = (chunk_size, *self._frame_cache_key())
@@ -135,7 +130,7 @@ class BFReconstructor:
             kX_full, kY_full = self._get_transformed_centers()
             self._tcbf_cache[key] = build_tcbf_cache(
                 kX_full, kY_full,
-                self.ab_state.order_keys, self.prepared.detector_geom.wavelength, chunk_size,
+                self.ab_state.order_keys, self.provider.detector_geom.wavelength, chunk_size,
             )
         return self._tcbf_cache[key]
 
@@ -144,13 +139,13 @@ class BFReconstructor:
     ) -> tuple[ACBFGeometryCache, ACBFOpticsCache | None]:
         """Return (geometry, optics_or_None).
 
-        Geometry is mode-independent. Optics is built on demand only in 'full'
-        mode; the consumer-facing return is gated on the current cache_mode.
+        Geometry is mode-independent. Optics is built on demand only in
+        'precompute' mode; the consumer-facing return is gated on basis_mode.
         """
         key = (rolloff, chunk_size, *self._frame_cache_key())
         if key not in self._acbf_cache:
             kX_full, kY_full = self._get_transformed_centers()
-            det = self.prepared.detector_geom
+            det = self.provider.detector_geom
             geometry = build_acbf_geometry_cache(
                 kX_full, kY_full,
                 self.ab_state.order_keys, det.max_alpha, det.wavelength,
@@ -159,7 +154,7 @@ class BFReconstructor:
             self._acbf_cache[key] = (geometry, None)
 
         geometry, optics = self._acbf_cache[key]
-        if self.cache_mode == 'full':
+        if self.basis_mode == 'precompute':
             if optics is None:
                 sg = self.scan_geom
                 optics = build_acbf_optics_cache(geometry, sg.qx_grid, sg.qy_grid)
@@ -192,9 +187,8 @@ class BFReconstructor:
         if mode_key == 'tcbf':
             self._validate_upscale(kwargs.get('upscale', 1))
             cache = self._get_tcbf_cache(chunk_size=kwargs.get('chunk_size', 64))
-            image_fft = self._get_image_fft()
             return reconstruct_tcbf(
-                image_fft, sg.qx_grid, sg.qy_grid, cache, coeffs, self.device,
+                self.provider, sg.qx_grid, sg.qy_grid, cache, coeffs, self.device,
             )
 
         if mode_key == 'acbf':
@@ -203,16 +197,15 @@ class BFReconstructor:
             chunk_size = kwargs.get('chunk_size', 64)
             acbf_algorithm = self._normalize_acbf_algorithm(kwargs.get('acbf_algorithm'))
             geometry, optics = self._get_acbf_cache(rolloff=rolloff, chunk_size=chunk_size)
-            image_fft = self._get_image_fft()
 
             if acbf_algorithm == 'phase_only':
                 return reconstruct_acbf(
-                    image_fft, sg.qx_grid, sg.qy_grid, geometry, optics,
+                    self.provider, sg.qx_grid, sg.qy_grid, geometry, optics,
                     coeffs, self.eps, self.device,
                 )
             if acbf_algorithm == 'complex_inversion':
                 return reconstruct_acbf_complex_inversion(
-                    image_fft, sg.qx_grid, sg.qy_grid, geometry, optics,
+                    self.provider, sg.qx_grid, sg.qy_grid, geometry, optics,
                     coeffs, self.device,
                     regularization=kwargs.get('regularization', 1e-3),
                     support_threshold=kwargs.get('support_threshold', 1e-6),
