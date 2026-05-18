@@ -172,19 +172,31 @@ class ImageFFTProvider:
         return torch.from_numpy(chunk_np).to(dev)
 
     def _prefill_host_cache_sequential(self, dev: torch.device) -> None:
-        """Fill the entire host FFT cache via one sequential scan-row streaming pass.
+        """Fill the entire host FFT cache in one pass, choosing the I/O strategy
+        based on the dataset's chunk layout.
 
-        Reads the lazy dataset one scan row at a time (one contiguous h5py I/O
-        call per row = Ry sequential reads), extracts all BF pixels from each
-        row, accumulates a raw (Nb, Ry, Rx) float32 buffer, then batch-FFTs on
-        the GPU in chunks of 64 and stores the results in the host cache.
+        Two strategies:
 
-        Peak extra RAM: (Nb, Ry, Rx) float32 ≈ 1.5 GiB for a 1024×1024 scan
-        with Nb=520 BF pixels.  Freed before returning.
+        scan_row / slab (contiguous HDF5):
+            Reads the dataset one scan row at a time — Ry sequential h5py
+            calls each reading Rx*Ky*Kx*4 bytes.  Scans the full file but
+            avoids the O(Ry*Rx) individual pread() calls that h5py's hyperslab
+            issues for per-pixel access on contiguous storage.
+
+        per_pixel (detector-major chunked HDF5, chunks=(Ry,Rx,1,1)):
+            Reads handle[:,:,ky,kx] for each BF pixel — Nb h5py calls each
+            reading one 3–4 MB contiguous chunk.  Only the BF subset of
+            the file is touched: I/O ∝ Nb*Ry*Rx*4 ≈ 2–3 GiB instead of
+            the full 48–64 GiB file.
+
+        Peak extra RAM: (Nb, Ry, Rx) float32 (2–5 GiB for typical scans).
+        Freed before returning.
         """
-        Ry, Rx = self.scan_shape
         bf_iy, bf_ix = self._bf_iy, self._bf_ix
-        raw_buf = self.dataset.stream_all_bf_images(bf_iy, bf_ix)   # (Nb, Ry, Rx) f32
+        if self.dataset.lazy_read_mode == 'per_pixel':
+            raw_buf = self.dataset.stream_all_bf_images_per_pixel(bf_iy, bf_ix)
+        else:
+            raw_buf = self.dataset.stream_all_bf_images(bf_iy, bf_ix)
 
         chunk_size = 64
         for b in range(0, self.nb, chunk_size):

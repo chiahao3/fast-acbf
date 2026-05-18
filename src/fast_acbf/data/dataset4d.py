@@ -316,6 +316,38 @@ class Dataset4D:
             out /= np.float32(self._norm_factor)
         return out
 
+    def stream_all_bf_images_per_pixel(
+        self, bf_iy: np.ndarray, bf_ix: np.ndarray
+    ) -> np.ndarray:
+        """Return (Nb, Ry, Rx) float32 via one h5py read per BF detector pixel.
+
+        Reads handle[:, :, ky, kx] for each BF pixel (ky, kx).  For HDF5 files
+        with detector-major chunk layout (Ry, Rx, 1, 1), each such read is a
+        single contiguous chunk read — only the BF subset of the detector is
+        touched, giving I/O proportional to Nb × Ry × Rx × 4 bytes rather than
+        the full file size.
+
+        For contiguous HDF5, each handle[:,:,ky,kx] read is a strided hyperslab
+        (one float per scan row), which is catastrophically slow — use
+        stream_all_bf_images() instead for contiguous files.
+
+        Intended for host-cache prefill when lazy_read_mode == 'per_pixel'.
+        Peak extra RAM: (Nb, Ry, Rx) float32 held by the caller.
+        """
+        if not self.is_lazy:
+            raise RuntimeError(
+                "stream_all_bf_images_per_pixel() is only available for lazy "
+                "(disk-backed) Dataset4D."
+            )
+        Ry, Rx = self.scan_shape
+        Nb = len(bf_iy)
+        out = np.empty((Nb, Ry, Rx), dtype=np.float32)
+        for b, (ky, kx) in enumerate(zip(bf_iy.tolist(), bf_ix.tolist())):
+            out[b] = np.asarray(self._handle[:, :, ky, kx], dtype=np.float32)
+        if self._norm_factor is not None:
+            out /= np.float32(self._norm_factor)
+        return out
+
     def _get_bf_chunk_slab(self, iy: np.ndarray, ix: np.ndarray) -> np.ndarray:
         """Ky bounding-box hyperslab: read handle[:,:,ky_min:ky_max,:] once.
 

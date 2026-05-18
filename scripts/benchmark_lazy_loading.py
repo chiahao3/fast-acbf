@@ -1,33 +1,32 @@
 #!/usr/bin/env python
-"""Benchmark lazy loading strategies for Dataset4D on a real HDF5 file.
+"""Benchmark I/O throughput for loading BF images from 4D-STEM HDF5 files.
 
-Tests three on-the-fly streaming approaches (per_pixel, scan_row, slab) against
-the host (RAM-materialised) baseline.  Each approach loads all N_bf virtual-BF
-images (one iteration of all chunks = full vBF pass).
+Measures the time to load all Nb BF detector pixels into a (Nb, Ry, Rx) float32
+buffer — the bottleneck step before GPU FFT in the host-cache prefill path.
 
-Two timing scenarios
---------------------
-1. **full_pass** – single ``get_bf_chunk(all_iy, all_ix)`` call with all N_bf
-   detector pixels at once.  Fair apples-to-apples for total I/O time.
+Two file layouts compared:
+  contiguous      HDF5 contiguous storage (no chunking).
+  detector-chunks HDF5 chunks = (Ry_out, Rx_out, 1, 1) — one chunk per detector
+                  pixel spanning all scan positions.
 
-2. **chunked** – iterate through ceil(N_bf / chunk_size) calls of size
-   ``chunk_size``.  Realistic pipeline scenario.  scan_row and slab are shown
-   but expect to be much slower here (each call re-reads the whole
-   dataset / slab).
+Two loading strategies:
+  sequential   stream_all_bf_images():          reads one scan row at a time.
+               I/O = full file (48–64 GiB); optimal for contiguous files.
+  per_pixel    stream_all_bf_images_per_pixel(): reads one h5py chunk per BF pixel.
+               I/O = Nb/（Ky*Kx) × file (~4% for 25 mrad); optimal for detector chunks.
+
+The benchmark also runs through all three legacy lazy_read_mode values
+(per_pixel, scan_row, slab) via get_bf_chunk() on the 1 GiB file so the
+single-call vs chunked-loop trade-offs remain visible.
 
 Usage
 -----
     conda run -n fast-acbf python scripts/benchmark_lazy_loading.py
 
-Optional args::
-
-    --file    path/to/file.hdf5 (default: ~/scratch/Figure 4/scan_x128_y128.hdf5)
-    --key     HDF5 dataset key (default: array)
-    --chunk-size  BF pixels per call for chunked scenario (default: 64)
-    --runs    timing repetitions per scenario (default: 2)
-    --max-alpha   BF aperture semi-angle in mrad (default: 25.0)
-    --wavelength  electron wavelength in Å (default: 0.04176)
-    --dk      detector pixel size in Å⁻¹/pixel (default: auto-estimate)
+    # Test specific lazy mode on a single file (legacy interface):
+    conda run -n fast-acbf python scripts/benchmark_lazy_loading.py \\
+        --file ~/scratch/fast_acbf_large_test/scan_x128_y128_detector_chunks.hdf5 \\
+        --lazy-mode per_pixel
 """
 
 from __future__ import annotations
@@ -39,273 +38,239 @@ from pathlib import Path
 
 import numpy as np
 
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
+# ── Paths ─────────────────────────────────────────────────────────────────────
+SCRATCH = Path.home() / 'scratch' / 'fast_acbf_large_test'
+SRC_FILE = Path.home() / 'scratch' / 'Figure 4' / 'scan_x128_y128.hdf5'
+FILES: dict[str, Path] = {
+    '1GiB-contiguous':       SRC_FILE,
+    '1GiB-detector-chunks':  SCRATCH / 'scan_x128_y128_detector_chunks.hdf5',
+    '48GiB-contiguous':      SCRATCH / 'scan_x1024_y768_48GiB.hdf5',
+    '48GiB-detector-chunks': SCRATCH / 'scan_x1024_y768_48GiB_detector_chunks.hdf5',
+    '64GiB-contiguous':      SCRATCH / 'scan_x1024_y1024_64GiB.hdf5',
+    '64GiB-detector-chunks': SCRATCH / 'scan_x1024_y1024_64GiB_detector_chunks.hdf5',
+}
+HDF5_KEY = 'array'
 
-def _bf_pixels(Ky: int, Kx: int, max_alpha: float, wavelength: float, dk: float):
-    ky = np.fft.fftshift(np.fft.fftfreq(Ky, d=(1.0 / dk / Ky)))
-    kx = np.fft.fftshift(np.fft.fftfreq(Kx, d=(1.0 / dk / Kx)))
-    kX, kY = np.meshgrid(kx, ky, indexing='xy')
-    bf_mask = np.sqrt(kX**2 + kY**2) <= (max_alpha / 1e3 / wavelength)
-    iy, ix = np.where(bf_mask)
-    return iy.astype(np.intp), ix.astype(np.intp), bf_mask
-
-
-def timed(fn, label: str, runs: int):
-    """Run fn() *runs* times, return list of elapsed seconds."""
-    times = []
-    for r in range(runs):
-        gc.collect()
-        t0 = time.perf_counter()
-        result = fn()
-        elapsed = time.perf_counter() - t0
-        times.append(elapsed)
-        print(f"  [{label}] run {r+1}/{runs}: {elapsed:.3f} s")
-    return times, result
+# ── Physics (80 kV, 25 mrad) ──────────────────────────────────────────────────
+WAVELENGTH = 0.04176   # Å
+MAX_ALPHA  = 25.0      # mrad
+DK         = 0.04      # Å⁻¹/px
 
 
-def fmt_row(label, times, n_bf, scan_shape, extra=""):
-    mean = np.mean(times)
-    best = np.min(times)
-    Ry, Rx = scan_shape
-    mb_out = n_bf * Ry * Rx * 4 / 1e6
-    return (
-        f"  {label:<28} best={best:7.3f}s  mean={mean:7.3f}s  "
-        f"output={mb_out:6.0f} MB  {extra}"
-    )
+# ── Helpers ────────────────────────────────────────────────────────────────────
+
+def hdr(title: str) -> None:
+    bar = '─' * 70
+    print(f'\n{bar}')
+    print(f'  {title}')
+    print(bar)
 
 
-# ---------------------------------------------------------------------------
-# Benchmark scenarios
-# ---------------------------------------------------------------------------
+def get_bf_indices(ds) -> tuple[np.ndarray, np.ndarray]:
+    from fast_acbf.data.geometry import DetectorGeometry
+    Ky, Kx = ds.detector_shape
+    geom = DetectorGeometry(Ky=Ky, Kx=Kx, max_alpha=MAX_ALPHA, dk=DK, wavelength=WAVELENGTH)
+    bf_iy, bf_ix = np.where(geom.bf_mask_bool)
+    return bf_iy, bf_ix
 
-def bench_full_pass(path, key, iy_bf, ix_bf, modes, runs, per_pixel_sample: int = 0):
-    """Single call with all N_bf BF pixels — pure I/O comparison.
 
-    per_pixel_sample: if > 0, time per_pixel on that many pixels and
-    extrapolate to N_bf (avoids waiting for the full catastrophically-slow pass).
-    """
+def measure_seq_read_speed(path: Path, max_bytes: int = 512 * 2**20) -> float:
+    """Sequential read speed in GB/s, reading up to max_bytes from path."""
+    n = min(max_bytes, path.stat().st_size)
+    buf = bytearray(8 * 2**20)
+    total, t0 = 0, time.perf_counter()
+    with open(path, 'rb') as f:
+        while total < n:
+            read = f.readinto(buf)
+            if not read:
+                break
+            total += read
+    return total / 1e9 / (time.perf_counter() - t0)
+
+
+# ── Prefill benchmarks (stream_all_bf_images* paths) ──────────────────────────
+
+def bench_prefill(name: str, path: Path, results: list) -> None:
+    """Benchmark stream_all_bf_images and stream_all_bf_images_per_pixel."""
     from fast_acbf.data.dataset4d import Dataset4D
 
-    print("\n=== Scenario 1: full_pass (single get_bf_chunk call, all N_bf pixels) ===")
-    n_bf = len(iy_bf)
-    results = {}
-    for mode in modes:
-        ds = Dataset4D.from_hdf5(path, key=key, lazy_read_mode=mode)
-        scan_shape = ds.scan_shape
+    file_gib = path.stat().st_size / 2**30
+    print(f'\n  {name}  ({file_gib:.1f} GiB)')
 
-        if mode == 'per_pixel' and per_pixel_sample > 0 and per_pixel_sample < n_bf:
-            sample = min(per_pixel_sample, n_bf)
-            print(f"  [per_pixel] timing {sample}/{n_bf} pixels, extrapolating to full pass ...")
-            times_sample, _ = timed(
-                lambda: ds.get_bf_chunk(iy_bf[:sample], ix_bf[:sample]),
-                f'per_pixel (sample={sample})', runs,
-            )
-            scale = n_bf / sample
-            times = [t * scale for t in times_sample]
-            print(f"  [per_pixel] extrapolated full-pass: best={min(times):.1f}s  "
-                  f"(measured {min(times_sample):.3f}s for {sample} px, ×{scale:.1f})")
-            is_extrapolated = True
+    ds = Dataset4D.from_hdf5(path, key=HDF5_KEY, materialize=False)
+    lrm = ds.lazy_read_mode
+    bf_iy, bf_ix = get_bf_indices(ds)
+    Nb = len(bf_iy)
+    Ry, Rx = ds.scan_shape
+    Ky, Kx = ds.detector_shape
+    bf_frac = Nb / (Ky * Kx)
+    useful_gib = Nb * Ry * Rx * 4 / 2**30
+
+    print(f'    lazy_read_mode={lrm!r}  Nb={Nb} ({bf_frac*100:.1f}% of detector)  '
+          f'useful={useful_gib:.2f} GiB')
+
+    # Determine which strategies make sense for this layout
+    large_scan = (Ry * Rx > 65_536)
+    strategies: list[tuple[str, str, float]] = []  # (strategy, label, io_gib)
+
+    # sequential: always available; catastrophic for detector-chunked on large scans
+    seq_io_gib = Ry * Rx * Ky * Kx * 4 / 2**30
+    strategies.append(('sequential', 'stream_all_bf_images', seq_io_gib))
+
+    # per_pixel: always available; catastrophic for contiguous on large scans
+    pp_io_gib = useful_gib
+    strategies.append(('per_pixel', 'stream_all_bf_images_per_pixel', pp_io_gib))
+
+    for strat, fn_name, io_gib in strategies:
+        is_bad = (
+            (strat == 'per_pixel' and lrm != 'per_pixel' and large_scan) or
+            (strat == 'sequential' and lrm == 'per_pixel' and large_scan)
+        )
+        tag = ' [SLOW — wrong layout]' if is_bad else ''
+        print(f'    [{fn_name}]{tag}  '
+              f'expected I/O={io_gib:.2f} GiB  ', end='', flush=True)
+
+        if is_bad and large_scan:
+            # Skip catastrophically slow combos on large files
+            print('SKIPPED')
+            continue
+
+        t0 = time.perf_counter()
+        if strat == 'sequential':
+            raw = ds.stream_all_bf_images(bf_iy, bf_ix)
         else:
-            def _run():
-                return ds.get_bf_chunk(iy_bf, ix_bf)
-            times, _ = timed(_run, mode, runs)
-            is_extrapolated = False
+            raw = ds.stream_all_bf_images_per_pixel(bf_iy, bf_ix)
+        elapsed = time.perf_counter() - t0
+        throughput = io_gib / 1.024**3 / elapsed  # GB/s (not GiB/s)
 
-        ds.close()
-        results[mode] = (times, scan_shape, is_extrapolated)
-        extra = "  (extrapolated)" if is_extrapolated else ""
-        print(fmt_row(mode, times, n_bf, scan_shape, extra))
-
-    return results
-
-
-def bench_host_full_pass(path, key, iy_bf, ix_bf, runs):
-    """Materialize to RAM then fancy-index — baseline for RAM speed."""
-    from fast_acbf.data.dataset4d import Dataset4D
-
-    print("\n  [host] materialize + extract:")
-    ds_lazy = Dataset4D.from_hdf5(path, key=key, lazy_read_mode='per_pixel')
-    Ry, Rx = ds_lazy.scan_shape
-    n_bf = len(iy_bf)
-
-    times_mat = []
-    times_idx = []
-    for r in range(runs):
-        import h5py
+        print(f'{elapsed:.2f} s  →  {throughput:.2f} GB/s')
+        del raw
         gc.collect()
-        # Re-open each time to avoid HDF5 read cache influencing results
-        t0 = time.perf_counter()
-        with h5py.File(path, 'r') as f:
-            arr = np.asarray(f[key][:], dtype=np.float32)   # materialize
-        t_mat = time.perf_counter() - t0
 
-        t1 = time.perf_counter()
-        raw = arr[:, :, iy_bf, ix_bf]                       # (Ry, Rx, N_bf)
-        out = np.ascontiguousarray(raw.transpose(2, 0, 1))  # (N_bf, Ry, Rx)
-        t_idx = time.perf_counter() - t1
+        results.append({
+            'file': name, 'file_gib': file_gib, 'layout': lrm,
+            'strategy': strat, 'fn': fn_name,
+            'io_gib': io_gib, 'elapsed_s': elapsed, 'throughput_gbs': throughput,
+            'Nb': Nb, 'scan': f'{Ry}x{Rx}',
+        })
 
-        times_mat.append(t_mat)
-        times_idx.append(t_idx)
-        del arr, out; gc.collect()
-        print(f"  [host] run {r+1}/{runs}: mat={t_mat:.3f}s  idx={t_idx:.3f}s  total={t_mat+t_idx:.3f}s")
-
-    times_total = [m + i for m, i in zip(times_mat, times_idx)]
-    ds_lazy.close()
-    print(fmt_row('host (mat+idx)', times_total, n_bf, (Ry, Rx),
-                  f"(best mat={min(times_mat):.3f}s idx={min(times_idx):.3f}s)"))
-    return times_total
+    ds.close()
+    gc.collect()
 
 
-def bench_chunked(path, key, iy_bf, ix_bf, modes, chunk_size, runs):
-    """Chunked iteration — realistic pipeline scenario."""
+# ── Legacy single-file mode benchmark (get_bf_chunk with lazy_read_mode) ──────
+
+def bench_single_file_modes(path: Path, modes: list[str], runs: int) -> None:
+    """Benchmark get_bf_chunk() across explicit lazy_read_mode values."""
     from fast_acbf.data.dataset4d import Dataset4D
 
-    print(f"\n=== Scenario 2: chunked (chunk_size={chunk_size}, N_bf={len(iy_bf)}) ===")
-    n_bf = len(iy_bf)
-    n_chunks = int(np.ceil(n_bf / chunk_size))
-    print(f"  {n_chunks} chunks per full pass\n")
-    results = {}
+    hdr(f'Single-file mode comparison: {path.name}')
+    import h5py
+    with h5py.File(path, 'r') as f:
+        shape = f[HDF5_KEY].shape
+        chunks = f[HDF5_KEY].chunks
+    Ry, Rx, Ky, Kx = shape
+    file_gib = Ry * Rx * Ky * Kx * 4 / 2**30
+    print(f'  shape={shape}  chunks={chunks}  ({file_gib:.2f} GiB)')
+
+    ds_tmp = Dataset4D.from_hdf5(path, key=HDF5_KEY, materialize=False)
+    bf_iy, bf_ix = get_bf_indices(ds_tmp)
+    Nb = len(bf_iy)
+    ds_tmp.close()
+    print(f'  Nb={Nb}  ({100*Nb/(Ky*Kx):.1f}% of detector)\n')
 
     for mode in modes:
-        ds = Dataset4D.from_hdf5(path, key=key, lazy_read_mode=mode)
-        scan_shape = ds.scan_shape
-        out_buf = np.empty((n_bf,) + ds.scan_shape, dtype=np.float32)
-
-        def _run():
-            for b in range(n_chunks):
-                b_start = b * chunk_size
-                b_end = min(b_start + chunk_size, n_bf)
-                out_buf[b_start:b_end] = ds.get_bf_chunk(iy_bf[b_start:b_end],
-                                                          ix_bf[b_start:b_end])
-            return out_buf
-
-        times, _ = timed(_run, mode, runs)
+        ds = Dataset4D.from_hdf5(path, key=HDF5_KEY, lazy_read_mode=mode, materialize=False)
+        times = []
+        for r in range(runs):
+            gc.collect()
+            t0 = time.perf_counter()
+            raw = ds.get_bf_chunk(bf_iy, bf_ix)
+            elapsed = time.perf_counter() - t0
+            times.append(elapsed)
+            del raw
         ds.close()
-        results[mode] = (times, scan_shape)
-        print(fmt_row(mode, times, n_bf, scan_shape, f"({n_chunks} calls × chunk_size={chunk_size})"))
+        gc.collect()
+        best = min(times)
+        mean = sum(times) / len(times)
+        print(f'  {mode:<12}  best={best:.3f}s  mean={mean:.3f}s  '
+              f'({runs} run{"s" if runs>1 else ""})')
 
-    return results
 
-
-# ---------------------------------------------------------------------------
-# Main
-# ---------------------------------------------------------------------------
+# ── Main ────────────────────────────────────────────────────────────────────────
 
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__,
                                      formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument(
-        '--file',
-        default=str(Path.home() / 'scratch' / 'Figure 4' / 'scan_x128_y128.hdf5'),
-    )
-    parser.add_argument('--key', default='array')
-    parser.add_argument('--chunk-size', type=int, default=64)
-    parser.add_argument('--runs', type=int, default=2)
-    parser.add_argument('--max-alpha', type=float, default=25.0,
-                        help='BF aperture semi-angle in mrad')
-    parser.add_argument('--wavelength', type=float, default=0.04176,
-                        help='electron wavelength in Å')
-    parser.add_argument('--dk', type=float, default=None,
-                        help='detector pixel size in Å⁻¹/pixel (default: auto)')
+    parser.add_argument('--file', default=None,
+                        help='Single file to benchmark (enables legacy mode-comparison)')
+    parser.add_argument('--lazy-mode', nargs='+',
+                        default=['per_pixel', 'scan_row', 'slab'],
+                        help='lazy_read_mode values to test in single-file mode')
+    parser.add_argument('--runs', type=int, default=2,
+                        help='Timing repetitions per scenario')
     args = parser.parse_args(argv)
 
-    import h5py
-    with h5py.File(args.file, 'r') as f:
-        ds = f[args.key]
-        shape = ds.shape
-        chunks = ds.chunks
-        compression = ds.compression
-    Ry, Rx, Ky, Kx = shape
-    size_gb = Ry * Rx * Ky * Kx * 4 / 1e9
+    import psutil
+    hdr('Lazy Loading I/O Benchmark')
+    mem = psutil.virtual_memory()
+    print(f'  RAM  total={mem.total/2**30:.1f} GiB  available={mem.available/2**30:.1f} GiB')
+    print(f'  Physics: wavelength={WAVELENGTH} Å  max_alpha={MAX_ALPHA} mrad  dk={DK} Å⁻¹/px')
 
-    # Auto-estimate dk so BF disk ≈ 20% of detector area (radius ≈ 0.253*Ky)
-    if args.dk is None:
-        r_pixels = 0.253 * Ky   # gives N_bf ≈ π*r² ≈ 20% of detector
-        args.dk = (args.max_alpha / 1e3 / args.wavelength) / r_pixels
+    if args.file:
+        # Legacy single-file mode comparison
+        bench_single_file_modes(Path(args.file).expanduser(), args.lazy_mode, args.runs)
+        return
 
-    iy_bf, ix_bf, _ = _bf_pixels(Ky, Kx, args.max_alpha, args.wavelength, args.dk)
-    n_bf = len(iy_bf)
+    # ── Multi-file prefill benchmark ───────────────────────────────────────────
+    available = {k: v for k, v in FILES.items() if v.exists()}
+    missing   = {k: v for k, v in FILES.items() if not v.exists()}
+    if missing:
+        print(f'\n  Missing files (run tile_hdf5.py --chunk-layout detector to generate):')
+        for k, v in missing.items():
+            print(f'    {k}: {v.name}')
 
-    print("=" * 60)
-    print(f"File      : {args.file}")
-    print(f"Key       : {args.key}")
-    print(f"Shape     : {shape}  ({size_gb:.2f} GB)")
-    print(f"Chunks    : {chunks}  compression: {compression}")
-    print(f"max_alpha : {args.max_alpha} mrad   wavelength: {args.wavelength} Å")
-    print(f"dk        : {args.dk:.5f} Å⁻¹/pixel")
-    print(f"N_bf      : {n_bf} / {Ky * Kx} pixels  ({100*n_bf/(Ky*Kx):.1f}% of detector)")
-    print(f"Output    : ({n_bf}, {Ry}, {Rx}) float32  = {n_bf*Ry*Rx*4/1e6:.0f} MB")
-    print(f"chunk_size: {args.chunk_size}  runs: {args.runs}")
-    print("=" * 60)
+    # NVMe sequential read baseline
+    hdr('NVMe Sequential Read Baseline (512 MiB sample)')
+    for path in available.values():
+        if path.stat().st_size > 512 * 2**20:
+            gbs = measure_seq_read_speed(path)
+            print(f'  {gbs:.2f} GB/s  (from {path.name})')
+            break
 
-    # ---- Full-pass: all three lazy modes ----
-    # per_pixel is ~N_bf × 0.1s per call; extrapolate from a small sample.
-    lazy_modes = ['per_pixel', 'scan_row', 'slab']
-    fp_results = bench_full_pass(
-        args.file, args.key, iy_bf, ix_bf, lazy_modes, args.runs,
-        per_pixel_sample=50,
-    )
-    host_times = bench_host_full_pass(args.file, args.key, iy_bf, ix_bf, args.runs)
+    hdr('Prefill Benchmark: stream_all_bf_images vs stream_all_bf_images_per_pixel')
+    results: list[dict] = []
+    for name, path in available.items():
+        bench_prefill(name, path, results)
 
-    # ---- Chunked: per_pixel and slab (scan_row is impractical for small chunks) ----
-    print("\n  Note: scan_row reads the full dataset (~1 GB) per get_bf_chunk call,")
-    print("  so it is O(n_chunks)× worse than per_pixel for small chunk sizes.")
-    chunked_modes = ['per_pixel', 'slab']
-    bench_chunked(args.file, args.key, iy_bf, ix_bf, chunked_modes, args.chunk_size, args.runs)
+    # ── Summary table ──────────────────────────────────────────────────────────
+    hdr('Summary')
+    col = 28
+    print(f'  {"File":<{col}}  {"Strategy":>22}  {"I/O(GiB)":>9}  {"t(s)":>7}  {"GB/s":>7}')
+    print(f'  {"-"*col}  {"-"*22}  {"-"*9}  {"-"*7}  {"-"*7}')
+    for r in results:
+        print(f'  {r["file"]:<{col}}  {r["fn"]:>22}  '
+              f'{r["io_gib"]:>9.2f}  {r["elapsed_s"]:>7.2f}  {r["throughput_gbs"]:>7.2f}')
 
-    # ---- Summary ----
-    ky_range = int(iy_bf.max()) - int(iy_bf.min()) + 1
-    slab_mb = Ry * Rx * ky_range * Kx * 4 / 1e6
-    data_reads = {
-        'per_pixel': f"{n_bf * Ry * Rx * 4 / 1e6:.0f} MB (strided)",
-        'scan_row':  f"{size_gb * 1e3:.0f} MB (sequential)",
-        'slab':      f"{slab_mb:.0f} MB (1 hyperslab)",
-        'host':      f"{size_gb * 1e3:.0f} MB (sequential)",
-    }
-    notes = {
-        'per_pixel': f"~{n_bf} h5py calls, scatter-gather overhead",
-        'scan_row':  f"{Ry} h5py calls, contiguous 8 MB blocks",
-        'slab':      f"1 h5py call, ky-bbox slab ({ky_range}×{Kx} det)",
-        'host':      "full materialize, then RAM fancy-index",
-    }
-    all_modes = ['per_pixel', 'scan_row', 'slab', 'host']
-    all_times = {
-        'per_pixel': fp_results['per_pixel'][0],
-        'scan_row':  fp_results['scan_row'][0],
-        'slab':      fp_results['slab'][0],
-        'host':      host_times,
-    }
-    extrap_flag = {
-        'per_pixel': fp_results['per_pixel'][2],
-        'scan_row':  fp_results['scan_row'][2],
-        'slab':      fp_results['slab'][2],
-        'host':      False,
-    }
-
-    per_pix_best = min(all_times['per_pixel'])
-    print("\n" + "=" * 60)
-    print("SUMMARY — full_pass (single call, all N_bf pixels)")
-    print(f"  (per_pixel marked * is extrapolated from 50-pixel sample)")
-    print("=" * 60)
-    print(f"  {'strategy':<20}  {'best (s)':>10}  {'mean (s)':>10}  {'data_read':>20}  speedup vs per_pixel")
-    print(f"  {'-'*20}  {'-'*10}  {'-'*10}  {'-'*20}  {'-'*20}")
-    for m in all_modes:
-        t = all_times[m]
-        speedup = per_pix_best / min(t)
-        flag = "*" if extrap_flag[m] else " "
-        print(
-            f"  {m+flag:<21}  {min(t):>10.2f}  {np.mean(t):>10.2f}  "
-            f"{data_reads[m]:>20}  ×{speedup:.1f}  {notes[m]}"
-        )
-
-    from fast_acbf.data.dataset4d import Dataset4D
-    auto_ds = Dataset4D.from_hdf5(args.file, key=args.key, lazy_read_mode='auto')
-    auto_mode = auto_ds.lazy_read_mode
-    auto_ds.close()
-    print(f"\nauto-detected mode for this file: {auto_mode!r}  (chunks={chunks})")
-    print("=" * 60)
+    # Speedup summary for matching file sizes
+    print()
+    seen = set()
+    for r in results:
+        if r['strategy'] != 'per_pixel' or 'detector' not in r['file']:
+            continue
+        base = r['file'].replace('-detector-chunks', '-contiguous')
+        if base in seen:
+            continue
+        seq = next((x for x in results if x['file'] == base and x['strategy'] == 'sequential'), None)
+        if not seq:
+            continue
+        seen.add(base)
+        speedup = seq['elapsed_s'] / r['elapsed_s']
+        io_saved = seq['io_gib'] / r['io_gib']
+        print(f'  {base.split("-", 1)[0]}: detector-chunks+per_pixel  '
+              f'{speedup:.1f}× faster,  {io_saved:.0f}× less I/O  '
+              f'({r["throughput_gbs"]:.2f} vs {seq["throughput_gbs"]:.2f} GB/s)')
+    print()
 
 
 if __name__ == '__main__':
