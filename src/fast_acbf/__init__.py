@@ -4,7 +4,7 @@ from .optimization.metrics import QualityMetrics
 from .data.dataset4d import Dataset4D
 from .data.geometry import DetectorGeometry, ScanGeometry, CoordinateTransform
 
-__version__ = "0.2.0" # 2026.05.10
+__version__ = "0.3.0" # 2026.05.17
 
 __all__ = [
     "BFSolver",
