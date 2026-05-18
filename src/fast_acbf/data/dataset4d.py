@@ -283,6 +283,39 @@ class Dataset4D:
             out /= np.float32(self._norm_factor)
         return out
 
+    def stream_all_bf_images(
+        self, bf_iy: np.ndarray, bf_ix: np.ndarray
+    ) -> np.ndarray:
+        """Return (Nb, Ry, Rx) float32 for ALL requested BF pixels via one sequential pass.
+
+        Only available for lazy backends.  Reads the dataset one scan row at a
+        time (one contiguous h5py read per row) so that the full Ry*Rx access
+        pattern is satisfied with Ry sequential I/O calls rather than one
+        hyperslab call per BF-pixel chunk.
+
+        For contiguous C-order HDF5 storage, h5py's hyperslab reads span the
+        entire file extent when accessing data across many scan positions.
+        Streaming by scan row avoids this and gives Ry × (Rx*Ky*Kx*4) bytes of
+        sequential I/O instead — optimal for spinning disk and NVMe alike.
+
+        This method is intended for host-cache prefill, not for repeated on-the-fly
+        access.  Peak extra RAM = (Nb, Ry, Rx) float32 held by the caller.
+        """
+        if not self.is_lazy:
+            raise RuntimeError(
+                "stream_all_bf_images() is only available for lazy (disk-backed) Dataset4D. "
+                "For in-memory datasets use get_bf_chunk() directly."
+            )
+        Ry, Rx = self.scan_shape
+        Nb = len(bf_iy)
+        out = np.empty((Nb, Ry, Rx), dtype=np.float32)
+        for scan_y in range(Ry):
+            row = np.asarray(self._handle[scan_y, :, :, :], dtype=np.float32)
+            out[:, scan_y, :] = row[:, bf_iy, bf_ix].T
+        if self._norm_factor is not None:
+            out /= np.float32(self._norm_factor)
+        return out
+
     def _get_bf_chunk_slab(self, iy: np.ndarray, ix: np.ndarray) -> np.ndarray:
         """Ky bounding-box hyperslab: read handle[:,:,ky_min:ky_max,:] once.
 
@@ -309,12 +342,15 @@ class Dataset4D:
         """Inspect handle chunk layout and return the best lazy_read_mode.
 
         Rules:
-          - h5py chunks=None (contiguous C-order): 'slab' — each chunk call
-            reads a small ky bounding-box (~2 rows for sorted BF pixels),
-            minimises h5py call count while keeping per-call I/O tiny.
-            scan_row is 2× faster for single full-pass calls but requires
-            all N_bf pixels in one call; slab is better for the chunked
-            reconstruction loop.
+          - h5py chunks=None (contiguous C-order):
+              Small scan (Ry*Rx ≤ 65 536 positions): 'slab' — one HDF5 call per
+                chunk reads a ky bounding-box that spans only a few rows.
+              Large scan (Ry*Rx > 65 536): 'scan_row' — for contiguous files,
+                h5py's hyperslab implementation issues O(Ry*Rx) individual
+                pread() calls whose aggregate latency (even on NVMe) dominates
+                bandwidth.  Sequential scan-row reads avoid this completely.
+                Note: the reconstruction hot path uses ImageFFTProvider's host
+                cache prefill (one sequential pass, not one slab per chunk).
           - Detector-major chunks (c2==1 and c3==1): 'per_pixel' — each
             (ky,kx) pixel is its own decompression unit.
           - Scan-major chunks (c0==1 and c1==1): 'scan_row' — each diffraction
@@ -326,7 +362,12 @@ class Dataset4D:
         # zarr.Array exposes chunks as a tuple (always chunked).
         chunks = getattr(handle, 'chunks', None)
         if chunks is None:
-            # h5py contiguous — adaptive ky-slab is best for chunked access
+            # h5py contiguous storage.  For large scans, h5py's slab read
+            # issues one pread() per scan position whose latency overhead
+            # (Ry*Rx × ~100 µs) vastly exceeds sequential scan_row I/O.
+            Ry, Rx = int(handle.shape[0]), int(handle.shape[1])
+            if Ry * Rx > 65_536:   # > 256×256 equivalent
+                return 'scan_row'
             return 'slab'
         c0, c1, c2, c3 = chunks
         if c2 == 1 and c3 == 1:
@@ -349,7 +390,7 @@ class Dataset4D:
 
         On success: self._array is populated as a contiguous float32 ndarray in host RAM,
         self._handle is cleared, and is_lazy becomes False.
-        On MemoryError: raises RuntimeError with dataset size and cache_mode suggestions.
+        On insufficient RAM: raises RuntimeError before any allocation attempt.
 
         If _norm_factor is already set (lazy-normalized dataset), the loaded array is
         divided by _norm_factor so the in-memory invariant holds. The load reads
@@ -358,13 +399,31 @@ class Dataset4D:
         if not self.is_lazy:
             return self._array
         shape = self._handle.shape  # (Ry, Rx, Ky, Kx)
-        size_gb = (shape[0] * shape[1] * shape[2] * shape[3] * 4) / (1024 ** 3)
+        size_bytes = shape[0] * shape[1] * shape[2] * shape[3] * 4
+        size_gib = size_bytes / 2**30
+        # Proactively check available RAM before attempting the allocation.
+        # On Linux, malloc may overcommit and succeed even without enough physical
+        # memory, causing the OOM killer to terminate the process instead of raising
+        # MemoryError. Checking upfront gives a clean error message.
+        try:
+            import psutil
+            available = psutil.virtual_memory().available
+            if size_bytes > available:
+                raise RuntimeError(
+                    f"Cannot materialize disk-backed Dataset4D into RAM: "
+                    f"dataset shape {shape} requires {size_gib:.2f} GiB as float32, "
+                    f"but only {available / 2**30:.2f} GiB is available. "
+                    "Use cache_mode='host' to cache FFTs incrementally in RAM, "
+                    "or cache_mode='on_the_fly' to avoid caching entirely."
+                )
+        except ImportError:
+            pass  # psutil unavailable; fall through and let MemoryError surface
         try:
             arr = np.asarray(self._handle[:], dtype=np.float32)
         except MemoryError:
             raise RuntimeError(
                 f"Cannot materialize disk-backed Dataset4D into RAM: "
-                f"dataset shape {shape} requires {size_gb:.2f} GB as float32. "
+                f"dataset shape {shape} requires {size_gib:.2f} GiB as float32. "
                 f"Use cache_mode='host' to cache FFTs incrementally in RAM, "
                 f"or cache_mode='on_the_fly' to avoid caching entirely."
             )

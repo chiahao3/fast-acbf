@@ -62,7 +62,27 @@ class ImageFFTProvider:
             return self._resolve_auto()
         if mode == 'device' and self.dataset.is_lazy:
             self.dataset._force_materialize()
+        if mode == 'host':
+            self._check_host_cache_fits()
         return mode
+
+    def _check_host_cache_fits(self) -> None:
+        """Warn if the host cache allocation is likely to exceed available RAM."""
+        Ry, Rx = self.scan_shape
+        cache_bytes = self.nb * Ry * Rx * 8  # (Nb, Ry, Rx) complex64
+        try:
+            import psutil
+            available = psutil.virtual_memory().available
+            if cache_bytes > available:
+                raise RuntimeError(
+                    f"cache_mode='host' would allocate {cache_bytes / 2**30:.1f} GiB for the FFT "
+                    f"cache ({self.nb} BF pixels × {Ry}×{Rx} scan × 8 B), but only "
+                    f"{available / 2**30:.1f} GiB RAM is available. "
+                    "Use cache_mode='on_the_fly' to stream without caching, or reduce the "
+                    "scan area (scan_roi) or aperture (max_alpha) to shrink the cache."
+                )
+        except ImportError:
+            pass  # psutil unavailable — let the allocation fail naturally
 
     def _resolve_auto(self) -> str:
         Ry, Rx = self.scan_shape
@@ -127,9 +147,17 @@ class ImageFFTProvider:
             Ry, Rx = self.scan_shape
             self._host_cache = np.empty((self.nb, Ry, Rx), dtype=np.complex64)
             self._host_filled = np.zeros(self.nb, dtype=bool)
+            if self.dataset.is_lazy:
+                # For lazy backends, fill the entire cache in ONE sequential
+                # scan-row pass instead of one call per chunk.  Chunk-by-chunk
+                # filling with slab/per_pixel on a contiguous HDF5 file causes
+                # h5py to issue one hyperslab read spanning the full file extent
+                # per chunk — O(n_chunks) full-file reads instead of O(1).
+                self._prefill_host_cache_sequential(dev)
 
         unfilled = ~self._host_filled[b_start:b_end]
         if unfilled.any():
+            # Handles non-lazy datasets and any entries not covered by prefill.
             unfilled_local = np.where(unfilled)[0]
             iy_batch = self._bf_iy[b_start + unfilled_local]
             ix_batch = self._bf_ix[b_start + unfilled_local]
@@ -142,6 +170,31 @@ class ImageFFTProvider:
 
         chunk_np = self._host_cache[b_start:b_end].copy()
         return torch.from_numpy(chunk_np).to(dev)
+
+    def _prefill_host_cache_sequential(self, dev: torch.device) -> None:
+        """Fill the entire host FFT cache via one sequential scan-row streaming pass.
+
+        Reads the lazy dataset one scan row at a time (one contiguous h5py I/O
+        call per row = Ry sequential reads), extracts all BF pixels from each
+        row, accumulates a raw (Nb, Ry, Rx) float32 buffer, then batch-FFTs on
+        the GPU in chunks of 64 and stores the results in the host cache.
+
+        Peak extra RAM: (Nb, Ry, Rx) float32 ≈ 1.5 GiB for a 1024×1024 scan
+        with Nb=520 BF pixels.  Freed before returning.
+        """
+        Ry, Rx = self.scan_shape
+        bf_iy, bf_ix = self._bf_iy, self._bf_ix
+        raw_buf = self.dataset.stream_all_bf_images(bf_iy, bf_ix)   # (Nb, Ry, Rx) f32
+
+        chunk_size = 64
+        for b in range(0, self.nb, chunk_size):
+            b_end = min(b + chunk_size, self.nb)
+            fft = torch.fft.fft2(
+                torch.from_numpy(raw_buf[b:b_end]).to(dev), dim=(-2, -1)
+            )
+            self._host_cache[b:b_end] = fft.cpu().numpy()
+            self._host_filled[b:b_end] = True
+        del raw_buf
 
     def clear_cache(self) -> None:
         self._device_cache = None
