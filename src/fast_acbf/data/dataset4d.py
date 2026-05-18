@@ -374,15 +374,11 @@ class Dataset4D:
         """Inspect handle chunk layout and return the best lazy_read_mode.
 
         Rules:
-          - h5py chunks=None (contiguous C-order):
-              Small scan (Ry*Rx ≤ 65 536 positions): 'slab' — one HDF5 call per
-                chunk reads a ky bounding-box that spans only a few rows.
-              Large scan (Ry*Rx > 65 536): 'scan_row' — for contiguous files,
-                h5py's hyperslab implementation issues O(Ry*Rx) individual
-                pread() calls whose aggregate latency (even on NVMe) dominates
-                bandwidth.  Sequential scan-row reads avoid this completely.
-                Note: the reconstruction hot path uses ImageFFTProvider's host
-                cache prefill (one sequential pass, not one slab per chunk).
+          - h5py chunks=None (contiguous C-order): 'slab' — reads only the
+              ky bounding box per chunk call.  Host-cache prefill already uses
+              stream_all_bf_images() (scan_row strategy) regardless of this
+              setting; 'slab' avoids reading the full file per chunk in
+              on_the_fly mode.
           - Detector-major chunks (c2==1 and c3==1): 'per_pixel' — each
             (ky,kx) pixel is its own decompression unit.
           - Scan-major chunks (c0==1 and c1==1): 'scan_row' — each diffraction
@@ -394,12 +390,10 @@ class Dataset4D:
         # zarr.Array exposes chunks as a tuple (always chunked).
         chunks = getattr(handle, 'chunks', None)
         if chunks is None:
-            # h5py contiguous storage.  For large scans, h5py's slab read
-            # issues one pread() per scan position whose latency overhead
-            # (Ry*Rx × ~100 µs) vastly exceeds sequential scan_row I/O.
-            Ry, Rx = int(handle.shape[0]), int(handle.shape[1])
-            if Ry * Rx > 65_536:   # > 256×256 equivalent
-                return 'scan_row'
+            # h5py contiguous storage.  Host-cache prefill calls
+            # stream_all_bf_images() which reads scan_row regardless of this
+            # setting.  'slab' is better for on_the_fly: reads only the ky
+            # bounding box per chunk, not the full file extent.
             return 'slab'
         c0, c1, c2, c3 = chunks
         if c2 == 1 and c3 == 1:

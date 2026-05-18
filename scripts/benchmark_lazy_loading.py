@@ -68,8 +68,11 @@ def hdr(title: str) -> None:
 
 def get_bf_indices(ds) -> tuple[np.ndarray, np.ndarray]:
     from fast_acbf.data.geometry import DetectorGeometry
-    Ky, Kx = ds.detector_shape
-    geom = DetectorGeometry(Ky=Ky, Kx=Kx, max_alpha=MAX_ALPHA, dk=DK, wavelength=WAVELENGTH)
+    geom = DetectorGeometry.from_params(
+        detector_shape=ds.detector_shape,
+        max_alpha=MAX_ALPHA, dk=DK, wavelength=WAVELENGTH,
+        device='cpu',
+    )
     bf_iy, bf_ix = np.where(geom.bf_mask_bool)
     return bf_iy, bf_ix
 
@@ -182,7 +185,7 @@ def bench_single_file_modes(path: Path, modes: list[str], runs: int) -> None:
     for mode in modes:
         ds = Dataset4D.from_hdf5(path, key=HDF5_KEY, lazy_read_mode=mode, materialize=False)
         times = []
-        for r in range(runs):
+        for _ in range(runs):
             gc.collect()
             t0 = time.perf_counter()
             raw = ds.get_bf_chunk(bf_iy, bf_ix)
