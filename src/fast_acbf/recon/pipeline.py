@@ -55,6 +55,7 @@ class PipelineManager:
         fft_batch_size: int = 64,
         vram_margin: float = 0.60,
         ram_margin: float = 0.80,
+        pad_width: int | None = None,
     ) -> None:
         self.dataset = dataset
         self.detector_geom = detector_geom
@@ -70,9 +71,21 @@ class PipelineManager:
         self.fft_batch_size = int(fft_batch_size)
         self.vram_margin = float(vram_margin)
         self.ram_margin = float(ram_margin)
+        self.pad_width = int(pad_width) if (pad_width is not None and pad_width > 0) else None
+
+        # Compute padded scan shape for memory estimates before _resolve()
+        if self.pad_width is not None:
+            from fast_acbf.data.bf_preparer import _compute_pad_for_axis
+            Ry, Rx = dataset.scan_shape
+            Ry_p, _, _ = _compute_pad_for_axis(Ry, self.pad_width)
+            Rx_p, _, _ = _compute_pad_for_axis(Rx, self.pad_width)
+            self._effective_scan_shape = (Ry_p, Rx_p)
+        else:
+            self._effective_scan_shape = None
 
         self.resolution = self._resolve()
         self.extractor: BFExtractor | None = None
+        self.preparer = None  # BFPreparer | None
         self.imagefft: ImageFFT | None = None
 
     @staticmethod
@@ -88,7 +101,7 @@ class PipelineManager:
 
     @property
     def vbf_bytes(self) -> int:
-        Ry, Rx = self.dataset.scan_shape
+        Ry, Rx = self._effective_scan_shape or self.dataset.scan_shape
         return int(self.nb * Ry * Rx * 4)
 
     @property
@@ -102,8 +115,15 @@ class PipelineManager:
             device=self.device,
             strategy=self.resolution.extractor_strategy,
         )
+        if self.pad_width is not None:
+            from fast_acbf.data.bf_preparer import BFPreparer
+            self.preparer = BFPreparer(self.extractor, self.pad_width)
+            provider = self.preparer
+        else:
+            self.preparer = None
+            provider = self.extractor
         self.imagefft = ImageFFT(
-            self.extractor,
+            provider,
             device=self.device,
             storage=self.resolution.imagefft_storage,
             fill=self.resolution.imagefft_fill,

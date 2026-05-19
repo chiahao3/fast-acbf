@@ -33,6 +33,22 @@ from fast_acbf.recon.cache import (
 _VALID_BASIS_MODES = ('on_the_fly', 'precompute')
 
 
+def _crop_to_original(
+    image: torch.Tensor,
+    pad_offsets: tuple[int, int],
+    orig_shape: tuple[int, int],
+    upscale: float,
+) -> torch.Tensor:
+    """Crop an upscaled padded image back to the original FOV."""
+    pad_y, pad_x = pad_offsets
+    Ry, Rx = orig_shape
+    y0 = round(pad_y * upscale)
+    y1 = y0 + round(Ry * upscale)
+    x0 = round(pad_x * upscale)
+    x1 = x0 + round(Rx * upscale)
+    return image[y0:y1, x0:x1]
+
+
 class BFReconstructor:
     """BF-specific optimizable model.
 
@@ -48,6 +64,9 @@ class BFReconstructor:
         coord_transform: CoordinateTransform,
         basis_mode: str = 'on_the_fly',
         eps: float = 1e-3,
+        orig_scan_shape: tuple[int, int] | None = None,
+        pad_offsets: tuple[int, int] | None = None,
+        fov: str = 'original',
     ) -> None:
         self.imagefft = imagefft
         self.detector_geom = detector_geom
@@ -55,6 +74,9 @@ class BFReconstructor:
         self.ab_state = ab_state
         self.coord_transform = coord_transform
         self.eps = eps
+        self._orig_scan_shape = orig_scan_shape
+        self._pad_offsets = pad_offsets
+        self._fov = str(fov)
         self._tcbf_cache: dict[tuple, TCBFCache] = {}
         self._acbf_cache: dict[tuple, tuple[ACBFGeometryCache, ACBFOpticsCache | None]] = {}
         self.basis_mode = basis_mode  # validated via property setter (accesses _acbf_cache)
@@ -169,55 +191,78 @@ class BFReconstructor:
     # ------------------------------------------------------------------
 
     @staticmethod
-    def _validate_upscale(upscale: int) -> None:
-        if upscale != 1:
-            raise NotImplementedError(
-                "upscale is not supported in v2. Use upscale=1."
-            )
-
-    @staticmethod
     def _normalize_acbf_algorithm(acbf_algorithm) -> str:
         if acbf_algorithm is None:
             return 'phase_only'
         return str(acbf_algorithm).strip().lower().replace('-', '_')
 
-    def _reconstruct_impl(self, mode: str = 'tcBF', **kwargs) -> torch.Tensor:
-        mode_key = mode.lower()
+    def _get_recon_grids(self, upscale: float) -> tuple[torch.Tensor, torch.Tensor]:
+        """Return (qx_grid, qy_grid) for the given upscale factor."""
         sg = self.scan_geom
+        if upscale == 1.0:
+            return sg.qx_grid, sg.qy_grid
+        Ry_p, Rx_p = sg.scan_shape
+        step = sg.scan_step_size
+        Ry_out = round(Ry_p * upscale)
+        Rx_out = round(Rx_p * upscale)
+        dev = torch.device(self.device)
+        # d = step * Rx_p / Rx_out ensures same low-frequency bin spacing as padded grid
+        qx = torch.fft.fftfreq(Rx_out, d=step * Rx_p / Rx_out, device=dev).view(1, 1, Rx_out)
+        qy = torch.fft.fftfreq(Ry_out, d=step * Ry_p / Ry_out, device=dev).view(1, Ry_out, 1)
+        return qx, qy
+
+    def _reconstruct_impl(self, mode: str = 'tcBF', **kwargs) -> torch.Tensor:
+        upscale = float(kwargs.get('upscale', 1.0))
+        fov = str(kwargs.get('fov', self._fov))
+        if upscale < 1.0:
+            raise ValueError(f"upscale must be >= 1.0, got {upscale}.")
+
+        qx_grid, qy_grid = self._get_recon_grids(upscale)
         coeffs = self._get_scan_frame_coeffs()
+        mode_key = mode.lower()
 
         if mode_key == 'tcbf':
-            self._validate_upscale(kwargs.get('upscale', 1))
             cache = self._get_tcbf_cache(chunk_size=kwargs.get('chunk_size', 64))
-            return reconstruct_tcbf(
-                self.imagefft, sg.qx_grid, sg.qy_grid, cache, coeffs, self.device,
+            result = reconstruct_tcbf(
+                self.imagefft, qx_grid, qy_grid, cache, coeffs, self.device,
+                upscale=upscale,
             )
 
-        if mode_key == 'acbf':
-            self._validate_upscale(kwargs.get('upscale', 1))
+        elif mode_key == 'acbf':
             rolloff = kwargs.get('rolloff', 0)
             chunk_size = kwargs.get('chunk_size', 64)
             acbf_algorithm = self._normalize_acbf_algorithm(kwargs.get('acbf_algorithm'))
             geometry, optics = self._get_acbf_cache(rolloff=rolloff, chunk_size=chunk_size)
+            if upscale != 1.0:
+                optics = None  # precomputed optics are wrong size; use lazy path
 
             if acbf_algorithm == 'phase_only':
-                return reconstruct_acbf(
-                    self.imagefft, sg.qx_grid, sg.qy_grid, geometry, optics,
-                    coeffs, self.eps, self.device,
+                result = reconstruct_acbf(
+                    self.imagefft, qx_grid, qy_grid, geometry, optics,
+                    coeffs, self.eps, self.device, upscale=upscale,
                 )
-            if acbf_algorithm == 'complex_inversion':
-                return reconstruct_acbf_complex_inversion(
-                    self.imagefft, sg.qx_grid, sg.qy_grid, geometry, optics,
+            elif acbf_algorithm == 'complex_inversion':
+                result = reconstruct_acbf_complex_inversion(
+                    self.imagefft, qx_grid, qy_grid, geometry, optics,
                     coeffs, self.device,
                     regularization=kwargs.get('regularization', 1e-3),
                     support_threshold=kwargs.get('support_threshold', 1e-6),
+                    upscale=upscale,
                 )
-            raise ValueError(
-                f"Unsupported acBF algorithm {acbf_algorithm!r}. "
-                "Choose 'phase_only' or 'complex_inversion'."
-            )
+            else:
+                raise ValueError(
+                    f"Unsupported acBF algorithm {acbf_algorithm!r}. "
+                    "Choose 'phase_only' or 'complex_inversion'."
+                )
 
-        raise ValueError(f"Unsupported mode {mode!r}. Choose 'tcBF' or 'acBF'.")
+        else:
+            raise ValueError(f"Unsupported mode {mode!r}. Choose 'tcBF' or 'acBF'.")
+
+        # fov crop — only when padding was used
+        if self._pad_offsets is not None and fov == 'original':
+            result = _crop_to_original(result, self._pad_offsets, self._orig_scan_shape, upscale)
+
+        return result
 
     def reconstruct(self, mode: str = 'tcBF', requires_grad: bool = False, **kwargs) -> torch.Tensor:
         """Run reconstruction. No-grad by default; opt-in for AD optimization paths."""
