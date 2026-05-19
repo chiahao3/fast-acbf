@@ -31,6 +31,7 @@ from fast_acbf.recon.cache import (
 )
 
 _VALID_BASIS_MODES = ('on_the_fly', 'precompute')
+_VALID_FOV = ('original', 'full')
 
 
 def _crop_to_original(
@@ -76,7 +77,10 @@ class BFReconstructor:
         self.eps = eps
         self._orig_scan_shape = orig_scan_shape
         self._pad_offsets = pad_offsets
-        self._fov = str(fov)
+        fov_str = str(fov)
+        if fov_str not in _VALID_FOV:
+            raise ValueError(f"fov must be one of {_VALID_FOV}, got {fov_str!r}.")
+        self._fov = fov_str
         self._tcbf_cache: dict[tuple, TCBFCache] = {}
         self._acbf_cache: dict[tuple, tuple[ACBFGeometryCache, ACBFOpticsCache | None]] = {}
         self.basis_mode = basis_mode  # validated via property setter (accesses _acbf_cache)
@@ -214,6 +218,8 @@ class BFReconstructor:
     def _reconstruct_impl(self, mode: str = 'tcBF', **kwargs) -> torch.Tensor:
         upscale = float(kwargs.get('upscale', 1.0))
         fov = str(kwargs.get('fov', self._fov))
+        if fov not in _VALID_FOV:
+            raise ValueError(f"fov must be one of {_VALID_FOV}, got {fov!r}.")
         if upscale < 1.0:
             raise ValueError(f"upscale must be >= 1.0, got {upscale}.")
 

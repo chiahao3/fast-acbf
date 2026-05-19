@@ -21,7 +21,7 @@ from fast_acbf.core.functional import generate_aberration_basis, generate_shift_
 from fast_acbf.data.dataset4d import Dataset4D
 from fast_acbf.data.geometry import CoordinateTransform, DetectorGeometry, ScanGeometry
 from fast_acbf.recon.pipeline import PipelineManager
-from fast_acbf.recon.reconstructor import BFReconstructor, _crop_to_original
+from fast_acbf.recon.reconstructor import BFReconstructor, _crop_to_original, _VALID_FOV
 
 logger = logging.getLogger(__name__)
 
@@ -116,6 +116,8 @@ class BFSolver:
     ) -> None:
         if aberrations is None:
             aberrations = {}
+        if str(fov) not in _VALID_FOV:
+            raise ValueError(f"fov must be one of {_VALID_FOV}, got {fov!r}.")
 
         # Dispatch → Dataset4D
         if isinstance(dataset, Dataset4D):
@@ -292,6 +294,24 @@ class BFSolver:
     @property
     def eps(self) -> float:
         return self._recon.eps
+
+    @property
+    def pad_width(self) -> int | None:
+        return self._pipeline_manager.pad_width
+
+    @property
+    def padded_scan_shape(self) -> tuple[int, int]:
+        """Scan shape after mirror-padding, or original shape when pad_width is None."""
+        p = self._pipeline_manager.preparer
+        return p.padded_shape if p is not None else self._orig_scan_shape
+
+    @property
+    def fov(self) -> str:
+        return self._fov
+
+    @property
+    def upscale(self) -> float:
+        return self._upscale
 
     @property
     def pipeline(self) -> str:
@@ -545,6 +565,8 @@ class BFSolver:
     def get_acBF_diagnostics(self, upscale=None, fov=None, **kwargs) -> dict:
         u = upscale if upscale is not None else self._upscale
         f = fov if fov is not None else self._fov
+        if f not in _VALID_FOV:
+            raise ValueError(f"fov must be one of {_VALID_FOV}, got {f!r}.")
         rolloff = kwargs.get('rolloff', 0)
         chunk_size = kwargs.get('chunk_size', 64)
         with torch.no_grad():

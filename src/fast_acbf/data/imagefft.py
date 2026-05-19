@@ -20,13 +20,14 @@ def _fft_zero_pad_2d(F_in: torch.Tensor, Ry_out: int, Rx_out: int) -> torch.Tens
     """
     Ry_in, Rx_in = F_in.shape[-2], F_in.shape[-1]
     F_c = torch.fft.fftshift(F_in, dim=(-2, -1))
-    pad_y = Ry_out - Ry_in
-    pad_x = Rx_out - Rx_in
-    # F.pad pads last dims first: (left, right, top, bottom)
-    F_c_padded = F.pad(
-        F_c,
-        (pad_x // 2, pad_x - pad_x // 2, pad_y // 2, pad_y - pad_y // 2),
-    )
+    # Left pad = Nout//2 - Nin//2 so DC (at Nin//2 after fftshift) lands at Nout//2.
+    # This is correct for both even and odd sizes; pad_total//2 only works for even Nin.
+    pad_y_left = Ry_out // 2 - Ry_in // 2
+    pad_x_left = Rx_out // 2 - Rx_in // 2
+    pad_y_right = Ry_out - Ry_in - pad_y_left
+    pad_x_right = Rx_out - Rx_in - pad_x_left
+    # F.pad pads last dims first: (x_left, x_right, y_left, y_right)
+    F_c_padded = F.pad(F_c, (pad_x_left, pad_x_right, pad_y_left, pad_y_right))
     out = torch.fft.ifftshift(F_c_padded, dim=(-2, -1))
     return out * ((Ry_out * Rx_out) / (Ry_in * Rx_in))
 

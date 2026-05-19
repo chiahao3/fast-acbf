@@ -82,6 +82,15 @@ class BFPreparer:
             )
         Ry_p, pad_top, pad_bottom = _compute_pad_for_axis(Ry, pad_width)
         Rx_p, pad_left, pad_right = _compute_pad_for_axis(Rx, pad_width)
+        # Reflect padding requires each pad < the axis size (PyTorch constraint).
+        # 5-smooth rounding can push the actual pad above pad_width, so check post-compute.
+        if max(pad_top, pad_bottom) >= Ry or max(pad_left, pad_right) >= Rx:
+            raise ValueError(
+                f"Effective padding after 5-smooth rounding "
+                f"(top={pad_top}, bottom={pad_bottom}, left={pad_left}, right={pad_right}) "
+                f"equals or exceeds input dimension (Ry={Ry}, Rx={Rx}). "
+                f"Reduce pad_width."
+            )
 
         self._extractor = extractor
         self.orig_shape = (Ry, Rx)

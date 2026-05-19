@@ -71,7 +71,9 @@ class PipelineManager:
         self.fft_batch_size = int(fft_batch_size)
         self.vram_margin = float(vram_margin)
         self.ram_margin = float(ram_margin)
-        self.pad_width = int(pad_width) if (pad_width is not None and pad_width > 0) else None
+        if pad_width is not None and int(pad_width) < 0:
+            raise ValueError(f"pad_width must be non-negative, got {pad_width}.")
+        self.pad_width = int(pad_width) if (pad_width is not None and int(pad_width) > 0) else None
 
         # Compute padded scan shape for memory estimates before _resolve()
         if self.pad_width is not None:
