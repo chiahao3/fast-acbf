@@ -113,6 +113,7 @@ def build_solver(dataset: np.ndarray, geom: common.DetectorGeometry, args: argpa
         max_order=args.max_order,
         aberrations={"C10": 0.0},
         device=args.device,
+        pipeline=args.pipeline,
         imagefft_storage=args.imagefft_storage,
     )
 
@@ -153,6 +154,7 @@ def benchmark_case(args: argparse.Namespace) -> dict:
 
     result = {
         "recon_mode": recon_mode,
+        "pipeline": args.pipeline,
         "imagefft_storage": args.imagefft_storage,
         "requested_nb": int(args.nb),
         "actual_nb": int(vbf_host.shape[0]),
@@ -191,7 +193,10 @@ def benchmark_case(args: argparse.Namespace) -> dict:
             if device == "cuda":
                 torch.cuda.empty_cache()
             elapsed, solver = timed_call(lambda: build_solver(dataset, geom, args, BFSolver), device)
-            result["actual_nb"] = int(solver.vbf_images.shape[0])
+            result["actual_nb"] = int(solver._recon.imagefft.nb)
+            result["resolved_imagefft_storage"] = solver.imagefft_storage
+            result["imagefft_fill"] = solver.imagefft_fill
+            result["extractor_strategy"] = solver.extractor_strategy
             init_times.append(elapsed)
             del solver
             if device == "cuda":
@@ -203,7 +208,10 @@ def benchmark_case(args: argparse.Namespace) -> dict:
             torch.cuda.empty_cache()
             torch.cuda.reset_peak_memory_stats()
         _, solver = timed_call(lambda: build_solver(dataset, geom, args, BFSolver), device)
-        result["actual_nb"] = int(solver.vbf_images.shape[0])
+        result["actual_nb"] = int(solver._recon.imagefft.nb)
+        result["resolved_imagefft_storage"] = solver.imagefft_storage
+        result["imagefft_fill"] = solver.imagefft_fill
+        result["extractor_strategy"] = solver.extractor_strategy
 
         cold_elapsed, image = timed_call(
             lambda: run_reconstruct(solver, recon_mode, args.chunk_size),
@@ -271,6 +279,7 @@ def load_existing(path: Path) -> dict[tuple, dict]:
 def result_key(row: dict) -> tuple:
     return (
         common.normalize_recon_mode(row.get("recon_mode")),
+        row.get("pipeline", "balanced"),
         row.get("imagefft_storage"),
         int(row.get("requested_nb")),
         int(row.get("ry")),
@@ -293,6 +302,8 @@ def run_child_case(script: Path, args: argparse.Namespace, case: dict) -> dict:
         args.device,
         "--recon-mode",
         case["recon_mode"],
+        "--pipeline",
+        case["pipeline"],
         "--imagefft-storage",
         case["imagefft_storage"],
         "--nb",
@@ -333,6 +344,7 @@ def run_child_case(script: Path, args: argparse.Namespace, case: dict) -> dict:
     except subprocess.TimeoutExpired as exc:
         return {
             "recon_mode": case["recon_mode"],
+            "pipeline": case["pipeline"],
             "imagefft_storage": case["imagefft_storage"],
             "requested_nb": case["nb"],
             "ry": case["scan"],
@@ -351,6 +363,7 @@ def run_child_case(script: Path, args: argparse.Namespace, case: dict) -> dict:
 
     return {
         "recon_mode": case["recon_mode"],
+        "pipeline": case["pipeline"],
         "imagefft_storage": case["imagefft_storage"],
         "requested_nb": case["nb"],
         "ry": case["scan"],
@@ -366,7 +379,11 @@ def write_csv(path: Path, rows: list[dict]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     fields = [
         "recon_mode",
+        "pipeline",
         "imagefft_storage",
+        "resolved_imagefft_storage",
+        "imagefft_fill",
+        "extractor_strategy",
         "requested_nb",
         "actual_nb",
         "ry",
@@ -415,6 +432,7 @@ def write_markdown(path: Path, rows: list[dict]) -> None:
         rows,
         key=lambda r: (
             str(r.get("recon_mode")),
+            str(r.get("pipeline", "balanced")),
             str(r.get("imagefft_storage")),
             int(r.get("max_order", 0)),
             int(r.get("ry", 0)),
@@ -437,13 +455,14 @@ def write_markdown(path: Path, rows: list[dict]) -> None:
 
         f.write("## Full Results\n\n")
         f.write(
-            "| recon | cache | max_order | scan | Nb req | Nb actual | status | "
+            "| recon | pipeline | cache | max_order | scan | Nb req | Nb actual | status | "
             "raw H2D s | vBF H2D s | init s | cold recon s | warm recon s |\n"
         )
-        f.write("|---|---|---:|---:|---:|---:|---|---:|---:|---:|---:|---:|\n")
+        f.write("|---|---|---|---:|---:|---:|---:|---|---:|---:|---:|---:|---:|\n")
         for row in rows:
             f.write(
-                f"| {row.get('recon_mode')} | {row.get('imagefft_storage')} | "
+                f"| {row.get('recon_mode')} | {row.get('pipeline', 'balanced')} | "
+                f"{row.get('imagefft_storage')} | "
                 f"{row.get('max_order')} | {row.get('ry')} | "
                 f"{row.get('requested_nb')} | {row.get('actual_nb', '')} | "
                 f"{row.get('status')} | "
@@ -515,6 +534,7 @@ def find_row(rows, recon_mode, imagefft_storage, max_order, scan, requested_nb):
     for row in rows:
         if (
             row.get("recon_mode") == recon_mode
+            and row.get("pipeline", "balanced") == "balanced"
             and row.get("imagefft_storage") == imagefft_storage
             and int(row.get("max_order", -1)) == max_order
             and int(row.get("ry", -1)) == scan
@@ -529,6 +549,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--single-json", action="store_true")
     parser.add_argument("--device", default="cuda", choices=("cuda", "cpu"))
     parser.add_argument("--recon-mode", choices=common.DEFAULT_RECON_MODES, default="acbf")
+    parser.add_argument("--pipeline", choices=common.DEFAULT_PIPELINES, default="balanced")
     parser.add_argument(
         "--imagefft-storage", choices=common.DEFAULT_IMAGEFFT_STORAGES, default="none"
     )
@@ -585,6 +606,7 @@ def main(argv: list[str] | None = None) -> int:
     cases = [
         {
             "recon_mode": recon_mode,
+            "pipeline": args.pipeline,
             "imagefft_storage": imagefft_storage,
             "nb": nb,
             "scan": scan,
@@ -601,6 +623,7 @@ def main(argv: list[str] | None = None) -> int:
     for index, case in enumerate(cases, start=1):
         key = (
             case["recon_mode"],
+            case["pipeline"],
             case["imagefft_storage"],
             case["nb"],
             case["scan"],

@@ -26,6 +26,7 @@ DEFAULT_NB = (512, 1024, 2048, 4096)
 DEFAULT_SCAN = (64, 128, 256)
 DEFAULT_MAX_ORDER = (1, 2, 3, 4)
 DEFAULT_IMAGEFFT_STORAGES = ("none", "host", "device")
+DEFAULT_PIPELINES = ("speed", "balanced", "memory")
 DEFAULT_RECON_MODES = ("acbf", "tcbf")
 DEFAULT_WAVELENGTH = 0.04176
 DEFAULT_DK = 0.01
@@ -156,6 +157,7 @@ def benchmark_case(args: argparse.Namespace) -> dict:
         "ry": int(args.ry),
         "rx": int(args.rx),
         "max_order": int(args.max_order),
+        "pipeline": args.pipeline,
         "imagefft_storage": args.imagefft_storage,
         "recon_mode": normalize_recon_mode(args.recon_mode),
         "chunk_size": int(args.chunk_size),
@@ -192,9 +194,13 @@ def benchmark_case(args: argparse.Namespace) -> dict:
             max_order=args.max_order,
             aberrations={"C10": 0.0},
             device=device,
+            pipeline=args.pipeline,
             imagefft_storage=args.imagefft_storage,
         )
-        result["actual_nb"] = int(solver.vbf_images.shape[0])
+        result["actual_nb"] = int(solver._recon.imagefft.nb)
+        result["resolved_imagefft_storage"] = solver.imagefft_storage
+        result["imagefft_fill"] = solver.imagefft_fill
+        result["extractor_strategy"] = solver.extractor_strategy
         if result["recon_mode"] == "acbf":
             image = solver.get_acBF(chunk_size=args.chunk_size)
         elif result["recon_mode"] == "tcbf":
@@ -244,6 +250,8 @@ def run_child_case(script: Path, args: argparse.Namespace, case: dict) -> dict:
         str(case["scan"]),
         "--max-order",
         str(case["max_order"]),
+        "--pipeline",
+        case["pipeline"],
         "--imagefft-storage",
         case["imagefft_storage"],
         "--recon-mode",
@@ -274,6 +282,7 @@ def run_child_case(script: Path, args: argparse.Namespace, case: dict) -> dict:
             "ry": case["scan"],
             "rx": case["scan"],
             "max_order": case["max_order"],
+            "pipeline": case["pipeline"],
             "imagefft_storage": case["imagefft_storage"],
             "recon_mode": case["recon_mode"],
             "status": "timeout",
@@ -294,6 +303,7 @@ def run_child_case(script: Path, args: argparse.Namespace, case: dict) -> dict:
         "ry": case["scan"],
         "rx": case["scan"],
         "max_order": case["max_order"],
+        "pipeline": case["pipeline"],
         "imagefft_storage": case["imagefft_storage"],
         "recon_mode": case["recon_mode"],
         "status": "error",
@@ -317,6 +327,7 @@ def load_existing(path: Path) -> dict[tuple, dict]:
                 row.get("requested_nb"),
                 row.get("ry"),
                 row.get("max_order"),
+                row.get("pipeline", "balanced"),
                 row.get("imagefft_storage"),
             )
             out[key] = row
@@ -333,7 +344,11 @@ def write_csv(path: Path, rows: list[dict]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     fields = [
         "recon_mode",
+        "pipeline",
         "imagefft_storage",
+        "resolved_imagefft_storage",
+        "imagefft_fill",
+        "extractor_strategy",
         "requested_nb",
         "actual_nb",
         "ry",
@@ -368,6 +383,7 @@ def write_markdown(path: Path, rows: list[dict]) -> None:
     ordered = sorted(rows, key=lambda r: (
         str(r.get("recon_mode")),
         str(r.get("imagefft_storage")),
+        str(r.get("pipeline", "balanced")),
         int(r.get("max_order", 0)),
         int(r.get("ry", 0)),
         int(r.get("requested_nb", 0)),
@@ -386,8 +402,8 @@ def write_markdown(path: Path, rows: list[dict]) -> None:
         )
         write_report_summary(f, rows)
         f.write("## Full Results\n\n")
-        f.write("| recon | cache | max_order | scan | requested Nb | actual Nb | status | peak alloc GiB | peak reserved GiB | time s |\n")
-        f.write("|---|---|---:|---:|---:|---:|---|---:|---:|---:|\n")
+        f.write("| recon | pipeline | cache | max_order | scan | requested Nb | actual Nb | status | peak alloc GiB | peak reserved GiB | time s |\n")
+        f.write("|---|---|---|---:|---:|---:|---:|---|---:|---:|---:|\n")
         for row in ordered:
             alloc = row.get("peak_allocated_gib")
             reserved = row.get("peak_reserved_gib")
@@ -397,7 +413,8 @@ def write_markdown(path: Path, rows: list[dict]) -> None:
             reserved_text = f"{reserved:.2f}" if isinstance(reserved, (int, float)) else ""
             elapsed_text = f"{elapsed:.2f}" if isinstance(elapsed, (int, float)) else ""
             f.write(
-                f"| {row.get('recon_mode')} | {row.get('imagefft_storage')} | {row.get('max_order')} | "
+                f"| {row.get('recon_mode')} | {row.get('pipeline', 'balanced')} | "
+                f"{row.get('imagefft_storage')} | {row.get('max_order')} | "
                 f"{row.get('ry')} | {row.get('requested_nb')} | {row.get('actual_nb')} | "
                 f"{row.get('status')}{suffix} | "
                 f"{alloc_text} | {reserved_text} | {elapsed_text} |\n"
@@ -409,12 +426,13 @@ def write_report_summary(f, rows: list[dict]) -> None:
     f.write("## Summary Report\n\n")
     f.write(
         "For this implementation, VRAM is driven by `imagefft_storage` (controls ImageFFT storage) "
+        "and `pipeline` (controls whether raw data may be temporarily materialized for faster precompute) "
         "and `basis_mode` (controls aberration-basis precomputation). `imagefft_storage='device'` "
         "stores the full `(Nb, Ry, Rx)` complex64 FFT cache in VRAM. `imagefft_storage='host'` "
-        "fills a RAM numpy cache lazily per chunk, copying only the active chunk to GPU. "
+        "stores the full complex64 FFT cache in RAM, copying only active chunks to GPU during reconstruction. "
         "`imagefft_storage='none'` recomputes FFTs every pass with no persistent cache. "
         "acBF with `basis_mode='precompute'` additionally stores aperture and basis tensors "
-        "for all Nb pixels; `basis_mode='none'` (default) regenerates them per chunk. "
+        "for all Nb pixels; `basis_mode='on_the_fly'` (default) regenerates them per chunk. "
         "tcBF only needs small shift-basis vectors, so its peak is nearly independent of "
         "cache settings.\n\n"
     )
@@ -585,6 +603,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--ry", type=int, default=64)
     parser.add_argument("--rx", type=int, default=64)
     parser.add_argument("--max-order", type=int, default=1)
+    parser.add_argument("--pipeline", choices=DEFAULT_PIPELINES, default="balanced")
     parser.add_argument("--imagefft-storage", choices=DEFAULT_IMAGEFFT_STORAGES, default="none")
     parser.add_argument("--recon-mode", choices=DEFAULT_RECON_MODES, default="acbf")
     parser.add_argument("--chunk-size", type=int, default=64)
@@ -632,6 +651,7 @@ def main(argv: list[str] | None = None) -> int:
             "nb": nb,
             "scan": scan,
             "max_order": max_order,
+            "pipeline": args.pipeline,
             "imagefft_storage": imagefft_storage,
             "recon_mode": recon_mode,
         }
@@ -649,6 +669,7 @@ def main(argv: list[str] | None = None) -> int:
             case["nb"],
             case["scan"],
             case["max_order"],
+            case["pipeline"],
             case["imagefft_storage"],
         )
         if key in existing:

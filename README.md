@@ -50,8 +50,7 @@ If you prefer a legacy version of PyTorch, or a different version of CUDA runtim
 `pipeline="balanced"` with automatic policy resolution:
 
 ```python
-from fast_acbf import BFSolver
-from fast_acbf.data import Dataset4D
+from fast_acbf import BFSolver, Dataset4D
 
 dataset = Dataset4D.from_hdf5("scan.h5", key="array")  # lazy by default
 

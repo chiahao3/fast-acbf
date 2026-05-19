@@ -2,8 +2,8 @@
 """Benchmark the reconstruction pipeline on datasets larger than VRAM and RAM.
 
 Covers:
-  - 48 GiB dataset (768, 1024, 128, 128): attempt full materialization + lazy+host
-  - 64 GiB dataset (1024, 1024, 128, 128): lazy+host and lazy+none
+  - 48 GiB dataset (768, 1024, 128, 128): attempt full materialization + lazy host cache
+  - 64 GiB dataset (1024, 1024, 128, 128): lazy host cache and no persistent cache
   - Contiguous and detector-chunked HDF5 layouts for each
 
 Times reported per step:
@@ -57,7 +57,12 @@ def hdr(title: str) -> None:
 
 OUTPUT_DIR = Path(__file__).parent.parent / 'output'
 
-def make_solver(ds, imagefft_storage: str, extractor_strategy: str = 'auto'):
+def make_solver(
+    ds,
+    imagefft_storage: str,
+    extractor_strategy: str = 'auto',
+    pipeline: str = 'balanced',
+):
     from fast_acbf import BFSolver
     return BFSolver(
         dataset=ds,
@@ -69,6 +74,7 @@ def make_solver(ds, imagefft_storage: str, extractor_strategy: str = 'auto'):
         aberrations={'C10': 80.0},
         coord_transform={'flipud': True},
         device=DEVICE,
+        pipeline=pipeline,
         imagefft_storage=imagefft_storage,
         extractor_strategy=extractor_strategy,
     )
@@ -128,6 +134,7 @@ def run_lazy_tcbf(
     imagefft_storage: str,
     results: dict,
     extractor_strategy: str = 'auto',
+    pipeline: str = 'balanced',
 ) -> None:
     """Lazy load + tcBF reconstruction: time init, cache fill, warm-up."""
     from fast_acbf.data.dataset4d import Dataset4D
@@ -136,8 +143,12 @@ def run_lazy_tcbf(
     layout = 'detector-chunks' if 'detector_chunks' in path.name else 'contiguous'
     label = f'{file_size_gib:.0f}GiB-{layout}-{imagefft_storage}'
 
-    hdr(f'{file_size_gib:.0f} GiB {layout} — lazy + imagefft_storage={imagefft_storage}')
+    hdr(
+        f'{file_size_gib:.0f} GiB {layout} — lazy + pipeline={pipeline} '
+        f'+ imagefft_storage={imagefft_storage}'
+    )
     print(f'  File: {path}  ({file_size_gib:.1f} GiB)')
+    print(f'  pipeline: {pipeline!r}')
     print(f'  extractor_strategy: {extractor_strategy!r}')
 
     # Step 1: Dataset4D init
@@ -156,6 +167,7 @@ def run_lazy_tcbf(
             ds,
             imagefft_storage=imagefft_storage,
             extractor_strategy=extractor_strategy,
+            pipeline=pipeline,
         )
         t_solver = time.perf_counter() - t0
         Nb = solver._recon.imagefft.nb
@@ -163,8 +175,9 @@ def run_lazy_tcbf(
         fft_cache_gib = Nb * Ry * Rx * 8 / 2**30
         useful_gib = Nb * Ry * Rx * 4 / 2**30
         print(f'    {t_solver:.3f} s  Nb={Nb}  scan={Ry}×{Rx}  '
-              f'FFT {fft_cache_gib:.2f} GiB  useful BF data={useful_gib:.2f} GiB  '
-              f'extractor={solver.extractor_strategy!r}')
+              f'FFT {fft_cache_gib:.2f} GiB  useful BF data={useful_gib:.2f} GiB')
+        print(f'    resolved: storage={solver.imagefft_storage!r}  '
+              f'fill={solver.imagefft_fill!r}  extractor={solver.extractor_strategy!r}')
     except RuntimeError as exc:
         t_solver = time.perf_counter() - t0
         print(f'    FAILED {t_solver:.2f} s: {exc}')
@@ -189,7 +202,7 @@ def run_lazy_tcbf(
 
     # Step 4: warm-up reconstruction (cache hot, no disk I/O)
     t_warm = None
-    if imagefft_storage != 'none':
+    if solver.imagefft_storage != 'none':
         print('\n  Step 4: tcBF warm-up reconstruction (cache hot)')
         t0 = time.perf_counter()
         solver.reconstruct(mode='tcBF', requires_grad=False)
@@ -205,6 +218,9 @@ def run_lazy_tcbf(
 
     results[label] = {
         'extractor_strategy': solver.extractor_strategy,
+        'pipeline': solver.pipeline,
+        'imagefft_storage': solver.imagefft_storage,
+        'imagefft_fill': solver.imagefft_fill,
         'init_s': t_init,
         'solver_s': t_solver,
         'tcBF_first_s': t_first,
@@ -269,18 +285,21 @@ def main():
     # ── Summary ────────────────────────────────────────────────────────────────
     hdr('Timing Summary')
     col = 44
-    print(f'  {"Scenario":<{col}}  {"tcBF-first":>12}  {"tcBF-warm":>12}  {"extractor_strategy":>16}')
-    print(f'  {"-"*col}  {"-"*12}  {"-"*12}  {"-"*16}')
+    print(f'  {"Scenario":<{col}}  {"tcBF-first":>12}  {"tcBF-warm":>12}  {"storage":>8}  {"fill":>12}  {"extractor_strategy":>16}')
+    print(f'  {"-"*col}  {"-"*12}  {"-"*12}  {"-"*8}  {"-"*12}  {"-"*16}')
     for scenario, r in results.items():
         if r.get('error') == 'OOM-materialize':
             tf = tw = 'OOM'
             lm = '-'
+            storage = fill = '-'
         else:
             tf = f'{r.get("tcBF_first_s", float("nan")):.2f} s'
             tw_val = r.get('tcBF_warm_s')
             tw = f'{tw_val:.2f} s' if tw_val is not None else 'skipped'
             lm = r.get('extractor_strategy', '-')
-        print(f'  {scenario:<{col}}  {tf:>12}  {tw:>12}  {lm:>16}')
+            storage = r.get('imagefft_storage', '-')
+            fill = r.get('imagefft_fill', '-')
+        print(f'  {scenario:<{col}}  {tf:>12}  {tw:>12}  {storage:>8}  {fill:>12}  {lm:>16}')
     print()
 
 
