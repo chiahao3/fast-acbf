@@ -102,7 +102,7 @@ class BFExtractor:
             )
 
     def _extract_host_mask(self, iy: np.ndarray, ix: np.ndarray) -> np.ndarray:
-        arr = self.dataset.raw_array()
+        arr = self.dataset.materialize() if self.dataset.is_lazy else self.dataset.raw_array()
         raw = arr[:, :, iy, ix]
         return np.ascontiguousarray(raw.transpose(2, 0, 1), dtype=np.float32)
 

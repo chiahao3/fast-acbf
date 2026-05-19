@@ -190,10 +190,22 @@ class PipelineManager:
         if self.extractor_strategy_request != 'auto':
             return self.extractor_strategy_request
 
-        if self._can_use_device_mask(raw_bytes, vbf_bytes, imagefft_bytes):
+        if (
+            storage != 'none'
+            and fill == 'precompute'
+            and self._can_use_device_mask(raw_bytes, vbf_bytes, imagefft_bytes)
+        ):
             return 'device_mask'
 
         if not self.dataset.is_lazy:
+            return 'host_mask'
+
+        host_extra = imagefft_bytes if storage == 'host' else 0
+        if (
+            self.pipeline != 'memory'
+            and storage != 'none'
+            and self._host_raw_fits(raw_bytes, extra_bytes=host_extra)
+        ):
             return 'host_mask'
 
         chunks = self.dataset.backend_chunks
@@ -215,13 +227,39 @@ class PipelineManager:
         vbf_bytes: int,
         imagefft_bytes: int,
     ) -> None:
-        if extractor_strategy != 'device_mask':
-            return
+        if extractor_strategy == 'device_mask':
+            self._validate_device_mask(storage, fill, raw_bytes, vbf_bytes, imagefft_bytes)
+        if extractor_strategy == 'host_mask' and self.dataset.is_lazy:
+            host_extra = imagefft_bytes if storage == 'host' else 0
+            if not self._host_raw_fits(raw_bytes, extra_bytes=host_extra):
+                raise RuntimeError(
+                    f"extractor_strategy='host_mask' requires {raw_bytes / 2**30:.2f} GiB "
+                    f"for raw host data"
+                    f"{' plus ImageFFT cache' if host_extra else ''}, but only "
+                    f"{(self._available_ram() or 0) / 2**30:.2f} GiB RAM is available. "
+                    "Use a disk extraction strategy or reduce the scan area."
+                )
+
+    def _validate_device_mask(
+        self,
+        storage: str,
+        fill: str,
+        raw_bytes: int,
+        vbf_bytes: int,
+        imagefft_bytes: int,
+    ) -> None:
         if storage == 'none' or fill != 'precompute':
             raise ValueError(
                 "extractor_strategy='device_mask' requires persistent ImageFFT storage "
                 "and imagefft_fill='precompute'. Use extractor_strategy='host_mask' or a "
                 "disk strategy for lazy/on-the-fly execution."
+            )
+        if self.dataset.is_lazy and not self._host_raw_fits(raw_bytes):
+            raise RuntimeError(
+                f"extractor_strategy='device_mask' must materialize the lazy raw source first, "
+                f"requiring {raw_bytes / 2**30:.2f} GiB host RAM, but only "
+                f"{(self._available_ram() or 0) / 2**30:.2f} GiB is available. "
+                "Use a disk extraction strategy or materialize a smaller ROI."
             )
         dev = torch.device(self.device)
         if dev.type != 'cuda':
@@ -262,6 +300,11 @@ class PipelineManager:
     def _host_imagefft_fits(self, imagefft_bytes: int) -> bool:
         available = self._available_ram()
         return available is not None and imagefft_bytes <= int(available * self.ram_margin)
+
+    def _host_raw_fits(self, raw_bytes: int, *, extra_bytes: int = 0) -> bool:
+        available = self._available_ram()
+        needed = raw_bytes + extra_bytes
+        return available is not None and needed <= int(available * self.ram_margin)
 
     def _free_vram(self) -> int | None:
         dev = torch.device(self.device)
