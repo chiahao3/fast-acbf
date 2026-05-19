@@ -118,6 +118,8 @@ class BFSolver:
             aberrations = {}
         if str(fov) not in _VALID_FOV:
             raise ValueError(f"fov must be one of {_VALID_FOV}, got {fov!r}.")
+        if float(upscale) < 1.0:
+            raise ValueError(f"upscale must be >= 1.0, got {upscale}.")
 
         # Dispatch → Dataset4D
         if isinstance(dataset, Dataset4D):
@@ -502,11 +504,15 @@ class BFSolver:
         return torch.stack([shift_y_ang, shift_x_ang], dim=-1)
 
     def get_yx_shifts_px(self, frame: str = 'detector', upscale=None) -> torch.Tensor:
-        u = upscale if upscale is not None else self._upscale
+        u = float(upscale) if upscale is not None else self._upscale
+        if u < 1.0:
+            raise ValueError(f"upscale must be >= 1.0, got {upscale}.")
         return self.get_yx_shifts_ang(frame=frame) / self.scan_step_size * u
 
     def get_probe(self, frame: str = 'detector', upscale=None) -> torch.Tensor:
-        u = upscale if upscale is not None else self._upscale
+        u = float(upscale) if upscale is not None else self._upscale
+        if u < 1.0:
+            raise ValueError(f"upscale must be >= 1.0, got {upscale}.")
         chi = self.get_chi_surface(frame=frame)
         mask = self.bf_mask
         if u == 1.0:
@@ -563,8 +569,10 @@ class BFSolver:
         return self.get_reconstructed_image(mode='acBF', frame=frame, upscale=upscale, fov=fov, **kwargs)
 
     def get_acBF_diagnostics(self, upscale=None, fov=None, **kwargs) -> dict:
-        u = upscale if upscale is not None else self._upscale
+        u = float(upscale) if upscale is not None else self._upscale
         f = fov if fov is not None else self._fov
+        if u < 1.0:
+            raise ValueError(f"upscale must be >= 1.0, got {upscale}.")
         if f not in _VALID_FOV:
             raise ValueError(f"fov must be one of {_VALID_FOV}, got {f!r}.")
         rolloff = kwargs.get('rolloff', 0)
@@ -588,10 +596,11 @@ class BFSolver:
         # Crop only real-space outputs; leave Fourier maps untouched
         if self._recon._pad_offsets is not None and f == 'original':
             real_space_keys = ('image', 'complex_image', 'real_channel', 'imag_channel')
+            padded_shape = self._recon.scan_geom.scan_shape
             for k in real_space_keys:
                 if k in result:
                     result[k] = _crop_to_original(
-                        result[k], self._recon._pad_offsets, self._recon._orig_scan_shape, u
+                        result[k], self._recon._pad_offsets, self._recon._orig_scan_shape, padded_shape
                     )
         return result
 
@@ -705,10 +714,11 @@ class BFSolver:
             ab_dict = self.get_aberrations_dict(frame=frame, layout='flat')
             desc_str = ", ".join(f"{ab}: {val:.2f}" for ab, val in ab_dict.items())
 
+        upscale = kwargs.get('upscale', None)
         with torch.no_grad():
             img = self.get_reconstructed_image(mode=mode, frame=frame, **kwargs).detach().cpu().numpy()
             fft = np.log(np.abs(np.fft.fftshift(mfft2(img)[0])))
-            probe = self.get_probe(frame=frame).abs().detach().cpu().numpy()
+            probe = self.get_probe(frame=frame, upscale=upscale).abs().detach().cpu().numpy()
 
         plotting.plot_reconstruction(
             img, fft, probe,
