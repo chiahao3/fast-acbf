@@ -16,11 +16,12 @@ from ptyrad.optics.aberrations import Aberrations
 from ptyrad.utils.image_proc import mfft2
 
 from fast_acbf.core.aberrations import AberrationState
+from fast_acbf.core.acbf import reconstruct_acbf_complex_inversion
 from fast_acbf.core.functional import generate_aberration_basis, generate_shift_basis, make_probe_from_chi
 from fast_acbf.data.dataset4d import Dataset4D
 from fast_acbf.data.geometry import CoordinateTransform, DetectorGeometry, ScanGeometry
 from fast_acbf.recon.pipeline import PipelineManager
-from fast_acbf.recon.reconstructor import BFReconstructor
+from fast_acbf.recon.reconstructor import BFReconstructor, _crop_to_original
 
 logger = logging.getLogger(__name__)
 
@@ -109,6 +110,9 @@ class BFSolver:
         imagefft_fill: str = 'auto',
         extractor_strategy: str = 'auto',
         fft_batch_size: int = 64,
+        pad_width: int | None = None,
+        fov: str = 'original',
+        upscale: float = 1.0,
     ) -> None:
         if aberrations is None:
             aberrations = {}
@@ -159,11 +163,6 @@ class BFSolver:
             wavelength=wavelength,
             device=device,
         )
-        scan_geom = ScanGeometry.from_params(
-            scan_shape=(Ry, Rx),
-            scan_step_size=scan_step_size,
-            device=device,
-        )
 
         pipeline_manager = PipelineManager(
             ds,
@@ -174,8 +173,20 @@ class BFSolver:
             imagefft_fill=imagefft_fill,
             extractor_strategy=extractor_strategy,
             fft_batch_size=fft_batch_size,
+            pad_width=pad_width,
         )
         imagefft = pipeline_manager.build_imagefft()
+
+        # Read padding metadata from the preparer (single source of truth)
+        if pipeline_manager.preparer is not None:
+            p = pipeline_manager.preparer
+            orig_scan_shape = p.orig_shape
+            pad_offsets = p.pad_offsets
+            scan_geom = ScanGeometry.from_params(p.padded_shape, scan_step_size, device=device)
+        else:
+            orig_scan_shape = None
+            pad_offsets = None
+            scan_geom = ScanGeometry.from_params((Ry, Rx), scan_step_size, device=device)
 
         Nb = imagefft.nb
         print(
@@ -190,11 +201,17 @@ class BFSolver:
             coord_transform=ct,
             basis_mode=basis_mode,
             eps=eps,
+            orig_scan_shape=orig_scan_shape,
+            pad_offsets=pad_offsets,
+            fov=fov,
         )
 
         self._dataset = ds
         self._pipeline_manager = pipeline_manager
         self._recon = recon
+        self._orig_scan_shape = (Ry, Rx)  # always raw scan dims
+        self._upscale = float(upscale)
+        self._fov = str(fov)
         self.reconstructed_image: torch.Tensor | None = None
         self.last_c10_stack_axis: torch.Tensor | None = None
         self.tolerance_factors = tolerance_factors
@@ -262,11 +279,11 @@ class BFSolver:
 
     @property
     def Ry(self) -> int:
-        return self._recon.scan_geom.scan_shape[0]
+        return self._orig_scan_shape[0]
 
     @property
     def Rx(self) -> int:
-        return self._recon.scan_geom.scan_shape[1]
+        return self._orig_scan_shape[1]
 
     @property
     def max_order(self) -> int:
@@ -343,6 +360,12 @@ class BFSolver:
             rotation_deg=self._recon.coord_transform.rotation_deg,
         )
         self._recon.set_coord_transform(ct, clear_basis=True)
+        return self
+
+    def set_upscale(self, value: float) -> BFSolver:
+        if value < 1.0:
+            raise ValueError(f"upscale must be >= 1.0, got {value}.")
+        self._upscale = float(value)
         return self
 
     # ------------------------------------------------------------------
@@ -458,11 +481,39 @@ class BFSolver:
         shift_y_ang = torch.einsum('k,kb->b', coeffs, b_dy)
         return torch.stack([shift_y_ang, shift_x_ang], dim=-1)
 
-    def get_yx_shifts_px(self, frame: str = 'detector') -> torch.Tensor:
-        return self.get_yx_shifts_ang(frame=frame) / self.scan_step_size
+    def get_yx_shifts_px(self, frame: str = 'detector', upscale=None) -> torch.Tensor:
+        u = upscale if upscale is not None else self._upscale
+        return self.get_yx_shifts_ang(frame=frame) / self.scan_step_size * u
 
-    def get_probe(self, frame: str = 'detector') -> torch.Tensor:
-        return make_probe_from_chi(self.get_chi_surface(frame=frame), self.bf_mask)
+    def get_probe(self, frame: str = 'detector', upscale=None) -> torch.Tensor:
+        u = upscale if upscale is not None else self._upscale
+        chi = self.get_chi_surface(frame=frame)
+        mask = self.bf_mask
+        if u == 1.0:
+            return make_probe_from_chi(chi, mask)
+
+        # Extend k-grid by u: same dk, larger (Ky_ext, Kx_ext) grid.
+        # Zero-pads the aperture function in k-space → finer real-space probe sampling.
+        det = self._recon.detector_geom
+        Ky, Kx = det.detector_shape
+        det_ext = DetectorGeometry.from_params(
+            detector_shape=(round(Ky * u), round(Kx * u)),
+            max_alpha=det.max_alpha,
+            dk=det.dk,
+            wavelength=det.wavelength,
+            device=self.device,
+        )
+        in_scan = (self._validate_frame(frame) == 'scan')
+        kX_ext, kY_ext = self._recon.coord_transform.apply_to_grids(
+            det_ext.kY_grid, det_ext.kX_grid, in_scan_frame=in_scan
+        )
+        chi_basis_ext = generate_aberration_basis(
+            self.max_order, self.ab_state.order_keys, kX_ext, kY_ext, self.wavelength
+        )
+        coeffs = (self.ab_state.get_flat_coeffs() if not in_scan
+                  else self._get_scan_frame_coeffs())
+        chi_ext = torch.einsum('k,kij->ij', coeffs, chi_basis_ext)
+        return make_probe_from_chi(chi_ext, det_ext.bf_mask)
 
     def rotate_scan_image_to_detector(self, img: torch.Tensor) -> torch.Tensor:
         if not self.rotation_deg:
@@ -474,37 +525,53 @@ class BFSolver:
         ).squeeze(0)
 
     def get_reconstructed_image(
-        self, mode: str = 'tcBF', frame: str = 'scan', **kwargs,
+        self, mode: str = 'tcBF', frame: str = 'scan', upscale=None, fov=None, **kwargs,
     ) -> torch.Tensor:
+        u = upscale if upscale is not None else self._upscale
+        f = fov if fov is not None else self._fov
         frame = self._validate_frame(frame)
-        img = self.reconstruct(mode=mode.lower(), requires_grad=False, **kwargs)
+        img = self.reconstruct(mode=mode.lower(), requires_grad=False, upscale=u, fov=f, **kwargs)
         self.reconstructed_image = img.detach()
         if frame == 'detector':
             img = self.rotate_scan_image_to_detector(img)
         return img
 
-    def get_tcBF(self, frame: str = 'scan', **kwargs) -> torch.Tensor:
-        return self.get_reconstructed_image(mode='tcBF', frame=frame, **kwargs)
+    def get_tcBF(self, frame: str = 'scan', upscale=None, fov=None, **kwargs) -> torch.Tensor:
+        return self.get_reconstructed_image(mode='tcBF', frame=frame, upscale=upscale, fov=fov, **kwargs)
 
-    def get_acBF(self, frame: str = 'scan', **kwargs) -> torch.Tensor:
-        return self.get_reconstructed_image(mode='acBF', frame=frame, **kwargs)
+    def get_acBF(self, frame: str = 'scan', upscale=None, fov=None, **kwargs) -> torch.Tensor:
+        return self.get_reconstructed_image(mode='acBF', frame=frame, upscale=upscale, fov=fov, **kwargs)
 
-    def get_acBF_diagnostics(self, **kwargs) -> dict:
+    def get_acBF_diagnostics(self, upscale=None, fov=None, **kwargs) -> dict:
+        u = upscale if upscale is not None else self._upscale
+        f = fov if fov is not None else self._fov
         rolloff = kwargs.get('rolloff', 0)
         chunk_size = kwargs.get('chunk_size', 64)
         with torch.no_grad():
             geometry, optics = self._recon._get_acbf_cache(rolloff=rolloff, chunk_size=chunk_size)
-            from fast_acbf.core.acbf import reconstruct_acbf_complex_inversion
-            return reconstruct_acbf_complex_inversion(
+            if u != 1.0:
+                optics = None
+            qx_grid, qy_grid = self._recon._get_recon_grids(u)
+            result = reconstruct_acbf_complex_inversion(
                 self._recon.imagefft,
-                self._recon.scan_geom.qx_grid, self._recon.scan_geom.qy_grid,
+                qx_grid, qy_grid,
                 geometry, optics,
                 self._get_scan_frame_coeffs(),
                 self.device,
                 regularization=kwargs.get('regularization', 1e-3),
                 support_threshold=kwargs.get('support_threshold', 1e-6),
                 return_diagnostics=True,
+                upscale=u,
             )
+        # Crop only real-space outputs; leave Fourier maps untouched
+        if self._recon._pad_offsets is not None and f == 'original':
+            real_space_keys = ('image', 'complex_image', 'real_channel', 'imag_channel')
+            for k in real_space_keys:
+                if k in result:
+                    result[k] = _crop_to_original(
+                        result[k], self._recon._pad_offsets, self._recon._orig_scan_shape, u
+                    )
+        return result
 
     def get_defocus_stack(
         self,
@@ -514,13 +581,18 @@ class BFSolver:
         z_top=None,
         z_bottom=None,
         slice_thickness=None,
+        upscale=None,
+        fov=None,
         **kwargs,
     ) -> torch.Tensor:
         """Return a defocus stack (Nz, Ny, Nx). C10 axis stored in last_c10_stack_axis."""
+        u = upscale if upscale is not None else self._upscale
+        f = fov if fov is not None else self._fov
         c10_axis = self._build_c10_stack_axis(
             n_layers=n_layers, z_top=z_top, z_bottom=z_bottom, slice_thickness=slice_thickness,
         )
-        _, stack = self._sweep_c10_stack(c10_axis, mode=mode.lower(), frame=frame, **kwargs)
+        _, stack = self._sweep_c10_stack(c10_axis, mode=mode.lower(), frame=frame,
+                                          upscale=u, fov=f, **kwargs)
         return stack
 
     # ------------------------------------------------------------------

@@ -81,12 +81,17 @@ class TestBFSolverInit:
                 defer_upscale=True,
             )
 
-    def test_reconstruction_upscale_unsupported(self, solver_zero_ab):
-        with pytest.raises(NotImplementedError, match="upscale"):
-            solver_zero_ab.get_tcBF(upscale=2)
+    def test_reconstruction_upscale_invalid(self, solver_zero_ab):
+        with pytest.raises(ValueError, match="upscale"):
+            solver_zero_ab.get_tcBF(upscale=0.5)
 
-        with pytest.raises(NotImplementedError, match="upscale"):
-            solver_zero_ab.get_acBF(upscale=2)
+        with pytest.raises(ValueError, match="upscale"):
+            solver_zero_ab.get_acBF(upscale=0.5)
+
+    def test_reconstruction_upscale_works(self, solver_zero_ab):
+        Ry, Rx = solver_zero_ab.Ry, solver_zero_ab.Rx
+        img = solver_zero_ab.get_tcBF(upscale=2.0)
+        assert img.shape == (round(Ry * 2), round(Rx * 2))
 
     def test_no_global_output_frame_state(self, solver_zero_ab):
         assert not hasattr(solver_zero_ab, "output_frame")
