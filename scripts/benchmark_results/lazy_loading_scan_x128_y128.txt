@@ -11,7 +11,7 @@ Output: (3297, 128, 128) float32 = 216 MB
 OS page cache: warm (second run reflects cache-warm performance)
 
 ============================================================
-Scenario 1 — full_pass (single get_bf_chunk call, all N_bf pixels)
+Scenario 1 — full_pass (single BFExtractor.extract_all call, all N_bf pixels)
   Note: per_pixel* is extrapolated from 50-pixel sample × 65.9
 ============================================================
   strategy       best (s)   mean (s)   data_read              speedup   notes
