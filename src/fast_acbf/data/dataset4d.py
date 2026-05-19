@@ -146,7 +146,7 @@ class Dataset4D:
         if self._h5_file is not None:
             self._h5_file.close()
             self._h5_file = None
-            self._handle = None
+        self._handle = None
 
     def __del__(self) -> None:
         try:

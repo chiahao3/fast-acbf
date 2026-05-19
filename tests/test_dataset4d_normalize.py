@@ -197,7 +197,6 @@ class TestNormalizeLazyHDF5:
 
 # ── lazy zarr tests ───────────────────────────────────────────────────────────
 
-@pytest.mark.skip(reason="zarr 3.2.1 store creation hangs in the current sandbox")
 class TestNormalizeLazyZarr:
     @pytest.fixture(autouse=True)
     def _zarrstore(self, tmp_path):
