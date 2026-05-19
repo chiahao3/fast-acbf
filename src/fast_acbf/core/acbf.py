@@ -10,7 +10,7 @@ from fast_acbf.core.functional import generate_aberration_basis, make_soft_apert
 from fast_acbf.recon.cache import ACBFGeometryCache, ACBFOpticsCache
 
 if TYPE_CHECKING:
-    from fast_acbf.data.imagefft_provider import ImageFFTProvider
+    from fast_acbf.data.imagefft import ImageFFT
 
 
 def compute_transfer(
@@ -100,7 +100,7 @@ def _iter_chunks(geometry: ACBFGeometryCache, optics: ACBFOpticsCache | None):
 
 
 def reconstruct_acbf(
-    provider: ImageFFTProvider,
+    provider: ImageFFT,
     qx_grid: torch.Tensor,
     qy_grid: torch.Tensor,
     geometry: ACBFGeometryCache,
@@ -115,7 +115,7 @@ def reconstruct_acbf(
     Aligns detector contributions by their phase before summation.
 
     Args:
-        provider:  ImageFFTProvider serving (chunk_size, Ry, Rx) complex64 chunks.
+        provider:  ImageFFT serving (chunk_size, Ry, Rx) complex64 chunks.
         qx_grid:   Scan-frame frequency grid, shape (1, 1, Rx).
         qy_grid:   Scan-frame frequency grid, shape (1, Ry, 1).
         geometry:  ACBFGeometryCache built by pipeline.build_acbf_geometry_cache.
@@ -138,7 +138,7 @@ def reconstruct_acbf(
 
 
 def reconstruct_acbf_complex_inversion(
-    provider: ImageFFTProvider,
+    provider: ImageFFT,
     qx_grid: torch.Tensor,
     qy_grid: torch.Tensor,
     geometry: ACBFGeometryCache,
@@ -161,7 +161,7 @@ def reconstruct_acbf_complex_inversion(
         S(q) = sum_b |T_b(q)|^2
 
     Args:
-        provider:           ImageFFTProvider serving (chunk_size, Ry, Rx) complex64 chunks.
+        provider:           ImageFFT serving (chunk_size, Ry, Rx) complex64 chunks.
         qx_grid:            Scan-frame frequency grid, shape (1, 1, Rx).
         qy_grid:            Scan-frame frequency grid, shape (1, Ry, 1).
         geometry:           ACBFGeometryCache.

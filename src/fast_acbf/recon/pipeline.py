@@ -5,7 +5,6 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
-import numpy as np
 import torch
 
 from fast_acbf.data.bf_extractor import BFExtractor
@@ -140,9 +139,9 @@ class PipelineManager:
         if self.pipeline == 'memory':
             return 'none'
 
-        if self._device_cache_fits(imagefft_bytes):
+        if self._device_imagefft_fits(imagefft_bytes):
             return 'device'
-        if self._host_cache_fits(imagefft_bytes):
+        if self._host_imagefft_fits(imagefft_bytes):
             return 'host'
         return 'none'
 
@@ -200,14 +199,14 @@ class PipelineManager:
         needed = raw_bytes + vbf_bytes + imagefft_bytes
         return needed <= int(free_vram * self.vram_margin)
 
-    def _device_cache_fits(self, imagefft_bytes: int) -> bool:
+    def _device_imagefft_fits(self, imagefft_bytes: int) -> bool:
         dev = torch.device(self.device)
         if dev.type != 'cuda':
             return False
         free_vram = self._free_vram()
         return free_vram is not None and imagefft_bytes <= int(free_vram * self.vram_margin)
 
-    def _host_cache_fits(self, imagefft_bytes: int) -> bool:
+    def _host_imagefft_fits(self, imagefft_bytes: int) -> bool:
         available = self._available_ram()
         return available is not None and imagefft_bytes <= int(available * self.ram_margin)
 

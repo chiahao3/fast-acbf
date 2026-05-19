@@ -19,7 +19,7 @@ from fast_acbf.core.aberrations import AberrationState
 from fast_acbf.core.functional import generate_aberration_basis, generate_shift_basis, make_probe_from_chi
 from fast_acbf.data.dataset4d import Dataset4D
 from fast_acbf.data.geometry import CoordinateTransform, DetectorGeometry, ScanGeometry
-from fast_acbf.data.imagefft_provider import ImageFFTProvider
+from fast_acbf.recon.pipeline import PipelineManager
 from fast_acbf.recon.reconstructor import BFReconstructor
 
 logger = logging.getLogger(__name__)
@@ -101,11 +101,14 @@ class BFSolver:
         aberrations: dict | None = None,
         device: str = 'cuda',
         coord_transform: dict | None = None,
-        cache_mode: str = 'auto',
         basis_mode: str = 'on_the_fly',
         eps: float = 1e-3,
         normalize: bool = False,
-        lazy_read_mode: str = 'auto',
+        pipeline: str = 'balanced',
+        imagefft_storage: str = 'auto',
+        imagefft_fill: str = 'auto',
+        extractor_strategy: str = 'auto',
+        fft_batch_size: int = 64,
     ) -> None:
         if aberrations is None:
             aberrations = {}
@@ -124,9 +127,9 @@ class BFSolver:
             path = Path(dataset)
             suffix = path.suffix.lower()
             if suffix in ('.h5', '.hdf5'):
-                ds = Dataset4D.from_hdf5(path, normalize=normalize, lazy_read_mode=lazy_read_mode)
+                ds = Dataset4D.from_hdf5(path, normalize=normalize)
             else:
-                ds = Dataset4D.from_zarr(path, normalize=normalize, lazy_read_mode=lazy_read_mode)
+                ds = Dataset4D.from_zarr(path, normalize=normalize)
         else:
             ds = Dataset4D(dataset, normalize=normalize)
 
@@ -162,15 +165,26 @@ class BFSolver:
             device=device,
         )
 
-        provider = ImageFFTProvider(ds, det_geom, device, cache_mode)
+        pipeline_manager = PipelineManager(
+            ds,
+            det_geom,
+            device=device,
+            pipeline=pipeline,
+            imagefft_storage=imagefft_storage,
+            imagefft_fill=imagefft_fill,
+            extractor_strategy=extractor_strategy,
+            fft_batch_size=fft_batch_size,
+        )
+        imagefft = pipeline_manager.build_imagefft()
 
-        Nb = provider.nb
+        Nb = imagefft.nb
         print(
             f"Extracted {Nb} vBF images within max_alpha = {max_alpha} mrad."
         )
 
         recon = BFReconstructor(
-            provider=provider,
+            imagefft=imagefft,
+            detector_geom=det_geom,
             scan_geom=scan_geom,
             ab_state=ab_state,
             coord_transform=ct,
@@ -179,6 +193,7 @@ class BFSolver:
         )
 
         self._dataset = ds
+        self._pipeline_manager = pipeline_manager
         self._recon = recon
         self.reconstructed_image: torch.Tensor | None = None
         self.last_c10_stack_axis: torch.Tensor | None = None
@@ -196,32 +211,33 @@ class BFSolver:
     def vbf_images(self) -> torch.Tensor:
         """Return (Nb, Ry, Rx) float32 BF image stack.
 
-        For device/host cache modes, vBF is not stored persistently — this
-        reconstructs it from the raw dataset each call. For lazy backends
-        (on_the_fly), this triggers Nb disk reads.
+        vBF is not the persistent pipeline product, so this extracts it from
+        the current BFExtractor each time.
         """
-        p = self._recon.provider
-        return torch.from_numpy(p.dataset.get_bf_chunk(p._bf_iy, p._bf_ix))
+        vbf = self._pipeline_manager.extractor.extract_all()
+        if isinstance(vbf, torch.Tensor):
+            return vbf.detach().cpu()
+        return torch.from_numpy(vbf)
 
     @property
     def bf_mask(self) -> torch.Tensor:
-        return self._recon.provider.detector_geom.bf_mask
+        return self._recon.detector_geom.bf_mask
 
     @property
     def kY_centers(self) -> torch.Tensor:
-        return self._recon.provider.detector_geom.kY_centers
+        return self._recon.detector_geom.kY_centers
 
     @property
     def kX_centers(self) -> torch.Tensor:
-        return self._recon.provider.detector_geom.kX_centers
+        return self._recon.detector_geom.kX_centers
 
     @property
     def kY_grid(self) -> torch.Tensor:
-        return self._recon.provider.detector_geom.kY_grid
+        return self._recon.detector_geom.kY_grid
 
     @property
     def kX_grid(self) -> torch.Tensor:
-        return self._recon.provider.detector_geom.kX_grid
+        return self._recon.detector_geom.kX_grid
 
     @property
     def device(self) -> str:
@@ -229,15 +245,15 @@ class BFSolver:
 
     @property
     def max_alpha(self) -> float:
-        return self._recon.provider.detector_geom.max_alpha
+        return self._recon.detector_geom.max_alpha
 
     @property
     def dk(self) -> float:
-        return self._recon.provider.detector_geom.dk
+        return self._recon.detector_geom.dk
 
     @property
     def wavelength(self) -> float:
-        return self._recon.provider.detector_geom.wavelength
+        return self._recon.detector_geom.wavelength
 
     @property
     def scan_step_size(self) -> float:
@@ -260,8 +276,20 @@ class BFSolver:
         return self._recon.eps
 
     @property
-    def cache_mode(self) -> str:
-        return self._recon.provider.cache_mode
+    def pipeline(self) -> str:
+        return self._pipeline_manager.resolution.pipeline
+
+    @property
+    def imagefft_storage(self) -> str:
+        return self._pipeline_manager.resolution.imagefft_storage
+
+    @property
+    def imagefft_fill(self) -> str:
+        return self._pipeline_manager.resolution.imagefft_fill
+
+    @property
+    def extractor_strategy(self) -> str:
+        return self._pipeline_manager.resolution.extractor_strategy
 
     @property
     def basis_mode(self) -> str:
@@ -467,7 +495,7 @@ class BFSolver:
             geometry, optics = self._recon._get_acbf_cache(rolloff=rolloff, chunk_size=chunk_size)
             from fast_acbf.core.acbf import reconstruct_acbf_complex_inversion
             return reconstruct_acbf_complex_inversion(
-                self._recon.provider,
+                self._recon.imagefft,
                 self._recon.scan_geom.qx_grid, self._recon.scan_geom.qy_grid,
                 geometry, optics,
                 self._get_scan_frame_coeffs(),

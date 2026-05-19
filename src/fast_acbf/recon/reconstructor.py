@@ -1,6 +1,6 @@
 """BFReconstructor — minimal BF-specific optimizable model.
 
-Owns: ImageFFTProvider, ScanGeometry, AberrationState, CoordinateTransform,
+Owns: ImageFFT, DetectorGeometry, ScanGeometry, AberrationState, CoordinateTransform,
 and the reconstruction cache workspace. Nothing else.
 
 Strict boundaries:
@@ -19,7 +19,8 @@ from fast_acbf.core.aberrations import AberrationState
 from fast_acbf.core.acbf import reconstruct_acbf, reconstruct_acbf_complex_inversion
 from fast_acbf.core.tcbf import reconstruct_tcbf
 from fast_acbf.data.geometry import CoordinateTransform, ScanGeometry
-from fast_acbf.data.imagefft_provider import ImageFFTProvider
+from fast_acbf.data.geometry import DetectorGeometry
+from fast_acbf.data.imagefft import ImageFFT
 from fast_acbf.recon.cache import (
     ACBFGeometryCache,
     ACBFOpticsCache,
@@ -40,14 +41,16 @@ class BFReconstructor:
 
     def __init__(
         self,
-        provider: ImageFFTProvider,
+        imagefft: ImageFFT,
+        detector_geom: DetectorGeometry,
         scan_geom: ScanGeometry,
         ab_state: AberrationState,
         coord_transform: CoordinateTransform,
         basis_mode: str = 'on_the_fly',
         eps: float = 1e-3,
     ) -> None:
-        self.provider = provider
+        self.imagefft = imagefft
+        self.detector_geom = detector_geom
         self.scan_geom = scan_geom
         self.ab_state = ab_state
         self.coord_transform = coord_transform
@@ -73,7 +76,7 @@ class BFReconstructor:
 
     @property
     def device(self) -> str:
-        return self.provider.device
+        return self.imagefft.device
 
     @property
     def rotation_deg(self) -> float:
@@ -84,13 +87,13 @@ class BFReconstructor:
     # ------------------------------------------------------------------
 
     def clear_cache(self) -> None:
-        """Full reset — clears both basis caches and the provider cache."""
+        """Full reset — clears both basis caches and the ImageFFT cache."""
         self._tcbf_cache = {}
         self._acbf_cache = {}
-        self.provider.clear_cache()
+        self.imagefft.clear()
 
     def clear_basis_cache(self) -> None:
-        """Clear orientation-dependent basis caches; provider cache is preserved."""
+        """Clear orientation-dependent basis caches; ImageFFT cache is preserved."""
         self._tcbf_cache = {}
         self._acbf_cache = {}
 
@@ -112,11 +115,11 @@ class BFReconstructor:
         return self.ab_state.to_scan_frame(self.coord_transform.rotation_deg)
 
     def _get_transformed_centers(self, in_scan_frame: bool = True) -> tuple[torch.Tensor, torch.Tensor]:
-        det = self.provider.detector_geom
+        det = self.detector_geom
         return self.coord_transform.apply_to_centers(det.kY_centers, det.kX_centers, in_scan_frame)
 
     def _get_transformed_grids(self, in_scan_frame: bool = True) -> tuple[torch.Tensor, torch.Tensor]:
-        det = self.provider.detector_geom
+        det = self.detector_geom
         return self.coord_transform.apply_to_grids(det.kY_grid, det.kX_grid, in_scan_frame)
 
     # ------------------------------------------------------------------
@@ -129,7 +132,7 @@ class BFReconstructor:
             kX_full, kY_full = self._get_transformed_centers()
             self._tcbf_cache[key] = build_tcbf_cache(
                 kX_full, kY_full,
-                self.ab_state.order_keys, self.provider.detector_geom.wavelength, chunk_size,
+                self.ab_state.order_keys, self.detector_geom.wavelength, chunk_size,
             )
         return self._tcbf_cache[key]
 
@@ -144,7 +147,7 @@ class BFReconstructor:
         key = (rolloff, chunk_size, *self._frame_cache_key())
         if key not in self._acbf_cache:
             kX_full, kY_full = self._get_transformed_centers()
-            det = self.provider.detector_geom
+            det = self.detector_geom
             geometry = build_acbf_geometry_cache(
                 kX_full, kY_full,
                 self.ab_state.order_keys, det.max_alpha, det.wavelength,
@@ -187,7 +190,7 @@ class BFReconstructor:
             self._validate_upscale(kwargs.get('upscale', 1))
             cache = self._get_tcbf_cache(chunk_size=kwargs.get('chunk_size', 64))
             return reconstruct_tcbf(
-                self.provider, sg.qx_grid, sg.qy_grid, cache, coeffs, self.device,
+                self.imagefft, sg.qx_grid, sg.qy_grid, cache, coeffs, self.device,
             )
 
         if mode_key == 'acbf':
@@ -199,12 +202,12 @@ class BFReconstructor:
 
             if acbf_algorithm == 'phase_only':
                 return reconstruct_acbf(
-                    self.provider, sg.qx_grid, sg.qy_grid, geometry, optics,
+                    self.imagefft, sg.qx_grid, sg.qy_grid, geometry, optics,
                     coeffs, self.eps, self.device,
                 )
             if acbf_algorithm == 'complex_inversion':
                 return reconstruct_acbf_complex_inversion(
-                    self.provider, sg.qx_grid, sg.qy_grid, geometry, optics,
+                    self.imagefft, sg.qx_grid, sg.qy_grid, geometry, optics,
                     coeffs, self.device,
                     regularization=kwargs.get('regularization', 1e-3),
                     support_threshold=kwargs.get('support_threshold', 1e-6),

@@ -68,7 +68,10 @@ def _build_roi_solver(solver, scan_roi):
         device=solver.device,
         coord_transform=solver.coord_transform,  # returns a dict
         eps=solver.eps,
-        cache_mode=solver.cache_mode,
+        pipeline=solver.pipeline,
+        imagefft_storage=solver.imagefft_storage,
+        imagefft_fill=solver.imagefft_fill,
+        extractor_strategy=solver.extractor_strategy,
         basis_mode=solver.basis_mode,
     )
 

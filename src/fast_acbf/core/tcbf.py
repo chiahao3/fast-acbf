@@ -9,11 +9,11 @@ import torch
 from fast_acbf.recon.cache import TCBFCache
 
 if TYPE_CHECKING:
-    from fast_acbf.data.imagefft_provider import ImageFFTProvider
+    from fast_acbf.data.imagefft import ImageFFT
 
 
 def reconstruct_tcbf(
-    provider: ImageFFTProvider,
+    provider: ImageFFT,
     qx_grid: torch.Tensor,
     qy_grid: torch.Tensor,
     cache: TCBFCache,
@@ -27,7 +27,7 @@ def reconstruct_tcbf(
     shift basis stored in the cache.
 
     Args:
-        provider:  ImageFFTProvider serving (chunk_size, Ry, Rx) complex64 chunks.
+        provider:  ImageFFT serving (chunk_size, Ry, Rx) complex64 chunks.
         qx_grid:   Scan-frame frequency grid, shape (1, 1, Rx).
         qy_grid:   Scan-frame frequency grid, shape (1, Ry, 1).
         cache:     TCBFCache built by pipeline.build_tcbf_cache (basis only).
