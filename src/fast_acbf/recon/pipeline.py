@@ -284,6 +284,8 @@ class PipelineManager:
             return False
         if self.dataset.is_lazy and self.pipeline != 'speed':
             return False
+        if self.dataset.is_lazy and not self._host_raw_fits(raw_bytes):
+            return False
         free_vram = self._free_vram()
         if free_vram is None:
             return False

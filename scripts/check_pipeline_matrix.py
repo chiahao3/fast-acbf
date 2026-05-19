@@ -82,6 +82,7 @@ RESOURCES = (
     ResourceCase("cpu_ram_fft_only", "cpu", None, 64 * 2**20),
     ResourceCase("cpu_ram_tight", "cpu", None, 8 * 2**20),
     ResourceCase("cuda_full_fit", "cuda", 1024 * 2**20, 512 * 2**20),
+    ResourceCase("cuda_vram_fit_ram_tight", "cuda", 2048 * 2**20, 16 * 2**20),
     ResourceCase("cuda_fft_only_host_raw_fit", "cuda", 32 * 2**20, 512 * 2**20),
     ResourceCase("cuda_fft_only_host_tight", "cuda", 32 * 2**20, 64 * 2**20),
     ResourceCase("cuda_no_fft_host_fit", "cuda", 8 * 2**20, 512 * 2**20),
@@ -110,7 +111,8 @@ PipelineManager behavior tree
    - explicit strategy: respect it, then validate route feasibility
    - auto:
      - device_mask only when storage is persistent, fill=precompute, CUDA is available,
-       pipeline is not memory, and raw+vBF+ImageFFT fit VRAM
+       pipeline is not memory, raw+vBF+ImageFFT fit VRAM, and any lazy raw source
+       can first be materialized in host RAM
      - host_mask if raw is already materialized
      - host_mask for lazy raw only when storage is persistent, pipeline is not memory,
        and raw host materialization plus any host ImageFFT cache fits RAM
@@ -124,7 +126,7 @@ PipelineManager behavior tree
 4. Whole-pass coercions
    - device_mask means whole-pass precompute:
      raw 4D -> device, full vBF -> device, full ImageFFT -> cache, release raw/vBF
-   - device_mask + lazy/on_the_fly or storage=none is invalid
+   - device_mask + fill=lazy/on_the_fly or storage=none is invalid
    - host_mask on a lazy source means host materialization first, so RAM must fit
 
 Nominal sizes in this matrix:
@@ -197,12 +199,24 @@ def assert_invariants(row):
         raise AssertionError(f"device_mask must be whole-pass precompute: {format_row(row)}")
     if row["extractor_request"] == 'auto' and fill != 'precompute' and extractor == 'device_mask':
         raise AssertionError(f"auto extractor chose device_mask for non-precompute: {format_row(row)}")
+    if row["extractor_request"] == 'auto' and dataset.is_lazy and extractor == 'device_mask':
+        if pipeline != 'speed':
+            raise AssertionError(f"only speed may auto-select lazy device_mask: {format_row(row)}")
+        if not host_raw_fits(row["resources"], dataset):
+            raise AssertionError(f"lazy device_mask requires host materialization: {format_row(row)}")
     if row["extractor_request"] == 'auto' and dataset.is_lazy and storage == 'none':
         if not extractor.startswith('disk_'):
             raise AssertionError(f"lazy storage=none should stream from disk: {format_row(row)}")
     if row["extractor_request"] == 'auto' and pipeline == 'memory' and dataset.is_lazy:
         if not extractor.startswith('disk_'):
             raise AssertionError(f"memory preset should not materialize lazy raw: {format_row(row)}")
+
+
+def host_raw_fits(resources, dataset, extra_bytes: int = 0) -> bool:
+    available = resources.available_ram
+    if available is None:
+        return False
+    return dataset.nbytes_float32 + extra_bytes <= int(available * 0.80)
 
 
 def classify(row):
