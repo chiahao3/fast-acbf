@@ -44,6 +44,11 @@ class ImageFFT:
             raise ValueError("imagefft_storage='none' requires imagefft_fill='on_the_fly'.")
         if self.fill == 'on_the_fly' and self.storage != 'none':
             raise ValueError("imagefft_fill='on_the_fly' requires imagefft_storage='none'.")
+        if extractor.strategy == 'device_mask' and self.fill != 'precompute':
+            raise ValueError(
+                "extractor_strategy='device_mask' requires imagefft_fill='precompute'. "
+                "Use a host or disk extraction strategy for lazy/on-the-fly ImageFFT."
+            )
 
         self.nb = extractor.nb
         self.scan_shape = extractor.scan_shape
@@ -59,7 +64,7 @@ class ImageFFT:
         if storage not in _VALID_STORAGE:
             raise ValueError(f"imagefft_storage must be one of {_VALID_STORAGE}, got {storage!r}.")
         if storage == 'auto':
-            return 'none'
+            return 'none'  # safe fallback; use PipelineManager for hardware-aware resolution
         return storage
 
     @staticmethod
@@ -97,6 +102,9 @@ class ImageFFT:
 
     def precompute(self) -> None:
         if self.storage == 'none':
+            return
+        if self.extractor.strategy == 'device_mask':
+            self._precompute_device_mask_all()
             return
         self._ensure_cache()
         for b_start in range(0, self.nb, self.batch_size):
@@ -154,6 +162,27 @@ class ImageFFT:
         else:
             raise AssertionError(f"Cannot store FFT chunk for storage={self.storage!r}.")
         self._filled[b_start:b_end] = True
+
+    def _precompute_device_mask_all(self) -> None:
+        """Whole-pass precompute for the raw-on-device extraction path."""
+        vbf = self.extractor.extract_all()
+        dev = torch.device(self.device)
+        if not isinstance(vbf, torch.Tensor):
+            raise TypeError("device_mask extraction must return a torch.Tensor.")
+        vbf_dev = vbf.to(dev)
+        fft = torch.fft.fft2(vbf_dev, dim=(-2, -1))
+        del vbf, vbf_dev
+
+        if self.storage == 'device':
+            self._cache = fft
+        elif self.storage == 'host':
+            self._cache = fft.cpu().numpy()
+            del fft
+        else:
+            raise AssertionError(f"Cannot precompute FFT for storage={self.storage!r}.")
+        self._filled = np.ones(self.nb, dtype=bool)
+        if dev.type == 'cuda':
+            torch.cuda.empty_cache()
 
     def _compute_fft_chunk(self, b_start: int, b_end: int) -> torch.Tensor:
         vbf = self.extractor.extract_chunk(b_start, b_end)

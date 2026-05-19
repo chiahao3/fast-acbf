@@ -93,7 +93,7 @@ class PipelineManager:
 
     @property
     def imagefft_bytes(self) -> int:
-        return int(self.vbf_bytes * 2)
+        return int(self.vbf_bytes * 2)  # complex64 = 2 x float32 bytes
 
     def build_imagefft(self) -> ImageFFT:
         self.extractor = BFExtractor(
@@ -121,6 +121,9 @@ class PipelineManager:
         extractor_strategy = self._resolve_extractor_strategy(
             storage, fill, raw_bytes, vbf_bytes, imagefft_bytes
         )
+        self._validate_resolved_combination(
+            storage, fill, extractor_strategy, raw_bytes, vbf_bytes, imagefft_bytes
+        )
 
         return PipelineResolution(
             pipeline=self.pipeline,
@@ -134,7 +137,25 @@ class PipelineManager:
 
     def _resolve_storage(self, raw_bytes: int, vbf_bytes: int, imagefft_bytes: int) -> str:
         if self.imagefft_storage_request != 'auto':
-            return self.imagefft_storage_request
+            requested = self.imagefft_storage_request
+            if requested == 'host':
+                available = self._available_ram()
+                if available is not None and imagefft_bytes > int(available * self.ram_margin):
+                    raise RuntimeError(
+                        f"imagefft_storage='host' requires {imagefft_bytes / 2**30:.2f} GiB for "
+                        f"the FFT cache but only {available / 2**30:.2f} GiB RAM is available. "
+                        "Use imagefft_storage='none' to recompute on the fly, or reduce the scan "
+                        "area or aperture to shrink the cache."
+                    )
+            elif requested == 'device':
+                free_vram = self._free_vram()
+                if free_vram is not None and imagefft_bytes > int(free_vram * self.vram_margin):
+                    raise RuntimeError(
+                        f"imagefft_storage='device' requires {imagefft_bytes / 2**30:.2f} GiB for "
+                        f"the FFT cache but only {free_vram / 2**30:.2f} GiB VRAM is free. "
+                        "Use imagefft_storage='host' or 'none'."
+                    )
+            return requested
 
         if self.pipeline == 'memory':
             return 'none'
@@ -184,6 +205,38 @@ class PipelineManager:
         if c0 == 1 and c1 == 1:
             return 'disk_scan_row'
         return 'disk_per_pixel'
+
+    def _validate_resolved_combination(
+        self,
+        storage: str,
+        fill: str,
+        extractor_strategy: str,
+        raw_bytes: int,
+        vbf_bytes: int,
+        imagefft_bytes: int,
+    ) -> None:
+        if extractor_strategy != 'device_mask':
+            return
+        if storage == 'none' or fill != 'precompute':
+            raise ValueError(
+                "extractor_strategy='device_mask' requires persistent ImageFFT storage "
+                "and imagefft_fill='precompute'. Use extractor_strategy='host_mask' or a "
+                "disk strategy for lazy/on-the-fly execution."
+            )
+        dev = torch.device(self.device)
+        if dev.type != 'cuda':
+            return
+        free_vram = self._free_vram()
+        if free_vram is None:
+            return
+        needed = raw_bytes + vbf_bytes + imagefft_bytes
+        if needed > int(free_vram * self.vram_margin):
+            raise RuntimeError(
+                f"extractor_strategy='device_mask' requires about {needed / 2**30:.2f} GiB "
+                f"VRAM for raw data, vBF images, and ImageFFT, but only "
+                f"{free_vram / 2**30:.2f} GiB is free. Use extractor_strategy='host_mask' "
+                "or a disk strategy, or reduce the scan area/aperture."
+            )
 
     def _can_use_device_mask(self, raw_bytes: int, vbf_bytes: int, imagefft_bytes: int) -> bool:
         if self.pipeline == 'memory':

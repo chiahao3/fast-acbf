@@ -212,7 +212,8 @@ class BFSolver:
         """Return (Nb, Ry, Rx) float32 BF image stack.
 
         vBF is not the persistent pipeline product, so this extracts it from
-        the current BFExtractor each time.
+        the current BFExtractor each time.  With ``extractor_strategy='device_mask'``
+        this uploads the full 4D dataset to the compute device on every access.
         """
         vbf = self._pipeline_manager.extractor.extract_all()
         if isinstance(vbf, torch.Tensor):

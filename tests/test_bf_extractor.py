@@ -100,3 +100,48 @@ def test_auto_strategy_detects_scan_major_chunks(tmp_path):
 
     extractor = BFExtractor(Dataset4D.from_hdf5(path), _make_geom(), strategy='auto')
     assert extractor.strategy == 'disk_scan_row'
+
+
+def test_device_mask_precompute_extracts_whole_pass_once():
+    """device_mask precompute is a whole-pass path, independent of FFT batch size."""
+    from fast_acbf.data.imagefft import ImageFFT
+
+    arr = _make_data(shape=(4, 4, 16, 16))
+    ds = Dataset4D(arr)
+
+    raw_access_count = [0]
+    original_raw_array = ds.raw_array
+
+    def counting_raw_array():
+        raw_access_count[0] += 1
+        return original_raw_array()
+
+    ds.raw_array = counting_raw_array  # type: ignore[method-assign]
+
+    geom = _make_geom()
+    extractor = BFExtractor(ds, geom, device='cpu', strategy='device_mask')
+    nb = extractor.nb
+
+    imagefft = ImageFFT(extractor, device='cpu', storage='device', fill='precompute', batch_size=1)
+
+    assert nb > 1, "test requires more than one BF pixel"
+    assert raw_access_count[0] == 1, (
+        f"Expected 1 raw_array() call during precompute but got {raw_access_count[0]}. "
+        "device_mask precompute should extract the full vBF stack in one pass."
+    )
+    assert imagefft.filled.all()
+    assert tuple(imagefft.cache.shape) == (nb, *ds.scan_shape)
+    _ = imagefft  # silence unused-variable warning
+
+
+def test_device_mask_rejects_lazy_imagefft_fill():
+    from fast_acbf.data.imagefft import ImageFFT
+
+    extractor = BFExtractor(
+        Dataset4D(_make_data()),
+        _make_geom(),
+        device='cpu',
+        strategy='device_mask',
+    )
+    with pytest.raises(ValueError, match="device_mask"):
+        ImageFFT(extractor, device='cpu', storage='host', fill='lazy')

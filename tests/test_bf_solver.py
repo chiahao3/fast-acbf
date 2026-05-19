@@ -1040,6 +1040,7 @@ class TestImageFFTPipelineBehavior:
         device,
         *,
         imagefft_fill='auto',
+        extractor_strategy='auto',
     ):
         p = synth_params
         return BFSolver(
@@ -1053,6 +1054,7 @@ class TestImageFFTPipelineBehavior:
             device=device,
             imagefft_storage=imagefft_storage,
             imagefft_fill=imagefft_fill,
+            extractor_strategy=extractor_strategy,
         )
 
     def test_on_the_fly_never_allocates_cache(self, synth_dataset, synth_params, device):
@@ -1141,6 +1143,63 @@ class TestImageFFTPipelineBehavior:
         dev = self._make_solver('device', synth_dataset, synth_params, device).get_acBF(chunk_size=8)
         torch.testing.assert_close(host, ref, atol=1e-5, rtol=1e-5)
         torch.testing.assert_close(dev, ref, atol=1e-5, rtol=1e-5)
+
+    def test_device_mask_requires_precompute(self, synth_dataset, synth_params, device):
+        with pytest.raises(ValueError, match="device_mask"):
+            self._make_solver(
+                'host',
+                synth_dataset,
+                synth_params,
+                device,
+                imagefft_fill='lazy',
+                extractor_strategy='device_mask',
+            )
+
+    def test_device_mask_rejects_on_the_fly_storage(self, synth_dataset, synth_params, device):
+        with pytest.raises(ValueError, match="device_mask"):
+            self._make_solver(
+                'none',
+                synth_dataset,
+                synth_params,
+                device,
+                extractor_strategy='device_mask',
+            )
+
+    def test_explicit_host_storage_oom_raises_descriptive_error(self, synth_dataset, synth_params, device, monkeypatch):
+        """Explicit imagefft_storage='host' must fail with a helpful message when RAM is tight."""
+        import psutil
+        mock_mem = psutil.virtual_memory()._replace(available=1)  # 1 byte available
+        monkeypatch.setattr(psutil, 'virtual_memory', lambda: mock_mem)
+
+        p = synth_params
+        with pytest.raises(RuntimeError, match="imagefft_storage='host'"):
+            BFSolver(
+                dataset=synth_dataset,
+                max_alpha=p["max_alpha"],
+                scan_step_size=p["scan_step_size"],
+                dk=p["dk"],
+                wavelength=p["wavelength"],
+                device=device,
+                imagefft_storage='host',
+            )
+
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+    def test_explicit_device_storage_oom_raises_descriptive_error(self, synth_dataset, synth_params, monkeypatch):
+        """Explicit imagefft_storage='device' must fail with a helpful message when VRAM is tight."""
+        from fast_acbf.recon.pipeline import PipelineManager
+        monkeypatch.setattr(PipelineManager, '_free_vram', lambda self: 1)  # 1 byte free
+
+        p = synth_params
+        with pytest.raises(RuntimeError, match="imagefft_storage='device'"):
+            BFSolver(
+                dataset=synth_dataset,
+                max_alpha=p["max_alpha"],
+                scan_step_size=p["scan_step_size"],
+                dk=p["dk"],
+                wavelength=p["wavelength"],
+                device='cuda',
+                imagefft_storage='device',
+            )
 
 
 @pytest.mark.regression
