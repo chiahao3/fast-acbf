@@ -1,0 +1,168 @@
+"""ImageFFT cache and chunk provider."""
+
+from __future__ import annotations
+
+from typing import TYPE_CHECKING
+
+import numpy as np
+import torch
+
+if TYPE_CHECKING:
+    from fast_acbf.data.bf_extractor import BFExtractor
+
+
+_VALID_STORAGE = ('auto', 'device', 'host', 'none')
+_VALID_FILL = ('auto', 'precompute', 'lazy', 'on_the_fly')
+
+
+class ImageFFT:
+    """Serves virtual-BF FFT chunks to reconstruction code.
+
+    ``ImageFFT`` is the only persistence object in the data pipeline.  It may
+    store computed FFTs on device, store them in host RAM, or store nothing and
+    recompute each requested chunk.
+    """
+
+    def __init__(
+        self,
+        extractor: BFExtractor,
+        *,
+        device: str,
+        storage: str = 'none',
+        fill: str = 'on_the_fly',
+        batch_size: int = 64,
+    ) -> None:
+        self.extractor = extractor
+        self.device = device
+        self.storage = self._normalize_storage(storage)
+        self.fill = self._normalize_fill(fill)
+        self.batch_size = int(batch_size)
+        if self.batch_size <= 0:
+            raise ValueError(f"batch_size must be positive, got {batch_size}.")
+
+        if self.storage == 'none' and self.fill != 'on_the_fly':
+            raise ValueError("imagefft_storage='none' requires imagefft_fill='on_the_fly'.")
+        if self.fill == 'on_the_fly' and self.storage != 'none':
+            raise ValueError("imagefft_fill='on_the_fly' requires imagefft_storage='none'.")
+
+        self.nb = extractor.nb
+        self.scan_shape = extractor.scan_shape
+        self._cache: torch.Tensor | np.ndarray | None = None
+        self._filled: np.ndarray | None = None
+
+        if self.fill == 'precompute':
+            self.precompute()
+
+    @staticmethod
+    def _normalize_storage(storage: str) -> str:
+        storage = str(storage).strip().lower()
+        if storage not in _VALID_STORAGE:
+            raise ValueError(f"imagefft_storage must be one of {_VALID_STORAGE}, got {storage!r}.")
+        if storage == 'auto':
+            return 'none'
+        return storage
+
+    @staticmethod
+    def _normalize_fill(fill: str) -> str:
+        fill = str(fill).strip().lower()
+        if fill not in _VALID_FILL:
+            raise ValueError(f"imagefft_fill must be one of {_VALID_FILL}, got {fill!r}.")
+        if fill == 'auto':
+            return 'on_the_fly'
+        return fill
+
+    @property
+    def cache(self):
+        return self._cache
+
+    @property
+    def filled(self) -> np.ndarray | None:
+        return self._filled
+
+    def get_chunk(self, b_start: int, b_end: int) -> torch.Tensor:
+        """Return ``(b_end-b_start, Ry, Rx)`` complex64 on the compute device."""
+        self._validate_range(b_start, b_end)
+        if self.storage == 'none':
+            return self._compute_fft_chunk(b_start, b_end)
+
+        self._ensure_cache()
+        if self.fill == 'lazy':
+            self._fill_missing(b_start, b_end)
+
+        if self.storage == 'device':
+            return self._cache[b_start:b_end]
+
+        chunk = np.asarray(self._cache[b_start:b_end]).copy()
+        return torch.from_numpy(chunk).to(torch.device(self.device))
+
+    def precompute(self) -> None:
+        if self.storage == 'none':
+            return
+        self._ensure_cache()
+        for b_start in range(0, self.nb, self.batch_size):
+            b_end = min(b_start + self.batch_size, self.nb)
+            self._store_fft_chunk(b_start, b_end)
+
+    def clear(self) -> None:
+        self._cache = None
+        self._filled = None
+        if torch.device(self.device).type == 'cuda':
+            torch.cuda.empty_cache()
+
+    def _validate_range(self, b_start: int, b_end: int) -> None:
+        if not (0 <= b_start <= b_end <= self.nb):
+            raise ValueError(f"Invalid ImageFFT chunk range [{b_start}, {b_end}) for nb={self.nb}.")
+
+    def _ensure_cache(self) -> None:
+        if self._cache is not None:
+            return
+        Ry, Rx = self.scan_shape
+        if self.storage == 'device':
+            self._cache = torch.empty(
+                (self.nb, Ry, Rx), dtype=torch.complex64, device=torch.device(self.device)
+            )
+        elif self.storage == 'host':
+            self._cache = np.empty((self.nb, Ry, Rx), dtype=np.complex64)
+        else:
+            raise AssertionError(f"Unhandled storage {self.storage!r}.")
+        self._filled = np.zeros(self.nb, dtype=bool)
+
+    def _fill_missing(self, b_start: int, b_end: int) -> None:
+        missing = ~self._filled[b_start:b_end]
+        if not missing.any():
+            return
+        local = np.where(missing)[0]
+        run_start = None
+        prev = None
+        for idx in local.tolist():
+            absolute = b_start + idx
+            if run_start is None:
+                run_start = absolute
+            elif prev is not None and absolute != prev + 1:
+                self._store_fft_chunk(run_start, prev + 1)
+                run_start = absolute
+            prev = absolute
+        if run_start is not None:
+            self._store_fft_chunk(run_start, prev + 1)
+
+    def _store_fft_chunk(self, b_start: int, b_end: int) -> None:
+        fft = self._compute_fft_chunk(b_start, b_end)
+        if self.storage == 'device':
+            self._cache[b_start:b_end] = fft
+        elif self.storage == 'host':
+            self._cache[b_start:b_end] = fft.cpu().numpy()
+        else:
+            raise AssertionError(f"Cannot store FFT chunk for storage={self.storage!r}.")
+        self._filled[b_start:b_end] = True
+
+    def _compute_fft_chunk(self, b_start: int, b_end: int) -> torch.Tensor:
+        vbf = self.extractor.extract_chunk(b_start, b_end)
+        dev = torch.device(self.device)
+        if isinstance(vbf, torch.Tensor):
+            vbf_dev = vbf.to(dev)
+        else:
+            vbf_dev = torch.from_numpy(vbf).to(dev)
+        return torch.fft.fft2(vbf_dev, dim=(-2, -1))
+
+
+__all__ = ["ImageFFT"]
