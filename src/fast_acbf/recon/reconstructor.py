@@ -38,22 +38,23 @@ def _crop_to_original(
     image: torch.Tensor,
     pad_offsets: tuple[int, int],
     orig_shape: tuple[int, int],
-    padded_shape: tuple[int, int],
+    upscale: float,
 ) -> torch.Tensor:
     """Crop a (possibly upscaled) padded image back to the original FOV.
 
-    Derives the effective scale factor from the actual image dimensions rather
-    than from a nominal upscale value, so fractional upscales with 5-smooth
-    rounding produce the physically correct crop for any image size.
+    Output shape is (round(Ry*U), round(Rx*U)) — determined by the user-supplied
+    upscale factor, not by the internal 5-smooth padded size.  This keeps output
+    shapes predictable for stacks, exports, and downstream comparisons.  The
+    continuous-space boundary drifts by at most one pixel relative to the exact
+    padded-grid boundary; callers that need exact physical coordinates should use
+    BFSolver.get_pixel_size() and the padded_scan_shape property.
     """
     pad_y, pad_x = pad_offsets
     Ry, Rx = orig_shape
-    Ry_padded, Rx_padded = padded_shape
-    Ry_out, Rx_out = image.shape[-2], image.shape[-1]
-    y0 = round(pad_y * Ry_out / Ry_padded)
-    y1 = y0 + round(Ry * Ry_out / Ry_padded)
-    x0 = round(pad_x * Rx_out / Rx_padded)
-    x1 = x0 + round(Rx * Rx_out / Rx_padded)
+    y0 = round(pad_y * upscale)
+    y1 = y0 + round(Ry * upscale)
+    x0 = round(pad_x * upscale)
+    x1 = x0 + round(Rx * upscale)
     return image[y0:y1, x0:x1]
 
 
@@ -273,7 +274,7 @@ class BFReconstructor:
 
         # fov crop — only when padding was used
         if self._pad_offsets is not None and fov == 'original':
-            result = _crop_to_original(result, self._pad_offsets, self._orig_scan_shape, self.scan_geom.scan_shape)
+            result = _crop_to_original(result, self._pad_offsets, self._orig_scan_shape, upscale)
 
         return result
 

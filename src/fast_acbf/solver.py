@@ -315,6 +315,19 @@ class BFSolver:
     def upscale(self) -> float:
         return self._upscale
 
+    def get_pixel_size(self, upscale: float | None = None) -> float:
+        """Physical size of one output pixel in Angstroms.
+
+        For fov='original' outputs the shape is (round(Ry*U), round(Rx*U)) and
+        each pixel represents scan_step_size/U Angstroms.  The continuous-space
+        boundary of the original FOV may drift by up to one pixel relative to the
+        exact padded-grid boundary; use padded_scan_shape to compute exact extents.
+        """
+        u = float(upscale) if upscale is not None else self._upscale
+        if u < 1.0:
+            raise ValueError(f"upscale must be >= 1.0, got {upscale}.")
+        return self.scan_step_size / u
+
     @property
     def pipeline(self) -> str:
         return self._pipeline_manager.resolution.pipeline
@@ -596,11 +609,10 @@ class BFSolver:
         # Crop only real-space outputs; leave Fourier maps untouched
         if self._recon._pad_offsets is not None and f == 'original':
             real_space_keys = ('image', 'complex_image', 'real_channel', 'imag_channel')
-            padded_shape = self._recon.scan_geom.scan_shape
             for k in real_space_keys:
                 if k in result:
                     result[k] = _crop_to_original(
-                        result[k], self._recon._pad_offsets, self._recon._orig_scan_shape, padded_shape
+                        result[k], self._recon._pad_offsets, self._recon._orig_scan_shape, u
                     )
         return result
 
