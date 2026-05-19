@@ -44,6 +44,56 @@ If you prefer a legacy version of PyTorch, or a different version of CUDA runtim
 1. Download the demo tBL-WSe2 data "Figure 4.zip" from the [Zenodo link](https://doi.org/10.5281/zenodo.15283331)
 2. Run the `get_acBF.ipynb` Jupyter notebook to reconstruct tcBF / acBF images
 
+## Data Pipeline Defaults
+
+`BFSolver` is the main user entry point. By default it uses
+`pipeline="balanced"` with automatic policy resolution:
+
+```python
+from fast_acbf import BFSolver
+from fast_acbf.data import Dataset4D
+
+dataset = Dataset4D.from_hdf5("scan.h5", key="array")  # lazy by default
+
+solver = BFSolver(
+    dataset=dataset,
+    max_alpha=25.0,
+    scan_step_size=0.43,
+    dk=0.04,
+    wavelength=0.04176,
+    device="cuda",
+)
+```
+
+The solver consumes `ImageFFT` chunks internally. The policy controls where that
+FFT cache lives, when it is filled, and how virtual BF images are extracted from
+the raw 4D data.
+
+| Pipeline | Intended use | Default behavior |
+| --- | --- | --- |
+| `speed` | Small data that can afford temporary materialization | Prefer device ImageFFT and, when raw 4D can be materialized and fit in VRAM with vBF/ImageFFT, do a whole-pass `device_mask` precompute. |
+| `balanced` | General default | Cache ImageFFT on device if it fits, otherwise host RAM, otherwise stream. Avoids raw-on-device extraction for lazy disk data unless explicitly requested. |
+| `memory` | Largest data / lowest persistent memory | Keep `imagefft_storage="none"` and compute on the fly, using disk extraction for lazy data. |
+
+Advanced users can override the resolved policy:
+
+```python
+solver = BFSolver(
+    dataset=dataset,
+    ...,
+    pipeline="balanced",
+    imagefft_storage="host",     # auto | device | host | none
+    imagefft_fill="precompute",  # auto | precompute | lazy | on_the_fly
+    extractor_strategy="auto",   # auto | device_mask | host_mask | disk_*
+)
+```
+
+Impossible or wasteful combinations are rejected early with memory/path guidance.
+For example, `extractor_strategy="device_mask"` requires persistent ImageFFT
+storage and `imagefft_fill="precompute"` because it is a whole-pass route:
+temporarily move raw 4D to the compute device, extract all vBF images, precompute
+ImageFFT, then release raw/vBF intermediates.
+
 ## References
 
 [1] Ma, Desheng, et al. "Information in 4D-STEM: Where it is, and How to Use it." Ultramicroscopy (2026). https://doi.org/10.1016/j.ultramic.2026.114351

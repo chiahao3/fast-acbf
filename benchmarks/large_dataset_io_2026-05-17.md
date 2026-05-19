@@ -124,7 +124,7 @@ At this data size the GPU FFT dominates, not the disk.
 
 ## 6. Best Practices
 
-### 6.1 Always use `imagefft_storage='host'` when RAM allows
+### 6.1 Prefer persistent ImageFFT storage when memory allows
 
 `imagefft_storage='none'` re-reads from disk on every reconstruction pass and
 avoids allocating the FFT cache.  For a single reconstruction this saves RAM but
@@ -133,12 +133,17 @@ parameter sweeps, AD refinement) the cached modes are far superior:
 
 - `host`: cache fits in RAM → all subsequent reconstructions are ~2–3 s (pure GPU).
 - `device`: cache fits in VRAM → fastest warm reconstructions (~0.03–0.07 s), but
-  requires the full dataset to be in VRAM first, so only viable for small datasets.
+  only the ImageFFT cache is persistent. For small datasets the `speed` pipeline
+  may temporarily put raw 4D on device for a whole-pass precompute; for larger
+  lazy datasets it can still stream from disk into a device ImageFFT cache.
 - `none`: no cache → every pass reads ~2–3 GiB (detector-chunks) or the full
   file (contiguous).  Use only when RAM is genuinely exhausted.
 
-`imagefft_storage='auto'` selects `device` → `host` → `none` in priority order
-based on available VRAM and RAM, so the default is already sensible.
+The default `pipeline='balanced'` with `imagefft_storage='auto'` selects
+`device` → `host` → `none` for the ImageFFT cache based on available VRAM and
+RAM, so the default is already sensible. `pipeline='speed'` is more willing to
+materialize lazy raw data when it fits; `pipeline='memory'` keeps
+`imagefft_storage='none'`.
 
 The FFT cache size is `Nb × Ry × Rx × 8` bytes (complex64).  For 697 BF pixels and
 a 1024×1024 scan this is ~5.5 GiB — easily fits in the 22 GiB available here.
@@ -169,14 +174,18 @@ temporary space during conversion).
 
 ### 6.3 `extractor_strategy` is auto-detected and should rarely need manual override
 
-`BFExtractor(strategy='auto')` inspects the HDF5 chunk layout and sets
-`extractor_strategy` automatically:
+`PipelineManager` resolves `extractor_strategy` automatically from the pipeline,
+ImageFFT storage/fill policy, memory budget, and HDF5 chunk layout:
 
-| HDF5 layout | Detected mode | Prefill strategy |
+| HDF5 layout / memory state | Auto strategy |
 |---|---|---|
-| Contiguous (chunks=None) | `disk_slab` | `disk_scan_row` for prefill — scans full file row by row |
-| Detector-major (Ry,Rx,1,1) | `disk_per_pixel` | one h5py call per BF pixel |
-| Scan-major (1,1,Ky,Kx) | `disk_scan_row` | scan-row streaming |
+| Raw 4D already materialized | `host_mask` |
+| Small lazy data under `speed`, raw+vBF+ImageFFT fit VRAM and raw fits RAM | `device_mask` whole-pass precompute |
+| Lazy raw fits RAM and ImageFFT storage is persistent | `host_mask` |
+| Contiguous lazy file + precompute | `disk_scan_row` |
+| Contiguous lazy file + on-the-fly | `disk_slab` |
+| Detector-major (Ry,Rx,1,1) | `disk_per_pixel` |
+| Scan-major (1,1,Ky,Kx) | `disk_scan_row` |
 
 The `disk_slab` mode is correct for contiguous files in both `host` and `none`
 contexts — it reads only the ky bounding box per `BFExtractor.extract_chunk()` call, avoiding a

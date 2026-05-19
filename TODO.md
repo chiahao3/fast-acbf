@@ -37,10 +37,11 @@
 
 
 ## Pipeline & Integration
-- Setup a dataloader path so we can run datasets larger than VRAM, or even RAM
-  - `imagefft_storage='none'` now streams directly from disk at practical speeds (see lazy
-    disk-streaming in Existing features). Remaining gap: reconstruction still stalls while
-    waiting for each disk read — prefetching would hide this latency.
+- Add asynchronous disk prefetch for the lazy disk strategies. `PipelineManager`
+  now provides coherent speed/balanced/memory routes for data larger than VRAM
+  or RAM, but reconstruction can still stall while waiting for each disk read.
+- Decide whether benchmark result files should be versioned as historical
+  artifacts or regenerated after the pipeline rewrite.
 
 
 # Existing features
@@ -52,13 +53,26 @@
 - scan rotation line search (`refine_scan_rotation`): sweep over rotation_deg with cache invalidation
 - flip/transpose exhaustive search (`refine_flips`): scores all 8 combinations of flipud × fliplr × transpose
 - aberration optimization with AD (`refine_aberrations`, controlled by `max_order`, `lr`, and `lr_scales`)
+- Pipeline presets (`speed`, `balanced`, `memory`) resolve storage, fill timing,
+  and BF extraction into coherent routes. Explicit `imagefft_storage`,
+  `imagefft_fill`, and `extractor_strategy` overrides are still respected when
+  feasible.
 - 3 ImageFFT storage modes (`device`, `host`, `none`) to trade off speed vs. memory: `device` caches ImageFFT on the compute device, `host` caches ImageFFT in RAM, `none` streams with no persistent FFT cache
+- ImageFFT fill policies (`precompute`, `lazy`, `on_the_fly`): presets choose
+  `precompute` whenever persistent ImageFFT storage is selected, while
+  `memory` defaults to `on_the_fly`.
 - soft aperture with cosine rolloff (`rolloff` param in `reconstruct()`)
 - multiple focus quality metrics: `laplacian` (variance of Laplacian), `sobel` (Tenengrad), `normalized_std`
 - coordinate transform flags (flipud, fliplr, transpose, rotation_deg) matching PtyRAD's `meas_flipT`; used when computing scan-frame vs detector-frame outputs
 - visualization: shift quiver over BF disk (`plot_shift_quiver`), chi surface (`plot_chi_surface`), reconstruction + probe side-by-side (`plot_reconstruction`), defocus/rotation line searches, flip/transpose search grid
 - `get_acBF_diagnostics`: returns transfer power map, support mask, and complex image channels for complex-inversion debugging
 - Export 3D defocus volume stack (`get_defocus_stack`)
-- Smart disk-streaming for `none` mode: automatically selects the best BFExtractor strategy based on how the file is stored on disk, up to ×1283 faster than the naive approach. Can be overridden via `extractor_strategy` on `BFSolver`.
+- Smart BF extraction policy: `device_mask` is a whole-pass precompute route,
+  `host_mask` materializes raw data in RAM when it fits, and disk strategies
+  stream lazy sources based on HDF5/Zarr chunk layout. Can be overridden via
+  `extractor_strategy` on `BFSolver`.
+- Exhaustive pipeline matrix checker (`scripts/check_pipeline_matrix.py`) that
+  verifies all-auto routes degrade instead of failing and catches wasteful
+  strategy/storage/fill combinations.
 - Modular package structure: `core/` (portable physics), `recon/pipeline.py` (pipeline policy), `optimization/` (metrics + refinement), `vis/` (plotting)
 - py4D-browser-fast-acbf as a interactive GUI (currently only in Muller group Github repo @ Cornell)
