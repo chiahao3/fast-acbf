@@ -3,7 +3,7 @@
 
 Covers:
   - 48 GiB dataset (768, 1024, 128, 128): attempt full materialization + lazy+host
-  - 64 GiB dataset (1024, 1024, 128, 128): lazy+host and lazy+on_the_fly
+  - 64 GiB dataset (1024, 1024, 128, 128): lazy+host and lazy+none
   - Contiguous and detector-chunked HDF5 layouts for each
 
 Times reported per step:
@@ -57,7 +57,7 @@ def hdr(title: str) -> None:
 
 OUTPUT_DIR = Path(__file__).parent.parent / 'output'
 
-def make_solver(ds, cache_mode: str):
+def make_solver(ds, imagefft_storage: str, extractor_strategy: str = 'auto'):
     from fast_acbf import BFSolver
     return BFSolver(
         dataset=ds,
@@ -69,7 +69,8 @@ def make_solver(ds, cache_mode: str):
         aberrations={'C10': 80.0},
         coord_transform={'flipud': True},
         device=DEVICE,
-        cache_mode=cache_mode,
+        imagefft_storage=imagefft_storage,
+        extractor_strategy=extractor_strategy,
     )
 
 
@@ -124,43 +125,46 @@ def run_materialized_oom(results: dict) -> None:
 
 def run_lazy_tcbf(
     path: Path,
-    cache_mode: str,
+    imagefft_storage: str,
     results: dict,
-    lazy_read_mode: str = 'auto',
+    extractor_strategy: str = 'auto',
 ) -> None:
     """Lazy load + tcBF reconstruction: time init, cache fill, warm-up."""
     from fast_acbf.data.dataset4d import Dataset4D
 
     file_size_gib = path.stat().st_size / 2**30
     layout = 'detector-chunks' if 'detector_chunks' in path.name else 'contiguous'
-    label = f'{file_size_gib:.0f}GiB-{layout}-{cache_mode}'
+    label = f'{file_size_gib:.0f}GiB-{layout}-{imagefft_storage}'
 
-    hdr(f'{file_size_gib:.0f} GiB {layout} — lazy + cache_mode={cache_mode}')
+    hdr(f'{file_size_gib:.0f} GiB {layout} — lazy + imagefft_storage={imagefft_storage}')
     print(f'  File: {path}  ({file_size_gib:.1f} GiB)')
-    print(f'  lazy_read_mode: {lazy_read_mode!r}')
+    print(f'  extractor_strategy: {extractor_strategy!r}')
 
     # Step 1: Dataset4D init
     print('\n  Step 1: Dataset4D init')
     t0 = time.perf_counter()
-    ds = Dataset4D.from_hdf5(path, key=HDF5_KEY, materialize=False,
-                              lazy_read_mode=lazy_read_mode)
+    ds = Dataset4D.from_hdf5(path, key=HDF5_KEY, materialize=False)
     t_init = time.perf_counter() - t0
-    detected = ds.lazy_read_mode
     print(f'    {t_init:.3f} s  shape={ds.scan_shape + ds.detector_shape}  '
-          f'is_lazy={ds.is_lazy}  lazy_read_mode={detected!r}')
+          f'is_lazy={ds.is_lazy}  chunks={ds.backend_chunks!r}')
 
     # Step 2: BFSolver init
     print('\n  Step 2: BFSolver init')
     t0 = time.perf_counter()
     try:
-        solver = make_solver(ds, cache_mode=cache_mode)
+        solver = make_solver(
+            ds,
+            imagefft_storage=imagefft_storage,
+            extractor_strategy=extractor_strategy,
+        )
         t_solver = time.perf_counter() - t0
-        Nb = solver._recon.provider.nb
+        Nb = solver._recon.imagefft.nb
         Ry, Rx = ds.scan_shape
         fft_cache_gib = Nb * Ry * Rx * 8 / 2**30
         useful_gib = Nb * Ry * Rx * 4 / 2**30
         print(f'    {t_solver:.3f} s  Nb={Nb}  scan={Ry}×{Rx}  '
-              f'FFT cache={fft_cache_gib:.2f} GiB  useful BF data={useful_gib:.2f} GiB')
+              f'FFT {fft_cache_gib:.2f} GiB  useful BF data={useful_gib:.2f} GiB  '
+              f'extractor={solver.extractor_strategy!r}')
     except RuntimeError as exc:
         t_solver = time.perf_counter() - t0
         print(f'    FAILED {t_solver:.2f} s: {exc}')
@@ -185,14 +189,14 @@ def run_lazy_tcbf(
 
     # Step 4: warm-up reconstruction (cache hot, no disk I/O)
     t_warm = None
-    if cache_mode != 'on_the_fly':
+    if imagefft_storage != 'none':
         print('\n  Step 4: tcBF warm-up reconstruction (cache hot)')
         t0 = time.perf_counter()
         solver.reconstruct(mode='tcBF', requires_grad=False)
         t_warm = time.perf_counter() - t0
         print(f'    Done in {t_warm:.2f} s')
     else:
-        print('\n  Step 4: warm-up SKIPPED (on_the_fly has no cache)')
+        print('\n  Step 4: warm-up SKIPPED (none has no cache)')
 
     ds.close()
     gc.collect()
@@ -200,7 +204,7 @@ def run_lazy_tcbf(
         torch.cuda.empty_cache()
 
     results[label] = {
-        'lazy_read_mode': detected,
+        'extractor_strategy': solver.extractor_strategy,
         'init_s': t_init,
         'solver_s': t_solver,
         'tcBF_first_s': t_first,
@@ -255,9 +259,9 @@ def main():
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
 
-    # Scenario F: 64 GiB contiguous, lazy + on_the_fly
+    # Scenario F: 64 GiB contiguous, lazy + none
     if FILE_64GiB.exists():
-        run_lazy_tcbf(FILE_64GiB, 'on_the_fly', results)
+        run_lazy_tcbf(FILE_64GiB, 'none', results)
         gc.collect()
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
@@ -265,7 +269,7 @@ def main():
     # ── Summary ────────────────────────────────────────────────────────────────
     hdr('Timing Summary')
     col = 44
-    print(f'  {"Scenario":<{col}}  {"tcBF-first":>12}  {"tcBF-warm":>12}  {"lazy_read_mode":>16}')
+    print(f'  {"Scenario":<{col}}  {"tcBF-first":>12}  {"tcBF-warm":>12}  {"extractor_strategy":>16}')
     print(f'  {"-"*col}  {"-"*12}  {"-"*12}  {"-"*16}')
     for scenario, r in results.items():
         if r.get('error') == 'OOM-materialize':
@@ -275,7 +279,7 @@ def main():
             tf = f'{r.get("tcBF_first_s", float("nan")):.2f} s'
             tw_val = r.get('tcBF_warm_s')
             tw = f'{tw_val:.2f} s' if tw_val is not None else 'skipped'
-            lm = r.get('lazy_read_mode', '-')
+            lm = r.get('extractor_strategy', '-')
         print(f'  {scenario:<{col}}  {tf:>12}  {tw:>12}  {lm:>16}')
     print()
 

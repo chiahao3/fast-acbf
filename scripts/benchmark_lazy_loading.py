@@ -10,14 +10,13 @@ Two file layouts compared:
                   pixel spanning all scan positions.
 
 Two loading strategies:
-  sequential   stream_all_bf_images():          reads one scan row at a time.
+  sequential   BFExtractor(strategy='disk_scan_row'): reads one scan row at a time.
                I/O = full file (48–64 GiB); optimal for contiguous files.
-  per_pixel    stream_all_bf_images_per_pixel(): reads one h5py chunk per BF pixel.
+  per_pixel    BFExtractor(strategy='disk_per_pixel'): reads one h5py chunk per BF pixel.
                I/O = Nb/（Ky*Kx) × file (~4% for 25 mrad); optimal for detector chunks.
 
-The benchmark also runs through all three legacy lazy_read_mode values
-(per_pixel, scan_row, slab) via get_bf_chunk() on the 1 GiB file so the
-single-call vs chunked-loop trade-offs remain visible.
+The benchmark also runs through BFExtractor disk strategies on the 1 GiB file
+so the single-call vs chunked-loop trade-offs remain visible.
 
 Usage
 -----
@@ -26,7 +25,7 @@ Usage
     # Test specific lazy mode on a single file (legacy interface):
     conda run -n fast-acbf python scripts/benchmark_lazy_loading.py \\
         --file ~/scratch/fast_acbf_large_test/scan_x128_y128_detector_chunks.hdf5 \\
-        --lazy-mode per_pixel
+        --extractor-strategy disk_per_pixel
 """
 
 from __future__ import annotations
@@ -77,6 +76,17 @@ def get_bf_indices(ds) -> tuple[np.ndarray, np.ndarray]:
     return bf_iy, bf_ix
 
 
+def make_extractor(ds, strategy='auto'):
+    from fast_acbf.data.bf_extractor import BFExtractor
+    from fast_acbf.data.geometry import DetectorGeometry
+    geom = DetectorGeometry.from_params(
+        detector_shape=ds.detector_shape,
+        max_alpha=MAX_ALPHA, dk=DK, wavelength=WAVELENGTH,
+        device='cpu',
+    )
+    return BFExtractor(ds, geom, strategy=strategy, device='cpu')
+
+
 def measure_seq_read_speed(path: Path, max_bytes: int = 512 * 2**20) -> float:
     """Sequential read speed in GB/s, reading up to max_bytes from path."""
     n = min(max_bytes, path.stat().st_size)
@@ -91,17 +101,17 @@ def measure_seq_read_speed(path: Path, max_bytes: int = 512 * 2**20) -> float:
     return total / 1e9 / (time.perf_counter() - t0)
 
 
-# ── Prefill benchmarks (stream_all_bf_images* paths) ──────────────────────────
+# ── Prefill benchmarks (BFExtractor disk strategies) ──────────────────────────
 
 def bench_prefill(name: str, path: Path, results: list) -> None:
-    """Benchmark stream_all_bf_images and stream_all_bf_images_per_pixel."""
+    """Benchmark disk_scan_row and disk_per_pixel extraction."""
     from fast_acbf.data.dataset4d import Dataset4D
 
     file_gib = path.stat().st_size / 2**30
     print(f'\n  {name}  ({file_gib:.1f} GiB)')
 
     ds = Dataset4D.from_hdf5(path, key=HDF5_KEY, materialize=False)
-    lrm = ds.lazy_read_mode
+    auto_strategy = make_extractor(ds, strategy='auto').strategy
     bf_iy, bf_ix = get_bf_indices(ds)
     Nb = len(bf_iy)
     Ry, Rx = ds.scan_shape
@@ -109,7 +119,7 @@ def bench_prefill(name: str, path: Path, results: list) -> None:
     bf_frac = Nb / (Ky * Kx)
     useful_gib = Nb * Ry * Rx * 4 / 2**30
 
-    print(f'    lazy_read_mode={lrm!r}  Nb={Nb} ({bf_frac*100:.1f}% of detector)  '
+    print(f'    extractor_strategy={auto_strategy!r}  Nb={Nb} ({bf_frac*100:.1f}% of detector)  '
           f'useful={useful_gib:.2f} GiB')
 
     # Determine which strategies make sense for this layout
@@ -118,16 +128,16 @@ def bench_prefill(name: str, path: Path, results: list) -> None:
 
     # sequential: always available; catastrophic for detector-chunked on large scans
     seq_io_gib = Ry * Rx * Ky * Kx * 4 / 2**30
-    strategies.append(('sequential', 'stream_all_bf_images', seq_io_gib))
+    strategies.append(('disk_scan_row', 'BFExtractor.disk_scan_row', seq_io_gib))
 
     # per_pixel: always available; catastrophic for contiguous on large scans
     pp_io_gib = useful_gib
-    strategies.append(('per_pixel', 'stream_all_bf_images_per_pixel', pp_io_gib))
+    strategies.append(('disk_per_pixel', 'BFExtractor.disk_per_pixel', pp_io_gib))
 
     for strat, fn_name, io_gib in strategies:
         is_bad = (
-            (strat == 'per_pixel' and lrm != 'per_pixel' and large_scan) or
-            (strat == 'sequential' and lrm == 'per_pixel' and large_scan)
+            (strat == 'disk_per_pixel' and auto_strategy != 'disk_per_pixel' and large_scan) or
+            (strat == 'disk_scan_row' and auto_strategy == 'disk_per_pixel' and large_scan)
         )
         tag = ' [SLOW — wrong layout]' if is_bad else ''
         print(f'    [{fn_name}]{tag}  '
@@ -139,10 +149,7 @@ def bench_prefill(name: str, path: Path, results: list) -> None:
             continue
 
         t0 = time.perf_counter()
-        if strat == 'sequential':
-            raw = ds.stream_all_bf_images(bf_iy, bf_ix)
-        else:
-            raw = ds.stream_all_bf_images_per_pixel(bf_iy, bf_ix)
+        raw = make_extractor(ds, strategy=strat).extract_all()
         elapsed = time.perf_counter() - t0
         throughput = io_gib / 1.024**3 / elapsed  # GB/s (not GiB/s)
 
@@ -151,7 +158,7 @@ def bench_prefill(name: str, path: Path, results: list) -> None:
         gc.collect()
 
         results.append({
-            'file': name, 'file_gib': file_gib, 'layout': lrm,
+            'file': name, 'file_gib': file_gib, 'layout': auto_strategy,
             'strategy': strat, 'fn': fn_name,
             'io_gib': io_gib, 'elapsed_s': elapsed, 'throughput_gbs': throughput,
             'Nb': Nb, 'scan': f'{Ry}x{Rx}',
@@ -161,10 +168,10 @@ def bench_prefill(name: str, path: Path, results: list) -> None:
     gc.collect()
 
 
-# ── Legacy single-file mode benchmark (get_bf_chunk with lazy_read_mode) ──────
+# ── Single-file BFExtractor strategy benchmark ────────────────────────────────
 
 def bench_single_file_modes(path: Path, modes: list[str], runs: int) -> None:
-    """Benchmark get_bf_chunk() across explicit lazy_read_mode values."""
+    """Benchmark BFExtractor disk strategies."""
     from fast_acbf.data.dataset4d import Dataset4D
 
     hdr(f'Single-file mode comparison: {path.name}')
@@ -183,12 +190,13 @@ def bench_single_file_modes(path: Path, modes: list[str], runs: int) -> None:
     print(f'  Nb={Nb}  ({100*Nb/(Ky*Kx):.1f}% of detector)\n')
 
     for mode in modes:
-        ds = Dataset4D.from_hdf5(path, key=HDF5_KEY, lazy_read_mode=mode, materialize=False)
+        ds = Dataset4D.from_hdf5(path, key=HDF5_KEY, materialize=False)
+        extractor = make_extractor(ds, strategy=mode)
         times = []
         for _ in range(runs):
             gc.collect()
             t0 = time.perf_counter()
-            raw = ds.get_bf_chunk(bf_iy, bf_ix)
+            raw = extractor.extract_all()
             elapsed = time.perf_counter() - t0
             times.append(elapsed)
             del raw
@@ -207,9 +215,9 @@ def main(argv=None):
                                      formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument('--file', default=None,
                         help='Single file to benchmark (enables legacy mode-comparison)')
-    parser.add_argument('--lazy-mode', nargs='+',
-                        default=['per_pixel', 'scan_row', 'slab'],
-                        help='lazy_read_mode values to test in single-file mode')
+    parser.add_argument('--extractor-strategy', nargs='+',
+                        default=['disk_per_pixel', 'disk_scan_row', 'disk_slab'],
+                        help='BFExtractor strategies to test in single-file mode')
     parser.add_argument('--runs', type=int, default=2,
                         help='Timing repetitions per scenario')
     args = parser.parse_args(argv)
@@ -221,8 +229,7 @@ def main(argv=None):
     print(f'  Physics: wavelength={WAVELENGTH} Å  max_alpha={MAX_ALPHA} mrad  dk={DK} Å⁻¹/px')
 
     if args.file:
-        # Legacy single-file mode comparison
-        bench_single_file_modes(Path(args.file).expanduser(), args.lazy_mode, args.runs)
+        bench_single_file_modes(Path(args.file).expanduser(), args.extractor_strategy, args.runs)
         return
 
     # ── Multi-file prefill benchmark ───────────────────────────────────────────
@@ -241,7 +248,7 @@ def main(argv=None):
             print(f'  {gbs:.2f} GB/s  (from {path.name})')
             break
 
-    hdr('Prefill Benchmark: stream_all_bf_images vs stream_all_bf_images_per_pixel')
+    hdr('Prefill Benchmark: BFExtractor disk_scan_row vs disk_per_pixel')
     results: list[dict] = []
     for name, path in available.items():
         bench_prefill(name, path, results)

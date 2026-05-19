@@ -113,7 +113,7 @@ def build_solver(dataset: np.ndarray, geom: common.DetectorGeometry, args: argpa
         max_order=args.max_order,
         aberrations={"C10": 0.0},
         device=args.device,
-        cache_mode=args.cache_mode,
+        imagefft_storage=args.imagefft_storage,
     )
 
 
@@ -153,7 +153,7 @@ def benchmark_case(args: argparse.Namespace) -> dict:
 
     result = {
         "recon_mode": recon_mode,
-        "cache_mode": args.cache_mode,
+        "imagefft_storage": args.imagefft_storage,
         "requested_nb": int(args.nb),
         "actual_nb": int(vbf_host.shape[0]),
         "ry": int(args.ry),
@@ -271,7 +271,7 @@ def load_existing(path: Path) -> dict[tuple, dict]:
 def result_key(row: dict) -> tuple:
     return (
         common.normalize_recon_mode(row.get("recon_mode")),
-        row.get("cache_mode"),
+        row.get("imagefft_storage"),
         int(row.get("requested_nb")),
         int(row.get("ry")),
         int(row.get("max_order")),
@@ -293,8 +293,8 @@ def run_child_case(script: Path, args: argparse.Namespace, case: dict) -> dict:
         args.device,
         "--recon-mode",
         case["recon_mode"],
-        "--cache-mode",
-        case["cache_mode"],
+        "--imagefft-storage",
+        case["imagefft_storage"],
         "--nb",
         str(case["nb"]),
         "--ry",
@@ -333,7 +333,7 @@ def run_child_case(script: Path, args: argparse.Namespace, case: dict) -> dict:
     except subprocess.TimeoutExpired as exc:
         return {
             "recon_mode": case["recon_mode"],
-            "cache_mode": case["cache_mode"],
+            "imagefft_storage": case["imagefft_storage"],
             "requested_nb": case["nb"],
             "ry": case["scan"],
             "rx": case["scan"],
@@ -351,7 +351,7 @@ def run_child_case(script: Path, args: argparse.Namespace, case: dict) -> dict:
 
     return {
         "recon_mode": case["recon_mode"],
-        "cache_mode": case["cache_mode"],
+        "imagefft_storage": case["imagefft_storage"],
         "requested_nb": case["nb"],
         "ry": case["scan"],
         "rx": case["scan"],
@@ -366,7 +366,7 @@ def write_csv(path: Path, rows: list[dict]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     fields = [
         "recon_mode",
-        "cache_mode",
+        "imagefft_storage",
         "requested_nb",
         "actual_nb",
         "ry",
@@ -415,7 +415,7 @@ def write_markdown(path: Path, rows: list[dict]) -> None:
         rows,
         key=lambda r: (
             str(r.get("recon_mode")),
-            str(r.get("cache_mode")),
+            str(r.get("imagefft_storage")),
             int(r.get("max_order", 0)),
             int(r.get("ry", 0)),
             int(r.get("requested_nb", 0)),
@@ -443,7 +443,7 @@ def write_markdown(path: Path, rows: list[dict]) -> None:
         f.write("|---|---|---:|---:|---:|---:|---|---:|---:|---:|---:|---:|\n")
         for row in rows:
             f.write(
-                f"| {row.get('recon_mode')} | {row.get('cache_mode')} | "
+                f"| {row.get('recon_mode')} | {row.get('imagefft_storage')} | "
                 f"{row.get('max_order')} | {row.get('ry')} | "
                 f"{row.get('requested_nb')} | {row.get('actual_nb', '')} | "
                 f"{row.get('status')} | "
@@ -461,14 +461,14 @@ def write_summary_tables(f, rows: list[dict]) -> None:
     f.write("| recon | cache | max_order | Nb~512 | Nb=1024 | Nb~2048 | Nb=4096 |\n")
     f.write("|---|---|---:|---:|---:|---:|---:|\n")
     for recon_mode in ("acbf", "tcbf"):
-        for cache_mode in ("on_the_fly", "host", "device"):
+        for imagefft_storage in ("none", "host", "device"):
             for max_order in (1, 2, 3, 4):
                 vals = []
                 for nb in (512, 1024, 2048, 4096):
-                    row = find_row(rows, recon_mode, cache_mode, max_order, 256, nb)
+                    row = find_row(rows, recon_mode, imagefft_storage, max_order, 256, nb)
                     vals.append(fmt_s(row.get("reconstruct_warm_mean_s")) if row else "")
                 f.write(
-                    f"| {recon_mode} | {cache_mode} | {max_order} | "
+                    f"| {recon_mode} | {imagefft_storage} | {max_order} | "
                     f"{vals[0]} | {vals[1]} | {vals[2]} | {vals[3]} |\n"
                 )
 
@@ -477,23 +477,23 @@ def write_summary_tables(f, rows: list[dict]) -> None:
     f.write("| recon | cache | max_order | Nb~512 | Nb=1024 | Nb~2048 | Nb=4096 |\n")
     f.write("|---|---|---:|---:|---:|---:|---:|\n")
     for recon_mode in ("acbf", "tcbf"):
-        for cache_mode in ("on_the_fly", "host", "device"):
+        for imagefft_storage in ("none", "host", "device"):
             for max_order in (1, 2, 3, 4):
                 vals = []
                 for nb in (512, 1024, 2048, 4096):
-                    row = find_row(rows, recon_mode, cache_mode, max_order, 256, nb)
+                    row = find_row(rows, recon_mode, imagefft_storage, max_order, 256, nb)
                     vals.append(fmt_s(row.get("reconstruct_cold_s")) if row else "")
                 f.write(
-                    f"| {recon_mode} | {cache_mode} | {max_order} | "
+                    f"| {recon_mode} | {imagefft_storage} | {max_order} | "
                     f"{vals[0]} | {vals[1]} | {vals[2]} | {vals[3]} |\n"
                 )
 
     f.write("\nRepresentative transfer and initialization timings at scan `256 x 256` ")
-    f.write("from `acbf/on_the_fly/max_order=1` rows:\n\n")
+    f.write("from `acbf/none/max_order=1` rows:\n\n")
     f.write("| requested Nb | actual Nb | raw dataset MiB | vBF stack MiB | raw H2D s | vBF H2D s | BFSolver init s |\n")
     f.write("|---:|---:|---:|---:|---:|---:|---:|\n")
     for nb in (512, 1024, 2048, 4096):
-        row = find_row(rows, "acbf", "on_the_fly", 1, 256, nb)
+        row = find_row(rows, "acbf", "none", 1, 256, nb)
         if not row:
             continue
         f.write(
@@ -511,11 +511,11 @@ def write_summary_tables(f, rows: list[dict]) -> None:
     )
 
 
-def find_row(rows, recon_mode, cache_mode, max_order, scan, requested_nb):
+def find_row(rows, recon_mode, imagefft_storage, max_order, scan, requested_nb):
     for row in rows:
         if (
             row.get("recon_mode") == recon_mode
-            and row.get("cache_mode") == cache_mode
+            and row.get("imagefft_storage") == imagefft_storage
             and int(row.get("max_order", -1)) == max_order
             and int(row.get("ry", -1)) == scan
             and int(row.get("requested_nb", -1)) == requested_nb
@@ -529,7 +529,9 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--single-json", action="store_true")
     parser.add_argument("--device", default="cuda", choices=("cuda", "cpu"))
     parser.add_argument("--recon-mode", choices=common.DEFAULT_RECON_MODES, default="acbf")
-    parser.add_argument("--cache-mode", choices=common.DEFAULT_CACHE_MODES, default="on_the_fly")
+    parser.add_argument(
+        "--imagefft-storage", choices=common.DEFAULT_IMAGEFFT_STORAGES, default="none"
+    )
     parser.add_argument("--nb", type=int, default=512)
     parser.add_argument("--ry", type=int, default=64)
     parser.add_argument("--rx", type=int, default=64)
@@ -546,7 +548,9 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--nbs", default=",".join(map(str, common.DEFAULT_NB)))
     parser.add_argument("--scans", default=",".join(map(str, common.DEFAULT_SCAN)))
     parser.add_argument("--max-orders", default=",".join(map(str, common.DEFAULT_MAX_ORDER)))
-    parser.add_argument("--cache-modes", default=",".join(common.DEFAULT_CACHE_MODES))
+    parser.add_argument(
+        "--imagefft-storages", default=",".join(common.DEFAULT_IMAGEFFT_STORAGES)
+    )
     parser.add_argument("--recon-modes", default=",".join(common.DEFAULT_RECON_MODES))
     parser.add_argument("--out-dir", type=Path, default=DEFAULT_OUT_DIR)
     parser.add_argument("--label", default=time.strftime("%Y%m%d-%H%M%S"))
@@ -572,7 +576,7 @@ def main(argv: list[str] | None = None) -> int:
     nbs = parse_int_list(args.nbs)
     scans = parse_int_list(args.scans)
     max_orders = parse_int_list(args.max_orders)
-    cache_modes = tuple(part.strip() for part in args.cache_modes.split(",") if part.strip())
+    imagefft_storages = tuple(part.strip() for part in args.imagefft_storages.split(",") if part.strip())
     recon_modes = tuple(
         common.normalize_recon_mode(part)
         for part in args.recon_modes.split(",")
@@ -581,13 +585,13 @@ def main(argv: list[str] | None = None) -> int:
     cases = [
         {
             "recon_mode": recon_mode,
-            "cache_mode": cache_mode,
+            "imagefft_storage": imagefft_storage,
             "nb": nb,
             "scan": scan,
             "max_order": max_order,
         }
-        for recon_mode, cache_mode, max_order, scan, nb in itertools.product(
-            recon_modes, cache_modes, max_orders, scans, nbs
+        for recon_mode, imagefft_storage, max_order, scan, nb in itertools.product(
+            recon_modes, imagefft_storages, max_orders, scans, nbs
         )
     ]
 
@@ -597,7 +601,7 @@ def main(argv: list[str] | None = None) -> int:
     for index, case in enumerate(cases, start=1):
         key = (
             case["recon_mode"],
-            case["cache_mode"],
+            case["imagefft_storage"],
             case["nb"],
             case["scan"],
             case["max_order"],

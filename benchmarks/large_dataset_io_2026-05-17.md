@@ -12,7 +12,7 @@
 Standard `Dataset4D` materialization loads the full 4D array into RAM before any
 reconstruction.  For datasets larger than system RAM (or VRAM), this raises an OOM
 error.  The lazy-loading pipeline streams data from HDF5 on demand and caches only
-the BF-pixel FFTs needed for reconstruction (`cache_mode='host'`).
+the BF-pixel FFTs needed for reconstruction (`imagefft_storage='host'`).
 
 This benchmark characterises the end-to-end pipeline for datasets from 48 GiB to
 64 GiB under different HDF5 chunk layouts and cache strategies.
@@ -39,14 +39,14 @@ is read from disk.
 
 All scenarios use `tcBF`, `max_order=2`, `aberrations={'C10': 80}`, `coord_transform={'flipud': True}`.
 
-| Scenario | First recon | Warm recon | lazy_read_mode | Notes |
+| Scenario | First recon | Warm recon | extractor_strategy | Notes |
 |---|---|---|---|---|
 | 48 GiB contiguous — **materialize** | OOM | OOM | — | Needs 48 GiB free RAM |
 | 48 GiB contiguous — **host cache** | 41.2 s | 2.35 s | slab | Full file streamed once |
 | 48 GiB detector-chunks — **host cache** | 8.35 s | 2.37 s | per_pixel | Only 2.04 GiB read |
 | 64 GiB contiguous — **host cache** | 56.5 s | 3.20 s | slab | Full file streamed once |
 | 64 GiB detector-chunks — **host cache** | 11.5 s | 3.34 s | per_pixel | Only 2.72 GiB read |
-| 64 GiB contiguous — **on_the_fly** | 273 s | — | slab | Re-reads disk every pass |
+| 64 GiB contiguous — **none** | 273 s | — | slab | Re-reads disk every pass |
 
 "First recon" fills the host FFT cache from disk.  "Warm recon" reads only from RAM
 (the pre-filled cache) and reflects pure GPU compute cost.
@@ -94,8 +94,8 @@ buffered I/O path itself, not Python call frequency.
 |---|---|---|
 | `dd` + `O_DIRECT` | 6.7 GB/s | Hardware limit |
 | `dd` buffered | 2.6 GB/s | Page-cache eviction (file >> RAM) |
-| h5py `stream_all_bf_images` | ~1.5 GB/s | Buffered I/O + HDF5 library overhead |
-| h5py `stream_all_bf_images_per_pixel` | ~1.0 GB/s | Same, but only reads BF-relevant data |
+| BFExtractor `disk_scan_row` | ~1.5 GB/s | Buffered I/O + HDF5 library overhead |
+| BFExtractor `disk_per_pixel` | ~1.0 GB/s | Same, but only reads BF-relevant data |
 
 The h5py implementation is near the practical ceiling for buffered reads on this
 system.  Reaching 6.7 GB/s would require `O_DIRECT` with 512-byte-aligned buffers,
@@ -106,7 +106,7 @@ investment is low given the detector-chunked format already reduces I/O to 2–3
 
 ## 5. Cache Fill Breakdown
 
-For `cache_mode='host'`, "first recon" = disk I/O + BF-image FFT + warm reconstruction overhead.
+For `imagefft_storage='host'`, "first recon" = disk I/O + BF-image FFT + warm reconstruction overhead.
 The fill cost alone is approximately `first − warm`:
 
 | Scenario | Fill time | Data read | Effective throughput |
@@ -124,9 +124,9 @@ At this data size the GPU FFT dominates, not the disk.
 
 ## 6. Best Practices
 
-### 6.1 Always use `cache_mode='host'` when RAM allows
+### 6.1 Always use `imagefft_storage='host'` when RAM allows
 
-`cache_mode='on_the_fly'` re-reads from disk on every reconstruction pass and
+`imagefft_storage='none'` re-reads from disk on every reconstruction pass and
 avoids allocating the FFT cache.  For a single reconstruction this saves RAM but
 costs the full I/O time per pass.  For any iterative use (multiple reconstructions,
 parameter sweeps, AD refinement) the cached modes are far superior:
@@ -134,10 +134,10 @@ parameter sweeps, AD refinement) the cached modes are far superior:
 - `host`: cache fits in RAM → all subsequent reconstructions are ~2–3 s (pure GPU).
 - `device`: cache fits in VRAM → fastest warm reconstructions (~0.03–0.07 s), but
   requires the full dataset to be in VRAM first, so only viable for small datasets.
-- `on_the_fly`: no cache → every pass reads ~2–3 GiB (detector-chunks) or the full
+- `none`: no cache → every pass reads ~2–3 GiB (detector-chunks) or the full
   file (contiguous).  Use only when RAM is genuinely exhausted.
 
-`cache_mode='auto'` selects `device` → `host` → `on_the_fly` in priority order
+`imagefft_storage='auto'` selects `device` → `host` → `none` in priority order
 based on available VRAM and RAM, so the default is already sensible.
 
 The FFT cache size is `Nb × Ry × Rx × 8` bytes (complex64).  For 697 BF pixels and
@@ -163,24 +163,24 @@ first-reconstruction latency matters, converting is worthwhile.  The one-time wr
 cost (~53 s for 48 GiB at ~1 GB/s write speed) is paid back on the very first
 re-read.
 
-**When not to convert**: one-shot reconstructions where on_the_fly is acceptable,
+**When not to convert**: one-shot reconstructions where none is acceptable,
 or constrained scratch space (the converted file is the same byte size but requires
 temporary space during conversion).
 
-### 6.3 `lazy_read_mode` is auto-detected and should rarely need manual override
+### 6.3 `extractor_strategy` is auto-detected and should rarely need manual override
 
-`Dataset4D.from_hdf5` inspects the HDF5 chunk layout and sets `lazy_read_mode`
-automatically:
+`BFExtractor(strategy='auto')` inspects the HDF5 chunk layout and sets
+`extractor_strategy` automatically:
 
 | HDF5 layout | Detected mode | Prefill strategy |
 |---|---|---|
-| Contiguous (chunks=None) | `slab` | `stream_all_bf_images()` — scans full file row by row |
-| Detector-major (Ry,Rx,1,1) | `per_pixel` | `stream_all_bf_images_per_pixel()` — one h5py call per BF pixel |
-| Scan-major (1,1,Ky,Kx) | `scan_row` | `stream_all_bf_images()` |
+| Contiguous (chunks=None) | `disk_slab` | `disk_scan_row` for prefill — scans full file row by row |
+| Detector-major (Ry,Rx,1,1) | `disk_per_pixel` | one h5py call per BF pixel |
+| Scan-major (1,1,Ky,Kx) | `disk_scan_row` | scan-row streaming |
 
-The `slab` mode is correct for contiguous files in both `host` and `on_the_fly`
-contexts — it reads only the ky bounding box per `get_bf_chunk()` call, avoiding a
-full file scan per chunk in `on_the_fly` mode.
+The `disk_slab` mode is correct for contiguous files in both `host` and `none`
+contexts — it reads only the ky bounding box per `BFExtractor.extract_chunk()` call, avoiding a
+full file scan per chunk in `none` mode.
 
 ---
 
@@ -200,7 +200,7 @@ full file scan per chunk in `on_the_fly` mode.
   `O_DIRECT`-like backends.  It could close the gap between h5py and hardware
   speed, at the cost of format compatibility.
 
-- **Multi-threaded prefill**: `stream_all_bf_images_per_pixel()` loops over BF
+- **Multi-threaded prefill**: `BFExtractor(strategy=`disk_per_pixel`)` loops over BF
   pixels sequentially.  Parallelising the h5py reads with a thread pool (h5py
   releases the GIL for reads) could improve prefill speed for detector-chunked
   files.

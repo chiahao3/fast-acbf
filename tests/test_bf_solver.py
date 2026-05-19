@@ -38,9 +38,9 @@ class TestBFSolverInit:
         p = synth_params
         assert solver_zero_ab.bf_mask.shape == (p["Npix"], p["Npix"])
 
-    def test_invalid_cache_mode_raises(self, synth_dataset, synth_params, device):
+    def test_invalid_imagefft_storage_raises(self, synth_dataset, synth_params, device):
         p = synth_params
-        with pytest.raises(ValueError, match="cache_mode"):
+        with pytest.raises(ValueError, match="imagefft_storage"):
             BFSolver(
                 dataset=synth_dataset,
                 max_alpha=p["max_alpha"],
@@ -50,7 +50,7 @@ class TestBFSolverInit:
                 max_order=2,
                 aberrations={"C10": 0.0},
                 device=device,
-                cache_mode="invalid_mode",
+                imagefft_storage="invalid_mode",
             )
 
     def test_removed_upscale_constructor_args_raise(self, synth_dataset, synth_params, device):
@@ -702,36 +702,36 @@ class TestFrameCacheBehavior:
             max_order=2,
             aberrations={"C10": 0.0},
             device=device,
-            cache_mode='host',
+            imagefft_storage='host',
+            imagefft_fill='lazy',
         )
 
         solver.get_tcBF(chunk_size=8)
         assert len(solver._recon._tcbf_cache) == 1
-        assert solver._recon.provider._host_cache is not None
-        host_cache_id = id(solver._recon.provider._host_cache)
+        assert solver._recon.imagefft.cache is not None
+        host_cache_id = id(solver._recon.imagefft.cache)
 
         solver.set_rotation_deg(15.0)
 
         solver.get_tcBF(chunk_size=8)
         assert len(solver._recon._tcbf_cache) == 2
-        # Provider cache is untouched by rotation — same numpy array object
-        assert solver._recon.provider._host_cache is not None
-        assert id(solver._recon.provider._host_cache) == host_cache_id
+        # ImageFFT cache is untouched by rotation — same numpy array object
+        assert solver._recon.imagefft.cache is not None
+        assert id(solver._recon.imagefft.cache) == host_cache_id
 
     def test_clear_cache_clears_all_caches(self, solver_zero_ab):
         img = solver_zero_ab.get_tcBF(chunk_size=8)
         torch.testing.assert_close(solver_zero_ab.reconstructed_image, img, atol=0, rtol=0)
         assert not solver_zero_ab.reconstructed_image.requires_grad
         assert len(solver_zero_ab._recon._tcbf_cache) + len(solver_zero_ab._recon._acbf_cache) >= 1
-        # host mode: provider cache is populated after first reconstruction
-        assert solver_zero_ab._recon.provider._host_cache is not None
+        assert solver_zero_ab._recon.imagefft.cache is not None
 
         solver_zero_ab.clear_cache()
 
         torch.testing.assert_close(solver_zero_ab.reconstructed_image, img, atol=0, rtol=0)
         assert not solver_zero_ab.reconstructed_image.requires_grad
         assert not solver_zero_ab._recon._tcbf_cache and not solver_zero_ab._recon._acbf_cache
-        assert solver_zero_ab._recon.provider._host_cache is None
+        assert solver_zero_ab._recon.imagefft.cache is None
 
 
 # ── Cache mode parity ────────────────────────────────────────────────────────
@@ -884,57 +884,58 @@ class TestImageBasisSplit:
             max_order=2,
             aberrations={"C10": 0.0, **ab_kwargs},
             device=device,
-            cache_mode='host',
+            imagefft_storage='host',
+            imagefft_fill='lazy',
         )
 
     def test_fft_cache_shared_across_rotations(self, synth_dataset, synth_params, device):
         solver = self._make_solver(synth_dataset, synth_params, device)
         solver.get_tcBF(chunk_size=8)
-        host_cache_id = id(solver._recon.provider._host_cache)
+        host_cache_id = id(solver._recon.imagefft.cache)
 
         solver.set_rotation_deg(15.0, clear_basis=True)
         solver.get_tcBF(chunk_size=8)
 
-        # Same underlying numpy array — provider cache not touched by rotation
-        assert id(solver._recon.provider._host_cache) == host_cache_id
+        # Same underlying numpy array — ImageFFT cache not touched by rotation
+        assert id(solver._recon.imagefft.cache) == host_cache_id
 
     def test_tcbf_and_acbf_share_same_provider_cache(self, synth_dataset, synth_params, device):
         solver = self._make_solver(synth_dataset, synth_params, device)
-        # Trigger both modes; both must reuse the provider's single host cache.
+        # Trigger both modes; both must reuse the single ImageFFT host cache.
         solver.get_tcBF(chunk_size=8)
-        host_cache_after_tcbf = solver._recon.provider._host_cache
+        host_cache_after_tcbf = solver._recon.imagefft.cache
         solver.get_acBF(chunk_size=8)
-        assert solver._recon.provider._host_cache is host_cache_after_tcbf
+        assert solver._recon.imagefft.cache is host_cache_after_tcbf
 
     def test_clear_basis_cache_preserves_provider_cache(self, synth_dataset, synth_params, device):
         solver = self._make_solver(synth_dataset, synth_params, device)
         solver.get_tcBF(chunk_size=8)
-        host_cache = solver._recon.provider._host_cache
+        host_cache = solver._recon.imagefft.cache
 
         solver.clear_basis_cache()
 
         assert not solver._recon._tcbf_cache and not solver._recon._acbf_cache
-        assert solver._recon.provider._host_cache is host_cache
+        assert solver._recon.imagefft.cache is host_cache
 
     def test_clear_cache_resets_both(self, synth_dataset, synth_params, device):
         solver = self._make_solver(synth_dataset, synth_params, device)
         solver.get_tcBF(chunk_size=8)
-        assert solver._recon.provider._host_cache is not None
+        assert solver._recon.imagefft.cache is not None
         assert len(solver._recon._tcbf_cache) >= 1
 
         solver.clear_cache()
 
-        assert solver._recon.provider._host_cache is None
+        assert solver._recon.imagefft.cache is None
         assert not solver._recon._tcbf_cache and not solver._recon._acbf_cache
 
     def test_set_rotation_clear_basis_preserves_provider_cache(self, synth_dataset, synth_params, device):
         solver = self._make_solver(synth_dataset, synth_params, device)
         solver.get_tcBF(chunk_size=8)
-        host_cache = solver._recon.provider._host_cache
+        host_cache = solver._recon.imagefft.cache
 
         solver.set_rotation_deg(20.0, clear_basis=True)
 
-        assert solver._recon.provider._host_cache is host_cache
+        assert solver._recon.imagefft.cache is host_cache
         assert not solver._recon._tcbf_cache and not solver._recon._acbf_cache
 
     def test_tcbf_output_unchanged_after_split(self, synth_dataset, synth_params, device):
@@ -955,17 +956,17 @@ class TestImageBasisSplit:
         from fast_acbf.optimization.refinement import refine_flips
         solver = self._make_solver(synth_dataset, synth_params, device)
         solver.get_tcBF(chunk_size=8)
-        host_cache = solver._recon.provider._host_cache
+        host_cache = solver._recon.imagefft.cache
 
         refine_flips(solver, mode='tcBF', metric='laplacian', plot_search=False)
 
-        assert solver._recon.provider._host_cache is host_cache
+        assert solver._recon.imagefft.cache is host_cache
 
     def test_refine_scan_rotation_preserves_provider_cache_and_clears_basis(self, synth_dataset, synth_params, device):
         from fast_acbf.optimization.refinement import refine_scan_rotation
         solver = self._make_solver(synth_dataset, synth_params, device)
         solver.get_tcBF(chunk_size=8)
-        host_cache = solver._recon.provider._host_cache
+        host_cache = solver._recon.imagefft.cache
 
         refine_scan_rotation(
             solver,
@@ -977,7 +978,7 @@ class TestImageBasisSplit:
             chunk_size=8,
         )
 
-        assert solver._recon.provider._host_cache is host_cache
+        assert solver._recon.imagefft.cache is host_cache
         assert not solver._recon._tcbf_cache and not solver._recon._acbf_cache
 
 
@@ -1028,14 +1029,18 @@ class TestACBFGeometryOpticsSplit:
 
 # ── ImageFFT cache mode behavior ──────────────────────────────────────────────
 
-class TestImageFFTCacheMode:
-    """Verify that each cache_mode allocates/fills storage exactly as claimed.
+class TestImageFFTPipelineBehavior:
+    """Verify ImageFFT storage/fill behavior through BFSolver."""
 
-    Tests check the internal fields _device_cache, _host_cache, _host_filled
-    directly so that bugs in the cache logic surface immediately.
-    """
-
-    def _make_solver(self, cache_mode, synth_dataset, synth_params, device):
+    def _make_solver(
+        self,
+        imagefft_storage,
+        synth_dataset,
+        synth_params,
+        device,
+        *,
+        imagefft_fill='auto',
+    ):
         p = synth_params
         return BFSolver(
             dataset=synth_dataset,
@@ -1046,140 +1051,55 @@ class TestImageFFTCacheMode:
             max_order=2,
             aberrations={"C10": 50.0},
             device=device,
-            cache_mode=cache_mode,
+            imagefft_storage=imagefft_storage,
+            imagefft_fill=imagefft_fill,
         )
-
-    # -- on_the_fly --------------------------------------------------------
 
     def test_on_the_fly_never_allocates_cache(self, synth_dataset, synth_params, device):
-        solver = self._make_solver('on_the_fly', synth_dataset, synth_params, device)
-        provider = solver._recon.provider
-        assert provider._device_cache is None
-        assert provider._host_cache is None
+        solver = self._make_solver('none', synth_dataset, synth_params, device)
+        imagefft = solver._recon.imagefft
+        assert solver.imagefft_storage == 'none'
+        assert solver.imagefft_fill == 'on_the_fly'
+        assert imagefft.cache is None
         solver.get_tcBF(chunk_size=8)
-        assert provider._device_cache is None, "on_the_fly must not allocate _device_cache"
-        assert provider._host_cache is None, "on_the_fly must not allocate _host_cache"
+        assert imagefft.cache is None
 
-    # -- host --------------------------------------------------------------
-
-    def test_host_cache_is_none_before_reconstruction(self, synth_dataset, synth_params, device):
-        solver = self._make_solver('host', synth_dataset, synth_params, device)
-        provider = solver._recon.provider
-        assert provider._device_cache is None
-        assert provider._host_cache is None
-        assert provider._host_filled is None
-
-    def test_host_cache_fills_lazily_after_reconstruction(self, synth_dataset, synth_params, device):
-        solver = self._make_solver('host', synth_dataset, synth_params, device)
-        provider = solver._recon.provider
+    def test_host_lazy_cache_fills_after_reconstruction(self, synth_dataset, synth_params, device):
+        solver = self._make_solver('host', synth_dataset, synth_params, device, imagefft_fill='lazy')
+        imagefft = solver._recon.imagefft
+        assert imagefft.cache is None
+        assert imagefft.filled is None
         solver.get_tcBF(chunk_size=8)
-        assert provider._device_cache is None, "host mode must not touch _device_cache"
-        assert provider._host_cache is not None
-        assert provider._host_filled is not None
-        Ry, Rx = provider.scan_shape
-        assert provider._host_cache.shape == (provider.nb, Ry, Rx)
-        assert provider._host_cache.dtype == np.complex64
-        assert provider._host_filled.all(), "all BF pixels must be filled after a full reconstruction"
+        assert imagefft.cache is not None
+        assert imagefft.filled is not None
+        Ry, Rx = imagefft.scan_shape
+        assert imagefft.cache.shape == (imagefft.nb, Ry, Rx)
+        assert imagefft.cache.dtype == np.complex64
+        assert imagefft.filled.all()
 
-    def test_host_cache_is_reused_on_second_call(self, synth_dataset, synth_params, device):
-        solver = self._make_solver('host', synth_dataset, synth_params, device)
-        provider = solver._recon.provider
+    def test_host_imagefft_is_reused_on_second_call(self, synth_dataset, synth_params, device):
+        solver = self._make_solver('host', synth_dataset, synth_params, device, imagefft_fill='lazy')
+        imagefft = solver._recon.imagefft
         solver.get_tcBF(chunk_size=8)
-        cache_id = id(provider._host_cache)
+        cache_id = id(imagefft.cache)
         solver.get_tcBF(chunk_size=8)
-        assert id(provider._host_cache) == cache_id, "_host_cache must be the same object on second call"
+        assert id(imagefft.cache) == cache_id
 
-    # -- device ------------------------------------------------------------
-
-    def test_device_cache_populated_at_construction(self, synth_dataset, synth_params, device):
+    def test_device_precompute_cache_populated_at_construction(self, synth_dataset, synth_params, device):
         solver = self._make_solver('device', synth_dataset, synth_params, device)
-        provider = solver._recon.provider
-        assert provider._device_cache is not None, "_device_cache must be allocated eagerly at construction"
-        assert provider._host_cache is None
+        imagefft = solver._recon.imagefft
+        assert imagefft.cache is not None
+        assert isinstance(imagefft.cache, torch.Tensor)
+        assert imagefft.cache.dtype == torch.complex64
+        Ry, Rx = imagefft.scan_shape
+        assert imagefft.cache.shape == (imagefft.nb, Ry, Rx)
 
-    def test_device_cache_shape_and_dtype(self, synth_dataset, synth_params, device):
-        solver = self._make_solver('device', synth_dataset, synth_params, device)
-        provider = solver._recon.provider
-        Ry, Rx = provider.scan_shape
-        assert provider._device_cache.shape == (provider.nb, Ry, Rx)
-        assert provider._device_cache.dtype == torch.complex64
-
-    def test_device_cache_unchanged_after_reconstruction(self, synth_dataset, synth_params, device):
-        solver = self._make_solver('device', synth_dataset, synth_params, device)
-        provider = solver._recon.provider
-        cache_id = id(provider._device_cache)
-        solver.get_tcBF(chunk_size=8)
-        assert id(provider._device_cache) == cache_id, "_device_cache must not be reallocated during reconstruction"
-
-    # -- guards / materialize ----------------------------------------------
-
-    def _make_det_geom(self, synth_params, device='cpu'):
-        from fast_acbf.data.geometry import DetectorGeometry
-        p = synth_params
-        return DetectorGeometry.from_params(
-            detector_shape=(p["Npix"], p["Npix"]),
-            max_alpha=p["max_alpha"],
-            dk=p["dk"],
-            wavelength=p["wavelength"],
-            device=device,
-        )
-
-    def _make_fake_lazy(self, arr: np.ndarray):
-        """Convert an in-memory Dataset4D to a fake-lazy one for testing."""
+    def test_materialize_converts_lazy_to_host_ram(self):
         from fast_acbf.data.dataset4d import Dataset4D
-        ds = Dataset4D(arr.copy())
-        ds._handle = ds._array
-        ds._array = None
-        return ds
-
-    def test_force_materialize_converts_lazy_to_host_ram(self):
         original = np.random.rand(4, 4, 8, 8).astype(np.float32)
-        ds = self._make_fake_lazy(original)
-        assert ds.is_lazy
-
-        result = ds._force_materialize()
-
+        ds = Dataset4D(original)
         assert not ds.is_lazy
-        assert isinstance(result, np.ndarray)        # host RAM, not GPU tensor
-        assert result.dtype == np.float32
-        assert result.data.contiguous
-        assert ds._handle is None
-        np.testing.assert_array_equal(result, original)
-
-    def test_force_materialize_noop_if_already_in_memory(self):
-        from fast_acbf.data.dataset4d import Dataset4D
-        arr = np.zeros((4, 4, 8, 8), dtype=np.float32)
-        ds = Dataset4D(arr)
-        result = ds._force_materialize()
-        assert not ds.is_lazy
-        assert result is ds._array
-
-    def test_device_mode_lazy_dataset_materializes_and_caches(self, synth_dataset, synth_params, device):
-        from fast_acbf.data.imagefft_provider import ImageFFTProvider
-        ds = self._make_fake_lazy(synth_dataset)
-        assert ds.is_lazy
-
-        provider = ImageFFTProvider(ds, self._make_det_geom(synth_params, device), device, cache_mode='device')
-
-        assert not ds.is_lazy
-        assert isinstance(ds._array, np.ndarray)        # raw data stays in host RAM
-        assert provider._device_cache is not None        # FFT cache on device
-        assert provider.cache_mode == 'device'
-
-    def test_device_mode_lazy_oom_raises_informative_error(self, synth_params, monkeypatch):
-        from fast_acbf.data.imagefft_provider import ImageFFTProvider
-        import fast_acbf.data.dataset4d as ds_mod
-
-        ds = self._make_fake_lazy(np.zeros((4, 4, 8, 8), dtype=np.float32))
-
-        def _oom(*_, **__):
-            raise MemoryError
-        monkeypatch.setattr(ds_mod.np, 'asarray', _oom)
-
-        with pytest.raises(RuntimeError, match="GB") as exc_info:
-            ImageFFTProvider(ds, self._make_det_geom(synth_params), 'cpu', cache_mode='device')
-        msg = str(exc_info.value)
-        assert "host" in msg or "on_the_fly" in msg
+        assert ds.materialize() is ds.raw_array()
 
     def test_from_hdf5_materialize_true_loads_to_host_ram(self, tmp_path):
         h5py = pytest.importorskip("h5py")
@@ -1192,57 +1112,35 @@ class TestImageFFTCacheMode:
         ds = Dataset4D.from_hdf5(p, materialize=True)
 
         assert not ds.is_lazy
-        assert isinstance(ds._array, np.ndarray)        # host RAM, not GPU tensor
-        assert ds._array.dtype == np.float32
-        assert ds._array.data.contiguous
-        np.testing.assert_array_equal(ds._array, data)
+        assert isinstance(ds.raw_array(), np.ndarray)
+        assert ds.raw_array().dtype == np.float32
+        assert ds.raw_array().data.contiguous
+        np.testing.assert_array_equal(ds.raw_array(), data)
 
-    def test_from_hdf5_materialize_downstream_cache_modes(self, tmp_path, synth_params, device):
-        """After materialize=True, all three cache_modes must work correctly.
+    def test_pipeline_properties_report_resolved_strings(self, synth_dataset, synth_params, device):
+        cases = [
+            ('none', 'on_the_fly'),
+            ('host', 'precompute'),
+            ('device', 'precompute'),
+        ]
+        for storage, fill in cases:
+            solver = self._make_solver(storage, synth_dataset, synth_params, device)
+            assert solver.imagefft_storage == storage
+            assert solver.imagefft_fill == fill
 
-        cache_mode governs FFT caching, not where the 4D dataset lives.
-        The raw dataset is always in host RAM; only FFT slices move to device.
-        """
-        h5py = pytest.importorskip("h5py")
-        from fast_acbf.data.dataset4d import Dataset4D
-        from fast_acbf.data.imagefft_provider import ImageFFTProvider
-        p = synth_params
-        arr = np.random.rand(p["Ny"], p["Nx"], p["Npix"], p["Npix"]).astype(np.float32)
-        hf = tmp_path / "test.h5"
-        with h5py.File(hf, 'w') as f:
-            f.create_dataset('data', data=arr)
-        det_geom = self._make_det_geom(synth_params, device)
-
-        for mode in ('on_the_fly', 'host', 'device'):
-            ds = Dataset4D.from_hdf5(hf, materialize=True)
-            assert not ds.is_lazy                       # pre-condition: in host RAM
-            provider = ImageFFTProvider(ds, det_geom, device, cache_mode=mode)
-            assert provider.cache_mode == mode
-            # Raw 4D data is still in host RAM regardless of cache_mode
-            assert isinstance(ds._array, np.ndarray)
-            # Smoke-test: chunk fetch must not raise
-            provider.get_chunk(0, min(4, provider.nb))
-
-    def test_cache_mode_property_reports_resolved_string(self, synth_dataset, synth_params, device):
-        for mode in ('on_the_fly', 'host', 'device'):
-            solver = self._make_solver(mode, synth_dataset, synth_params, device)
-            assert solver.cache_mode == mode
-
-    # -- numerical parity --------------------------------------------------
-
-    def test_numerical_parity_tcbf_all_modes(self, synth_dataset, synth_params, device):
-        ref  = self._make_solver('on_the_fly', synth_dataset, synth_params, device).get_tcBF(chunk_size=8)
-        host = self._make_solver('host',       synth_dataset, synth_params, device).get_tcBF(chunk_size=8)
-        dev  = self._make_solver('device',     synth_dataset, synth_params, device).get_tcBF(chunk_size=8)
+    def test_numerical_parity_tcbf_all_storage_modes(self, synth_dataset, synth_params, device):
+        ref = self._make_solver('none', synth_dataset, synth_params, device).get_tcBF(chunk_size=8)
+        host = self._make_solver('host', synth_dataset, synth_params, device).get_tcBF(chunk_size=8)
+        dev = self._make_solver('device', synth_dataset, synth_params, device).get_tcBF(chunk_size=8)
         torch.testing.assert_close(host, ref, atol=1e-5, rtol=1e-5)
-        torch.testing.assert_close(dev,  ref, atol=1e-5, rtol=1e-5)
+        torch.testing.assert_close(dev, ref, atol=1e-5, rtol=1e-5)
 
-    def test_numerical_parity_acbf_all_modes(self, synth_dataset, synth_params, device):
-        ref  = self._make_solver('on_the_fly', synth_dataset, synth_params, device).get_acBF(chunk_size=8)
-        host = self._make_solver('host',       synth_dataset, synth_params, device).get_acBF(chunk_size=8)
-        dev  = self._make_solver('device',     synth_dataset, synth_params, device).get_acBF(chunk_size=8)
+    def test_numerical_parity_acbf_all_storage_modes(self, synth_dataset, synth_params, device):
+        ref = self._make_solver('none', synth_dataset, synth_params, device).get_acBF(chunk_size=8)
+        host = self._make_solver('host', synth_dataset, synth_params, device).get_acBF(chunk_size=8)
+        dev = self._make_solver('device', synth_dataset, synth_params, device).get_acBF(chunk_size=8)
         torch.testing.assert_close(host, ref, atol=1e-5, rtol=1e-5)
-        torch.testing.assert_close(dev,  ref, atol=1e-5, rtol=1e-5)
+        torch.testing.assert_close(dev, ref, atol=1e-5, rtol=1e-5)
 
 
 @pytest.mark.regression

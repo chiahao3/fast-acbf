@@ -25,7 +25,7 @@ import numpy as np
 DEFAULT_NB = (512, 1024, 2048, 4096)
 DEFAULT_SCAN = (64, 128, 256)
 DEFAULT_MAX_ORDER = (1, 2, 3, 4)
-DEFAULT_CACHE_MODES = ("on_the_fly", "host", "device")
+DEFAULT_IMAGEFFT_STORAGES = ("none", "host", "device")
 DEFAULT_RECON_MODES = ("acbf", "tcbf")
 DEFAULT_WAVELENGTH = 0.04176
 DEFAULT_DK = 0.01
@@ -156,7 +156,7 @@ def benchmark_case(args: argparse.Namespace) -> dict:
         "ry": int(args.ry),
         "rx": int(args.rx),
         "max_order": int(args.max_order),
-        "cache_mode": args.cache_mode,
+        "imagefft_storage": args.imagefft_storage,
         "recon_mode": normalize_recon_mode(args.recon_mode),
         "chunk_size": int(args.chunk_size),
         "npix": int(geom.npix),
@@ -192,7 +192,7 @@ def benchmark_case(args: argparse.Namespace) -> dict:
             max_order=args.max_order,
             aberrations={"C10": 0.0},
             device=device,
-            cache_mode=args.cache_mode,
+            imagefft_storage=args.imagefft_storage,
         )
         result["actual_nb"] = int(solver.vbf_images.shape[0])
         if result["recon_mode"] == "acbf":
@@ -244,8 +244,8 @@ def run_child_case(script: Path, args: argparse.Namespace, case: dict) -> dict:
         str(case["scan"]),
         "--max-order",
         str(case["max_order"]),
-        "--cache-mode",
-        case["cache_mode"],
+        "--imagefft-storage",
+        case["imagefft_storage"],
         "--recon-mode",
         case["recon_mode"],
         "--chunk-size",
@@ -274,7 +274,7 @@ def run_child_case(script: Path, args: argparse.Namespace, case: dict) -> dict:
             "ry": case["scan"],
             "rx": case["scan"],
             "max_order": case["max_order"],
-            "cache_mode": case["cache_mode"],
+            "imagefft_storage": case["imagefft_storage"],
             "recon_mode": case["recon_mode"],
             "status": "timeout",
             "error": f"timed out after {exc.timeout} s",
@@ -294,7 +294,7 @@ def run_child_case(script: Path, args: argparse.Namespace, case: dict) -> dict:
         "ry": case["scan"],
         "rx": case["scan"],
         "max_order": case["max_order"],
-        "cache_mode": case["cache_mode"],
+        "imagefft_storage": case["imagefft_storage"],
         "recon_mode": case["recon_mode"],
         "status": "error",
         "error": (completed.stderr or stdout)[-1000:],
@@ -317,7 +317,7 @@ def load_existing(path: Path) -> dict[tuple, dict]:
                 row.get("requested_nb"),
                 row.get("ry"),
                 row.get("max_order"),
-                row.get("cache_mode"),
+                row.get("imagefft_storage"),
             )
             out[key] = row
     return out
@@ -333,7 +333,7 @@ def write_csv(path: Path, rows: list[dict]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     fields = [
         "recon_mode",
-        "cache_mode",
+        "imagefft_storage",
         "requested_nb",
         "actual_nb",
         "ry",
@@ -367,7 +367,7 @@ def write_markdown(path: Path, rows: list[dict]) -> None:
 
     ordered = sorted(rows, key=lambda r: (
         str(r.get("recon_mode")),
-        str(r.get("cache_mode")),
+        str(r.get("imagefft_storage")),
         int(r.get("max_order", 0)),
         int(r.get("ry", 0)),
         int(r.get("requested_nb", 0)),
@@ -397,7 +397,7 @@ def write_markdown(path: Path, rows: list[dict]) -> None:
             reserved_text = f"{reserved:.2f}" if isinstance(reserved, (int, float)) else ""
             elapsed_text = f"{elapsed:.2f}" if isinstance(elapsed, (int, float)) else ""
             f.write(
-                f"| {row.get('recon_mode')} | {row.get('cache_mode')} | {row.get('max_order')} | "
+                f"| {row.get('recon_mode')} | {row.get('imagefft_storage')} | {row.get('max_order')} | "
                 f"{row.get('ry')} | {row.get('requested_nb')} | {row.get('actual_nb')} | "
                 f"{row.get('status')}{suffix} | "
                 f"{alloc_text} | {reserved_text} | {elapsed_text} |\n"
@@ -408,13 +408,13 @@ def write_report_summary(f, rows: list[dict]) -> None:
     """Write compact conclusions and sizing equations to the markdown report."""
     f.write("## Summary Report\n\n")
     f.write(
-        "For this implementation, VRAM is driven by `cache_mode` (controls ImageFFT storage) "
-        "and `basis_mode` (controls aberration-basis precomputation). `cache_mode='device'` "
-        "stores the full `(Nb, Ry, Rx)` complex64 FFT cache in VRAM. `cache_mode='host'` "
+        "For this implementation, VRAM is driven by `imagefft_storage` (controls ImageFFT storage) "
+        "and `basis_mode` (controls aberration-basis precomputation). `imagefft_storage='device'` "
+        "stores the full `(Nb, Ry, Rx)` complex64 FFT cache in VRAM. `imagefft_storage='host'` "
         "fills a RAM numpy cache lazily per chunk, copying only the active chunk to GPU. "
-        "`cache_mode='on_the_fly'` recomputes FFTs every pass with no persistent cache. "
+        "`imagefft_storage='none'` recomputes FFTs every pass with no persistent cache. "
         "acBF with `basis_mode='precompute'` additionally stores aperture and basis tensors "
-        "for all Nb pixels; `basis_mode='on_the_fly'` (default) regenerates them per chunk. "
+        "for all Nb pixels; `basis_mode='none'` (default) regenerates them per chunk. "
         "tcBF only needs small shift-basis vectors, so its peak is nearly independent of "
         "cache settings.\n\n"
     )
@@ -423,7 +423,7 @@ def write_report_summary(f, rows: list[dict]) -> None:
     f.write("| recon | cache | max_order | Nb~512 | Nb=1024 | Nb~2048 | Nb=4096 |\n")
     f.write("|---|---|---:|---:|---:|---:|---:|\n")
     for recon_mode in ("acbf", "tcbf"):
-        for cache_mode in ("on_the_fly", "host", "device"):
+        for imagefft_storage in ("none", "host", "device"):
             for max_order in (1, 2, 3, 4):
                 vals = []
                 for nb in (512, 1024, 2048, 4096):
@@ -431,7 +431,7 @@ def write_report_summary(f, rows: list[dict]) -> None:
                         (
                             row for row in rows
                             if row.get("recon_mode") == recon_mode
-                            and row.get("cache_mode") == cache_mode
+                            and row.get("imagefft_storage") == imagefft_storage
                             and int(row.get("max_order")) == max_order
                             and int(row.get("ry")) == 256
                             and int(row.get("requested_nb")) == nb
@@ -447,7 +447,7 @@ def write_report_summary(f, rows: list[dict]) -> None:
                         text += " est"
                     vals.append(text)
                 f.write(
-                    f"| {recon_mode} | {cache_mode} | {max_order} | "
+                    f"| {recon_mode} | {imagefft_storage} | {max_order} | "
                     f"{vals[0]} | {vals[1]} | {vals[2]} | {vals[3]} |\n"
                 )
 
@@ -458,11 +458,11 @@ def write_report_summary(f, rows: list[dict]) -> None:
         "`C = min(chunk_size, B)`. The benchmark used `chunk_size = 64`. "
         "The relevant dtypes are `float32 = 4 bytes` and `complex64 = 8 bytes`.\n\n"
     )
-    f.write("Persistent FFT cache footprint by cache_mode:\n\n")
+    f.write("Persistent FFT cache footprint by imagefft_storage:\n\n")
     f.write("```text\n")
     f.write("device   : fft_bytes = 8*B*S       # full (Nb, Ry, Rx) complex64 in VRAM\n")
     f.write("host     : fft_bytes = 8*C*S       # only active chunk in VRAM; rest in RAM\n")
-    f.write("on_the_fly: fft_bytes = 8*C*S      # recomputed per chunk; no persistent VRAM\n")
+    f.write("none: fft_bytes = 8*C*S      # recomputed per chunk; no persistent VRAM\n")
     f.write("```\n\n")
     f.write("tcBF peak estimate:\n\n")
     f.write("```text\n")
@@ -470,7 +470,7 @@ def write_report_summary(f, rows: list[dict]) -> None:
     f.write("             + 8*K*B                # b_dx and b_dy shift basis, float32\n")
     f.write("             + 28*C*S               # per-chunk ramp, phasor, multiply, ifft workspaces\n")
     f.write("```\n\n")
-    f.write("acBF on_the_fly basis peak estimate (default basis_mode):\n\n")
+    f.write("acBF none basis peak estimate (default basis_mode):\n\n")
     f.write("```text\n")
     f.write("acBF_otf_bytes ~= fft_bytes\n")
     f.write("                 + (64 + 12*K)*C*S  # regenerated aperture, basis, chi, transfer, FFT workspaces\n")
@@ -502,7 +502,7 @@ def _estimate_features(row: dict) -> tuple[float, float, float]:
     chunk_cells = chunk * ry * rx
     if recon_mode == "tcbf":
         return (1.0, cells / 1e8, chunk_cells / 1e8)
-    if row.get("cache_mode") == "device":
+    if row.get("imagefft_storage") == "device":
         return (1.0, cells / 1e8, chunk_cells * coeffs / 1e8)
     return (1.0, chunk_cells / 1e8, chunk_cells * coeffs / 1e8)
 
@@ -523,7 +523,7 @@ def _analytic_peak_estimate_gib(row: dict) -> float:
     # points exist for least-squares interpolation.
     if recon_mode == "tcbf":
         bytes_est = 8.0 * cells + 8.0 * coeffs * actual_nb + 28.0 * chunk_cells
-    elif row.get("cache_mode") == "device":
+    elif row.get("imagefft_storage") == "device":
         bytes_est = 8.0 * cells + (64.0 + 12.0 * coeffs) * chunk_cells
     else:
         bytes_est = 8.0 * chunk_cells + (64.0 + 12.0 * coeffs) * chunk_cells
@@ -535,12 +535,12 @@ def with_estimates(rows: list[dict]) -> list[dict]:
     output = [row.copy() for row in rows]
     for row in output:
         row["recon_mode"] = normalize_recon_mode(row.get("recon_mode"))
-    groups = sorted({(row.get("recon_mode"), row.get("cache_mode")) for row in output})
-    for recon_mode, cache_mode in groups:
+    groups = sorted({(row.get("recon_mode"), row.get("imagefft_storage")) for row in output})
+    for recon_mode, imagefft_storage in groups:
         ok_rows = [
             row for row in output
             if row.get("recon_mode") == recon_mode
-            and row.get("cache_mode") == cache_mode
+            and row.get("imagefft_storage") == imagefft_storage
             and row.get("status") == "ok"
             and isinstance(row.get("peak_allocated_gib"), (int, float))
         ]
@@ -553,7 +553,7 @@ def with_estimates(rows: list[dict]) -> list[dict]:
         for row in output:
             if (
                 row.get("recon_mode") != recon_mode
-                or row.get("cache_mode") != cache_mode
+                or row.get("imagefft_storage") != imagefft_storage
                 or row.get("status") == "ok"
             ):
                 continue
@@ -585,7 +585,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--ry", type=int, default=64)
     parser.add_argument("--rx", type=int, default=64)
     parser.add_argument("--max-order", type=int, default=1)
-    parser.add_argument("--cache-mode", choices=DEFAULT_CACHE_MODES, default="on_the_fly")
+    parser.add_argument("--imagefft-storage", choices=DEFAULT_IMAGEFFT_STORAGES, default="none")
     parser.add_argument("--recon-mode", choices=DEFAULT_RECON_MODES, default="acbf")
     parser.add_argument("--chunk-size", type=int, default=64)
     parser.add_argument("--scan-step-size", type=float, default=0.2)
@@ -595,7 +595,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--nbs", default=",".join(map(str, DEFAULT_NB)))
     parser.add_argument("--scans", default=",".join(map(str, DEFAULT_SCAN)))
     parser.add_argument("--max-orders", default=",".join(map(str, DEFAULT_MAX_ORDER)))
-    parser.add_argument("--cache-modes", default=",".join(DEFAULT_CACHE_MODES))
+    parser.add_argument("--imagefft-storages", default=",".join(DEFAULT_IMAGEFFT_STORAGES))
     parser.add_argument("--recon-modes", default="acbf")
     parser.add_argument("--out-dir", type=Path, default=Path("benchmarks/vram"))
     parser.add_argument("--label", default=time.strftime("%Y%m%d-%H%M%S"))
@@ -621,7 +621,7 @@ def main(argv: list[str] | None = None) -> int:
     nbs = parse_int_list(args.nbs)
     scans = parse_int_list(args.scans)
     max_orders = parse_int_list(args.max_orders)
-    cache_modes = tuple(part.strip() for part in args.cache_modes.split(",") if part.strip())
+    imagefft_storages = tuple(part.strip() for part in args.imagefft_storages.split(",") if part.strip())
     recon_modes = tuple(
         normalize_recon_mode(part)
         for part in args.recon_modes.split(",")
@@ -632,11 +632,11 @@ def main(argv: list[str] | None = None) -> int:
             "nb": nb,
             "scan": scan,
             "max_order": max_order,
-            "cache_mode": cache_mode,
+            "imagefft_storage": imagefft_storage,
             "recon_mode": recon_mode,
         }
-        for recon_mode, cache_mode, max_order, scan, nb in itertools.product(
-            recon_modes, cache_modes, max_orders, scans, nbs
+        for recon_mode, imagefft_storage, max_order, scan, nb in itertools.product(
+            recon_modes, imagefft_storages, max_orders, scans, nbs
         )
     ]
 
@@ -649,7 +649,7 @@ def main(argv: list[str] | None = None) -> int:
             case["nb"],
             case["scan"],
             case["max_order"],
-            case["cache_mode"],
+            case["imagefft_storage"],
         )
         if key in existing:
             print(f"[{index}/{len(cases)}] skip existing {case}", flush=True)
