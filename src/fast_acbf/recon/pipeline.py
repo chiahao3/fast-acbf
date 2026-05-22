@@ -119,7 +119,7 @@ class PipelineManager:
         )
         if self.pad_width is not None:
             from fast_acbf.data.bf_preparer import BFPreparer
-            self.preparer = BFPreparer(self.extractor, self.pad_width)
+            self.preparer = BFPreparer(self.extractor, pad_width=self.pad_width)
             provider = self.preparer
         else:
             self.preparer = None

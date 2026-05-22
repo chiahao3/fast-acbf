@@ -184,11 +184,11 @@ class BFSolver:
         # Read padding metadata from the preparer (single source of truth)
         if pipeline_manager.preparer is not None:
             p = pipeline_manager.preparer
-            orig_scan_shape = p.orig_shape
-            pad_offsets = p.pad_offsets
+            crop_shape = p.upscaled_shape
+            pad_offsets = p.pad_offsets if p._has_pad else None
             scan_geom = ScanGeometry.from_params(p.padded_shape, scan_step_size, device=device)
         else:
-            orig_scan_shape = None
+            crop_shape = None
             pad_offsets = None
             scan_geom = ScanGeometry.from_params((Ry, Rx), scan_step_size, device=device)
 
@@ -205,7 +205,7 @@ class BFSolver:
             coord_transform=ct,
             basis_mode=basis_mode,
             eps=eps,
-            orig_scan_shape=orig_scan_shape,
+            crop_shape=crop_shape,
             pad_offsets=pad_offsets,
             fov=fov,
         )
@@ -594,7 +594,7 @@ class BFSolver:
             geometry, optics = self._recon._get_acbf_cache(rolloff=rolloff, chunk_size=chunk_size)
             if u != 1.0:
                 optics = None
-            qx_grid, qy_grid = self._recon._get_recon_grids(u)
+            qx_grid, qy_grid = self._recon._get_recon_grids()
             result = reconstruct_acbf_complex_inversion(
                 self._recon.imagefft,
                 qx_grid, qy_grid,
@@ -604,7 +604,6 @@ class BFSolver:
                 regularization=kwargs.get('regularization', 1e-3),
                 support_threshold=kwargs.get('support_threshold', 1e-6),
                 return_diagnostics=True,
-                upscale=u,
             )
         # Crop only real-space outputs; leave Fourier maps untouched
         if self._recon._pad_offsets is not None and f == 'original':
@@ -612,7 +611,7 @@ class BFSolver:
             for k in real_space_keys:
                 if k in result:
                     result[k] = _crop_to_original(
-                        result[k], self._recon._pad_offsets, self._recon._orig_scan_shape, u
+                        result[k], self._recon._pad_offsets, self._recon._crop_shape
                     )
         return result
 

@@ -19,7 +19,6 @@ def reconstruct_tcbf(
     cache: TCBFCache,
     coeffs: torch.Tensor,
     device: str,
-    upscale: float = 1.0,
 ) -> torch.Tensor:
     """
     Ultra-lean AD forward pass for tcBF.
@@ -34,10 +33,9 @@ def reconstruct_tcbf(
         cache:     TCBFCache built by pipeline.build_tcbf_cache (basis only).
         coeffs:    Flat scan-frame aberration coefficients, shape (num_coeffs,).
         device:    Target device string.
-        upscale:   FFT zero-padding upscale factor (>= 1.0).
 
     Returns:
-        Reconstructed tcBF image, shape (Ry_out, Rx_out), float32.
+        Reconstructed tcBF image, shape (Ry, Rx), float32.
     """
     neg_two_pi_j = torch.tensor(-2.0j * torch.pi, dtype=torch.complex64, device=device)
     Ry_out = qy_grid.shape[-2]
@@ -45,7 +43,7 @@ def reconstruct_tcbf(
 
     tcBF_total = torch.zeros((Ry_out, Rx_out), dtype=torch.float32, device=device)
     for chunk in cache.chunks:
-        img_fft_chunk = provider.get_upscaled_chunk(chunk['start'], chunk['end'], upscale)
+        img_fft_chunk = provider.get_chunk(chunk['start'], chunk['end'])
         shift_dx = torch.einsum('k, kb -> b', coeffs, chunk['b_dx']).view(-1, 1, 1)
         shift_dy = torch.einsum('k, kb -> b', coeffs, chunk['b_dy']).view(-1, 1, 1)
         ramp = shift_dx * qx_grid + shift_dy * qy_grid

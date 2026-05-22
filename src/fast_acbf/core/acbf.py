@@ -108,7 +108,6 @@ def reconstruct_acbf(
     coeffs: torch.Tensor,
     eps: float,
     device: str,
-    upscale: float = 1.0,
 ) -> torch.Tensor:
     """
     Phase-only acBF reconstruction.
@@ -124,16 +123,15 @@ def reconstruct_acbf(
         coeffs:    Flat scan-frame aberration coefficients, shape (num_coeffs,).
         eps:       Small constant for phase normalization stability.
         device:    Target device string.
-        upscale:   FFT zero-padding upscale factor (>= 1.0).
 
     Returns:
-        Reconstructed acBF image, shape (Ry_out, Rx_out), float32.
+        Reconstructed acBF image, shape (Ry, Rx), float32.
     """
     Ry_out = qy_grid.shape[-2]
     Rx_out = qx_grid.shape[-1]
     acBF_total = torch.zeros((Ry_out, Rx_out), dtype=torch.float32, device=device)
     for geom_chunk, optics_chunk in _iter_chunks(geometry, optics):
-        img_fft_chunk = provider.get_upscaled_chunk(geom_chunk['start'], geom_chunk['end'], upscale)
+        img_fft_chunk = provider.get_chunk(geom_chunk['start'], geom_chunk['end'])
         transfer = compute_transfer(geom_chunk, optics_chunk, coeffs, qx_grid, qy_grid, geometry, device)
         phasor = transfer / (transfer.abs() + eps)
         acBF_total += torch.sum(torch.fft.ifft2(img_fft_chunk * phasor, dim=(-2, -1)).real, dim=0)
@@ -151,7 +149,6 @@ def reconstruct_acbf_complex_inversion(
     regularization: float = 1e-3,
     support_threshold: float = 1e-6,
     return_diagnostics: bool = False,
-    upscale: float = 1.0,
 ):
     """
     Complex-inversion acBF reconstruction via regularized transfer inversion.
@@ -176,10 +173,9 @@ def reconstruct_acbf_complex_inversion(
         support_threshold:  Fraction of median transfer power below which Fourier
                             components are zeroed.
         return_diagnostics: If True, return full diagnostic dict instead of just image.
-        upscale:            FFT zero-padding upscale factor (>= 1.0).
 
     Returns:
-        Reconstructed image (Ry_out, Rx_out) float32, or dict if return_diagnostics=True.
+        Reconstructed image (Ry, Rx) float32, or dict if return_diagnostics=True.
     """
     if regularization < 0:
         raise ValueError(f"regularization must be non-negative, got {regularization}.")
@@ -193,7 +189,7 @@ def reconstruct_acbf_complex_inversion(
     transfer_power = torch.zeros(out_shape, dtype=torch.float32, device=device)
 
     for geom_chunk, optics_chunk in _iter_chunks(geometry, optics):
-        img_fft_chunk = provider.get_upscaled_chunk(geom_chunk['start'], geom_chunk['end'], upscale)
+        img_fft_chunk = provider.get_chunk(geom_chunk['start'], geom_chunk['end'])
         transfer = compute_transfer(geom_chunk, optics_chunk, coeffs, qx_grid, qy_grid, geometry, device)
         numerator.add_(torch.sum(transfer * img_fft_chunk, dim=0))
         transfer_power.add_(torch.sum(transfer.abs().square(), dim=0))

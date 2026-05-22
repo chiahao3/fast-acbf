@@ -37,25 +37,12 @@ _VALID_FOV = ('original', 'full')
 def _crop_to_original(
     image: torch.Tensor,
     pad_offsets: tuple[int, int],
-    orig_shape: tuple[int, int],
-    upscale: float,
+    crop_shape: tuple[int, int],
 ) -> torch.Tensor:
-    """Crop a (possibly upscaled) padded image back to the original FOV.
-
-    Output shape is (round(Ry*U), round(Rx*U)) — determined by the user-supplied
-    upscale factor, not by the internal 5-smooth padded size.  This keeps output
-    shapes predictable for stacks, exports, and downstream comparisons.  The
-    continuous-space boundary drifts by at most one pixel relative to the exact
-    padded-grid boundary; callers that need exact physical coordinates should use
-    BFSolver.get_pixel_size() and the padded_scan_shape property.
-    """
+    """Crop a prepared padded image back to its active unpadded prepared FOV."""
     pad_y, pad_x = pad_offsets
-    Ry, Rx = orig_shape
-    y0 = round(pad_y * upscale)
-    y1 = y0 + round(Ry * upscale)
-    x0 = round(pad_x * upscale)
-    x1 = x0 + round(Rx * upscale)
-    return image[y0:y1, x0:x1]
+    Ry, Rx = crop_shape
+    return image[pad_y:pad_y + Ry, pad_x:pad_x + Rx]
 
 
 class BFReconstructor:
@@ -73,7 +60,7 @@ class BFReconstructor:
         coord_transform: CoordinateTransform,
         basis_mode: str = 'on_the_fly',
         eps: float = 1e-3,
-        orig_scan_shape: tuple[int, int] | None = None,
+        crop_shape: tuple[int, int] | None = None,
         pad_offsets: tuple[int, int] | None = None,
         fov: str = 'original',
     ) -> None:
@@ -83,7 +70,7 @@ class BFReconstructor:
         self.ab_state = ab_state
         self.coord_transform = coord_transform
         self.eps = eps
-        self._orig_scan_shape = orig_scan_shape
+        self._crop_shape = crop_shape
         self._pad_offsets = pad_offsets
         fov_str = str(fov)
         if fov_str not in _VALID_FOV:
@@ -130,6 +117,21 @@ class BFReconstructor:
         """Clear orientation-dependent basis caches; ImageFFT cache is preserved."""
         self._tcbf_cache = {}
         self._acbf_cache = {}
+
+    def replace_prepared_data(
+        self,
+        imagefft: ImageFFT,
+        scan_geom: ScanGeometry,
+        *,
+        crop_shape: tuple[int, int] | None,
+        pad_offsets: tuple[int, int] | None,
+    ) -> None:
+        """Replace prepared FFT provider and scan geometry, then clear derived caches."""
+        self.imagefft = imagefft
+        self.scan_geom = scan_geom
+        self._crop_shape = crop_shape
+        self._pad_offsets = pad_offsets
+        self.clear_basis_cache()
 
     def set_coord_transform(self, ct: CoordinateTransform, clear_basis: bool = True) -> None:
         """Replace the coordinate transform. Clears basis cache by default."""
@@ -208,30 +210,17 @@ class BFReconstructor:
             return 'phase_only'
         return str(acbf_algorithm).strip().lower().replace('-', '_')
 
-    def _get_recon_grids(self, upscale: float) -> tuple[torch.Tensor, torch.Tensor]:
-        """Return (qx_grid, qy_grid) for the given upscale factor."""
+    def _get_recon_grids(self) -> tuple[torch.Tensor, torch.Tensor]:
+        """Return (qx_grid, qy_grid) for the active prepared scan grid."""
         sg = self.scan_geom
-        if upscale == 1.0:
-            return sg.qx_grid, sg.qy_grid
-        Ry_p, Rx_p = sg.scan_shape
-        step = sg.scan_step_size
-        Ry_out = round(Ry_p * upscale)
-        Rx_out = round(Rx_p * upscale)
-        dev = torch.device(self.device)
-        # d = step * Rx_p / Rx_out ensures same low-frequency bin spacing as padded grid
-        qx = torch.fft.fftfreq(Rx_out, d=step * Rx_p / Rx_out, device=dev).view(1, 1, Rx_out)
-        qy = torch.fft.fftfreq(Ry_out, d=step * Ry_p / Ry_out, device=dev).view(1, Ry_out, 1)
-        return qx, qy
+        return sg.qx_grid, sg.qy_grid
 
     def _reconstruct_impl(self, mode: str = 'tcBF', **kwargs) -> torch.Tensor:
-        upscale = float(kwargs.get('upscale', 1.0))
         fov = str(kwargs.get('fov', self._fov))
         if fov not in _VALID_FOV:
             raise ValueError(f"fov must be one of {_VALID_FOV}, got {fov!r}.")
-        if upscale < 1.0:
-            raise ValueError(f"upscale must be >= 1.0, got {upscale}.")
 
-        qx_grid, qy_grid = self._get_recon_grids(upscale)
+        qx_grid, qy_grid = self._get_recon_grids()
         coeffs = self._get_scan_frame_coeffs()
         mode_key = mode.lower()
 
@@ -239,7 +228,6 @@ class BFReconstructor:
             cache = self._get_tcbf_cache(chunk_size=kwargs.get('chunk_size', 64))
             result = reconstruct_tcbf(
                 self.imagefft, qx_grid, qy_grid, cache, coeffs, self.device,
-                upscale=upscale,
             )
 
         elif mode_key == 'acbf':
@@ -247,13 +235,11 @@ class BFReconstructor:
             chunk_size = kwargs.get('chunk_size', 64)
             acbf_algorithm = self._normalize_acbf_algorithm(kwargs.get('acbf_algorithm'))
             geometry, optics = self._get_acbf_cache(rolloff=rolloff, chunk_size=chunk_size)
-            if upscale != 1.0:
-                optics = None  # precomputed optics are wrong size; use lazy path
 
             if acbf_algorithm == 'phase_only':
                 result = reconstruct_acbf(
                     self.imagefft, qx_grid, qy_grid, geometry, optics,
-                    coeffs, self.eps, self.device, upscale=upscale,
+                    coeffs, self.eps, self.device,
                 )
             elif acbf_algorithm == 'complex_inversion':
                 result = reconstruct_acbf_complex_inversion(
@@ -261,7 +247,6 @@ class BFReconstructor:
                     coeffs, self.device,
                     regularization=kwargs.get('regularization', 1e-3),
                     support_threshold=kwargs.get('support_threshold', 1e-6),
-                    upscale=upscale,
                 )
             else:
                 raise ValueError(
@@ -274,7 +259,7 @@ class BFReconstructor:
 
         # fov crop — only when padding was used
         if self._pad_offsets is not None and fov == 'original':
-            result = _crop_to_original(result, self._pad_offsets, self._orig_scan_shape, upscale)
+            result = _crop_to_original(result, self._pad_offsets, self._crop_shape)
 
         return result
 

@@ -6,30 +6,9 @@ from typing import TYPE_CHECKING
 
 import numpy as np
 import torch
-import torch.nn.functional as F
 
 if TYPE_CHECKING:
     from fast_acbf.data.bf_extractor import BFExtractor
-
-
-def _fft_zero_pad_2d(F_in: torch.Tensor, Ry_out: int, Rx_out: int) -> torch.Tensor:
-    """
-    Zero-pad a 2-D FFT (..., Ry_in, Rx_in) to (..., Ry_out, Rx_out).
-    Preserves torch.fft.fft2 frequency layout (DC at corner).
-    Scale factor (Ry_out*Rx_out)/(Ry_in*Rx_in) ensures correct IFFT amplitude.
-    """
-    Ry_in, Rx_in = F_in.shape[-2], F_in.shape[-1]
-    F_c = torch.fft.fftshift(F_in, dim=(-2, -1))
-    # Left pad = Nout//2 - Nin//2 so DC (at Nin//2 after fftshift) lands at Nout//2.
-    # This is correct for both even and odd sizes; pad_total//2 only works for even Nin.
-    pad_y_left = Ry_out // 2 - Ry_in // 2
-    pad_x_left = Rx_out // 2 - Rx_in // 2
-    pad_y_right = Ry_out - Ry_in - pad_y_left
-    pad_x_right = Rx_out - Rx_in - pad_x_left
-    # F.pad pads last dims first: (x_left, x_right, y_left, y_right)
-    F_c_padded = F.pad(F_c, (pad_x_left, pad_x_right, pad_y_left, pad_y_right))
-    out = torch.fft.ifftshift(F_c_padded, dim=(-2, -1))
-    return out * ((Ry_out * Rx_out) / (Ry_in * Rx_in))
 
 
 _VALID_STORAGE = ('auto', 'device', 'host', 'none')
@@ -120,20 +99,6 @@ class ImageFFT:
 
         chunk = np.asarray(self._cache[b_start:b_end]).copy()
         return torch.from_numpy(chunk).to(torch.device(self.device))
-
-    def get_upscaled_chunk(self, b_start: int, b_end: int, upscale: float) -> torch.Tensor:
-        """
-        Return the FFT chunk for [b_start, b_end) zero-padded to the upscaled size.
-        Shape: (b_end-b_start, Ry_out, Rx_out) complex64, on device.
-        upscale=1.0 returns get_chunk() directly (no allocation).
-        """
-        chunk = self.get_chunk(b_start, b_end)
-        if upscale == 1.0:
-            return chunk
-        Ry_in, Rx_in = self.scan_shape
-        Ry_out = round(Ry_in * upscale)
-        Rx_out = round(Rx_in * upscale)
-        return _fft_zero_pad_2d(chunk, Ry_out, Rx_out)
 
     def precompute(self) -> None:
         if self.storage == 'none':
@@ -229,4 +194,4 @@ class ImageFFT:
         return torch.fft.fft2(vbf_dev, dim=(-2, -1))
 
 
-__all__ = ["ImageFFT", "_fft_zero_pad_2d"]
+__all__ = ["ImageFFT"]
