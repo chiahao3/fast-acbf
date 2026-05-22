@@ -543,6 +543,49 @@ class TestAutogradBoundary:
             rtol=1e-6,
         )
 
+    def test_refine_defocus_accepts_upscaled_preparation(self, synth_dataset, synth_params, device):
+        solver = self._make_solver(synth_dataset, synth_params, device)
+
+        solver.refine_defocus(
+            search_range=(40.0, 60.0),
+            num_points=3,
+            method='max',
+            plot_search=False,
+            upscale=2.0,
+            upscale_method='nearest',
+            chunk_size=8,
+        )
+
+        assert solver.upscale == pytest.approx(2.0)
+        assert solver.upscale_method == 'nearest'
+        assert solver.reconstructed_image.shape == (
+            round(synth_params["Ny"] * 2),
+            round(synth_params["Nx"] * 2),
+        )
+
+    def test_refined_aberrations_survive_preparation_rebuilds(self, synth_dataset, synth_params, device):
+        solver = self._make_solver(synth_dataset, synth_params, device)
+        solver.refine_defocus(
+            search_range=(40.0, 60.0),
+            num_points=3,
+            method='max',
+            plot_search=False,
+            upscale=2.0,
+            chunk_size=8,
+        )
+        refined = {
+            key: solver.ab_state.get_physical(key)
+            for key in solver.ab_state.coeffs
+        }
+
+        img_native = solver.get_acBF(upscale=1.0, chunk_size=8)
+        assert img_native.shape == (synth_params["Ny"], synth_params["Nx"])
+        img_upscaled = solver.get_acBF(upscale=2.0, chunk_size=8)
+        assert img_upscaled.shape == (round(synth_params["Ny"] * 2), round(synth_params["Nx"] * 2))
+
+        for key, value in refined.items():
+            assert solver.ab_state.get_physical(key) == pytest.approx(value)
+
 
 # ── get_defocus_stack ─────────────────────────────────────────────────────────
 
@@ -756,6 +799,55 @@ class TestFrameCacheBehavior:
         assert not solver_zero_ab.reconstructed_image.requires_grad
         assert not solver_zero_ab._recon._tcbf_cache and not solver_zero_ab._recon._acbf_cache
         assert solver_zero_ab._recon.imagefft.cache is None
+
+    def test_same_preparation_key_reuses_imagefft_object(self, synth_dataset, synth_params, device):
+        p = synth_params
+        solver = BFSolver(
+            dataset=synth_dataset,
+            max_alpha=p["max_alpha"],
+            scan_step_size=p["scan_step_size"],
+            dk=p["dk"],
+            wavelength=p["wavelength"],
+            max_order=2,
+            aberrations={"C10": 0.0},
+            device=device,
+            imagefft_storage='host',
+            imagefft_fill='lazy',
+        )
+
+        solver.get_tcBF(upscale=2.0, chunk_size=8)
+        imagefft = solver._recon.imagefft
+        solver.get_acBF(upscale=2.0, chunk_size=8)
+
+        assert solver._recon.imagefft is imagefft
+
+    def test_different_preparation_key_rebuilds_imagefft_preserves_aberrations(self, synth_dataset, synth_params, device):
+        p = synth_params
+        solver = BFSolver(
+            dataset=synth_dataset,
+            max_alpha=p["max_alpha"],
+            scan_step_size=p["scan_step_size"],
+            dk=p["dk"],
+            wavelength=p["wavelength"],
+            max_order=2,
+            aberrations={"C10": 50.0, "C12": 10.0},
+            device=device,
+            imagefft_storage='host',
+            imagefft_fill='lazy',
+        )
+        before = {
+            key: solver.ab_state.get_physical(key)
+            for key in solver.ab_state.coeffs
+        }
+
+        solver.get_tcBF(upscale=2.0, chunk_size=8)
+        imagefft = solver._recon.imagefft
+        solver.get_tcBF(upscale=1.0, chunk_size=8)
+
+        assert solver._recon.imagefft is not imagefft
+        assert solver.scan_shape == (p["Ny"], p["Nx"])
+        for key, value in before.items():
+            assert solver.ab_state.get_physical(key) == pytest.approx(value)
 
 
 # ── Cache mode parity ────────────────────────────────────────────────────────
