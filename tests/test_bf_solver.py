@@ -53,20 +53,23 @@ class TestBFSolverInit:
                 imagefft_storage="invalid_mode",
             )
 
-    def test_removed_upscale_constructor_args_raise(self, synth_dataset, synth_params, device):
+    def test_upscale_constructor_args_initialize_prepared_state(self, synth_dataset, synth_params, device):
         p = synth_params
-        with pytest.raises(TypeError, match="upscale_method"):
-            BFSolver(
-                dataset=synth_dataset,
-                max_alpha=p["max_alpha"],
-                scan_step_size=p["scan_step_size"],
-                dk=p["dk"],
-                wavelength=p["wavelength"],
-                max_order=2,
-                aberrations={"C10": 0.0},
-                device=device,
-                upscale_method="bilinear",
-            )
+        solver = BFSolver(
+            dataset=synth_dataset,
+            max_alpha=p["max_alpha"],
+            scan_step_size=p["scan_step_size"],
+            dk=p["dk"],
+            wavelength=p["wavelength"],
+            max_order=2,
+            aberrations={"C10": 0.0},
+            device=device,
+            upscale=2.0,
+            upscale_method="nearest",
+        )
+        assert solver.upscale == pytest.approx(2.0)
+        assert solver.upscale_method == "nearest"
+        assert solver.scan_shape == (round(p["Ny"] * 2), round(p["Nx"] * 2))
 
         with pytest.raises(TypeError, match="defer_upscale"):
             BFSolver(
@@ -92,6 +95,22 @@ class TestBFSolverInit:
         Ry, Rx = solver_zero_ab.Ry, solver_zero_ab.Rx
         img = solver_zero_ab.get_tcBF(upscale=2.0)
         assert img.shape == (round(Ry * 2), round(Rx * 2))
+        assert solver_zero_ab.upscale == pytest.approx(2.0)
+        assert solver_zero_ab.scan_shape == img.shape
+        assert solver_zero_ab.scan_step_size == pytest.approx(
+            solver_zero_ab.raw_scan_step_size / 2.0
+        )
+
+    def test_raw_properties_preserve_native_state_after_upscale(self, solver_zero_ab, synth_params):
+        p = synth_params
+        solver_zero_ab.prepare_vbf(upscale=1.5, upscale_method="nearest")
+
+        assert solver_zero_ab.raw_scan_shape == (p["Ny"], p["Nx"])
+        assert solver_zero_ab.scan_shape == (round(p["Ny"] * 1.5), round(p["Nx"] * 1.5))
+        assert solver_zero_ab.raw_scan_step_size == pytest.approx(p["scan_step_size"])
+        assert solver_zero_ab.scan_step_size == pytest.approx(p["scan_step_size"] / 1.5)
+        assert solver_zero_ab.raw_vbf_images.shape[-2:] == (p["Ny"], p["Nx"])
+        assert solver_zero_ab.vbf_images.shape[-2:] == solver_zero_ab.padded_scan_shape
 
     def test_no_global_output_frame_state(self, solver_zero_ab):
         assert not hasattr(solver_zero_ab, "output_frame")
