@@ -1,4 +1,4 @@
-"""BFPreparer — mirror-pad + Tukey window applied to vBF images before FFT."""
+"""BFPreparer -- real-space vBF preparation before FFT caching."""
 
 from __future__ import annotations
 
@@ -10,6 +10,9 @@ import torch.nn.functional as F
 
 if TYPE_CHECKING:
     from fast_acbf.data.bf_extractor import BFExtractor
+
+
+_VALID_UPSCALE_METHODS = ("nearest", "bilinear")
 
 
 def _ceil_5smooth(n: int) -> int:
@@ -29,9 +32,6 @@ def _compute_pad_for_axis(orig: int, min_pad: int) -> tuple[int, int, int]:
     """
     Find the smallest 5-smooth size >= orig + 2*min_pad.
     Returns (padded_size, pad_before, pad_after).
-      pad_before = (padded_size - orig) // 2
-      pad_after  = padded_size - orig - pad_before   <- at most pad_before + 1
-    Both values are >= min_pad.
     """
     target = orig + 2 * min_pad
     padded = _ceil_5smooth(target)
@@ -42,12 +42,7 @@ def _compute_pad_for_axis(orig: int, min_pad: int) -> tuple[int, int, int]:
 
 
 def _make_tukey_1d(total: int, pad_before: int, pad_after: int) -> np.ndarray:
-    """
-    Tukey window of length total.
-      indices 0..pad_before-1         : cosine rise  0 -> 1
-      indices pad_before..total-pad_after-1: flat 1.0
-      indices total-pad_after..total-1: cosine fall 1 -> 0
-    """
+    """Tukey window with flat unit central region and cosine pad rolloff."""
     w = np.ones(total, dtype=np.float32)
     if pad_before > 0:
         i = np.arange(pad_before, dtype=np.float32)
@@ -69,36 +64,102 @@ def _make_tukey_2d(
     return np.outer(wy, wx).astype(np.float32)
 
 
+def _normalize_upscale_method(method: str) -> str:
+    method = str(method).strip().lower()
+    if method not in _VALID_UPSCALE_METHODS:
+        raise ValueError(
+            f"upscale_method must be one of {_VALID_UPSCALE_METHODS}, got {method!r}."
+        )
+    return method
+
+
+def _prepared_shapes(
+    raw_shape: tuple[int, int],
+    upscale: float,
+    pad_width: int | None,
+) -> tuple[tuple[int, int], tuple[int, int], tuple[int, int], tuple[int, int, int, int], bool]:
+    """Return upscaled/padded shapes and pad metadata for a preparation state."""
+    if upscale < 1.0:
+        raise ValueError(f"upscale must be >= 1.0, got {upscale}.")
+    Ry, Rx = raw_shape
+    Ry_up = round(Ry * upscale)
+    Rx_up = round(Rx * upscale)
+    if Ry_up <= 0 or Rx_up <= 0:
+        raise ValueError(f"upscale produces invalid shape {(Ry_up, Rx_up)}.")
+
+    if pad_width is None:
+        return (Ry_up, Rx_up), (Ry_up, Rx_up), (0, 0), (0, 0, 0, 0), False
+
+    pad_width = int(pad_width)
+    if pad_width < 0:
+        raise ValueError(f"pad_width must be non-negative, got {pad_width}.")
+    if pad_width == 0:
+        return (Ry_up, Rx_up), (Ry_up, Rx_up), (0, 0), (0, 0, 0, 0), False
+
+    effective_pad = round(pad_width * upscale)
+    if effective_pad <= 0:
+        return (Ry_up, Rx_up), (Ry_up, Rx_up), (0, 0), (0, 0, 0, 0), False
+    if effective_pad >= min(Ry_up, Rx_up):
+        raise ValueError(
+            f"effective pad_width={effective_pad} must be < min(Ry={Ry_up}, Rx={Rx_up}) "
+            "after upscaling."
+        )
+
+    Ry_p, pad_top, pad_bottom = _compute_pad_for_axis(Ry_up, effective_pad)
+    Rx_p, pad_left, pad_right = _compute_pad_for_axis(Rx_up, effective_pad)
+    if max(pad_top, pad_bottom) >= Ry_up or max(pad_left, pad_right) >= Rx_up:
+        raise ValueError(
+            f"Effective padding after 5-smooth rounding "
+            f"(top={pad_top}, bottom={pad_bottom}, left={pad_left}, right={pad_right}) "
+            f"equals or exceeds upscaled input dimension (Ry={Ry_up}, Rx={Rx_up}). "
+            "Reduce pad_width."
+        )
+    return (
+        (Ry_up, Rx_up),
+        (Ry_p, Rx_p),
+        (pad_top, pad_left),
+        (pad_top, pad_bottom, pad_left, pad_right),
+        True,
+    )
+
+
 class BFPreparer:
-    """Wraps BFExtractor; applies mirror-padding + Tukey window before images reach ImageFFT."""
+    """Wraps BFExtractor; applies real-space upscale, padding, and windowing."""
 
-    def __init__(self, extractor: BFExtractor, pad_width: int) -> None:
-        if pad_width <= 0:
-            raise ValueError(f"pad_width must be positive, got {pad_width}.")
-        Ry, Rx = extractor.scan_shape
-        if pad_width >= min(Ry, Rx):
-            raise ValueError(
-                f"pad_width={pad_width} must be < min(Ry={Ry}, Rx={Rx}) for reflect padding."
-            )
-        Ry_p, pad_top, pad_bottom = _compute_pad_for_axis(Ry, pad_width)
-        Rx_p, pad_left, pad_right = _compute_pad_for_axis(Rx, pad_width)
-        # Reflect padding requires each pad < the axis size (PyTorch constraint).
-        # 5-smooth rounding can push the actual pad above pad_width, so check post-compute.
-        if max(pad_top, pad_bottom) >= Ry or max(pad_left, pad_right) >= Rx:
-            raise ValueError(
-                f"Effective padding after 5-smooth rounding "
-                f"(top={pad_top}, bottom={pad_bottom}, left={pad_left}, right={pad_right}) "
-                f"equals or exceeds input dimension (Ry={Ry}, Rx={Rx}). "
-                f"Reduce pad_width."
-            )
-
+    def __init__(
+        self,
+        extractor: BFExtractor,
+        upscale: float = 1.0,
+        upscale_method: str = "bilinear",
+        pad_width: int | None = None,
+    ) -> None:
         self._extractor = extractor
-        self.orig_shape = (Ry, Rx)
-        self.padded_shape = (Ry_p, Rx_p)
-        self.pad_offsets = (pad_top, pad_left)  # (pad_top, pad_left) for fov crop
-        self.pad_top, self.pad_bottom = pad_top, pad_bottom
-        self.pad_left, self.pad_right = pad_left, pad_right
-        self._window_np = _make_tukey_2d(Ry_p, Rx_p, pad_top, pad_bottom, pad_left, pad_right)
+        self.upscale = float(upscale)
+        self.upscale_method = _normalize_upscale_method(upscale_method)
+        self.pad_width = None if pad_width is None or int(pad_width) == 0 else int(pad_width)
+
+        self.raw_shape = tuple(extractor.scan_shape)
+        self.orig_shape = self.raw_shape  # compatibility alias for older callers
+        (
+            self.upscaled_shape,
+            self.padded_shape,
+            self.pad_offsets,
+            pads,
+            self._has_pad,
+        ) = _prepared_shapes(self.raw_shape, self.upscale, self.pad_width)
+        self.pad_top, self.pad_bottom, self.pad_left, self.pad_right = pads
+        self._window_np = (
+            _make_tukey_2d(
+                self.padded_shape[0],
+                self.padded_shape[1],
+                self.pad_top,
+                self.pad_bottom,
+                self.pad_left,
+                self.pad_right,
+            )
+            if self._has_pad
+            else None
+        )
 
     # Duck-typed ImageFFT extractor interface
     @property
@@ -107,7 +168,7 @@ class BFPreparer:
 
     @property
     def scan_shape(self) -> tuple[int, int]:
-        return self.padded_shape  # override → ImageFFT allocates padded cache
+        return self.padded_shape
 
     @property
     def strategy(self) -> str:
@@ -122,28 +183,63 @@ class BFPreparer:
         return self._extractor.bf_ix
 
     def extract_chunk(self, b_start: int, b_end: int):
-        return self._pad_and_window(self._extractor.extract_chunk(b_start, b_end))
+        return self._prepare(self._extractor.extract_chunk(b_start, b_end))
 
     def extract_all(self):
-        return self._pad_and_window(self._extractor.extract_all())
+        return self._prepare(self._extractor.extract_all())
+
+    def _prepare(self, vbf):
+        if self.upscaled_shape != self.raw_shape:
+            vbf = self._upsample(vbf)
+        if self._has_pad:
+            vbf = self._pad_and_window(vbf)
+        return vbf
+
+    def _upsample(self, vbf):
+        is_tensor = isinstance(vbf, torch.Tensor)
+        if is_tensor:
+            src = vbf.float()
+            device = src.device
+        else:
+            src = torch.from_numpy(np.asarray(vbf, dtype=np.float32))
+            device = torch.device("cpu")
+
+        inp = src.to(device).unsqueeze(1)
+        if self.upscale_method == "nearest":
+            out = F.interpolate(inp, size=self.upscaled_shape, mode="nearest")
+        else:
+            out = F.interpolate(
+                inp,
+                size=self.upscaled_shape,
+                mode="bilinear",
+                align_corners=False,
+            )
+        out = out.squeeze(1).contiguous()
+        if is_tensor:
+            return out
+        return out.cpu().numpy().astype(np.float32, copy=False)
 
     def _pad_and_window(self, vbf):
-        """vbf: (B, Ry, Rx) numpy or torch. Returns same type, padded and windowed."""
+        """vBF shape: (B, Ry, Rx). Returns same array/tensor type."""
         if isinstance(vbf, torch.Tensor):
             padded = F.pad(
                 vbf,
                 (self.pad_left, self.pad_right, self.pad_top, self.pad_bottom),
-                mode='reflect',
+                mode="reflect",
             )
             w = torch.as_tensor(self._window_np, dtype=torch.float32, device=vbf.device)
             return padded * w
-        else:
-            padded = np.pad(
-                vbf,
-                ((0, 0), (self.pad_top, self.pad_bottom), (self.pad_left, self.pad_right)),
-                mode='reflect',
-            ).astype(np.float32)
-            return padded * self._window_np
+
+        padded = np.pad(
+            vbf,
+            ((0, 0), (self.pad_top, self.pad_bottom), (self.pad_left, self.pad_right)),
+            mode="reflect",
+        ).astype(np.float32)
+        return padded * self._window_np
 
 
-__all__ = ["BFPreparer", "_compute_pad_for_axis"]
+__all__ = [
+    "BFPreparer",
+    "_compute_pad_for_axis",
+    "_prepared_shapes",
+]

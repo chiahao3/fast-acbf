@@ -7,6 +7,7 @@ import pytest
 import torch
 
 from fast_acbf.data.bf_extractor import BFExtractor
+from fast_acbf.data.bf_preparer import BFPreparer, _compute_pad_for_axis
 from fast_acbf.data.dataset4d import Dataset4D
 from fast_acbf.data.geometry import DetectorGeometry
 
@@ -145,3 +146,61 @@ def test_device_mask_rejects_lazy_imagefft_fill():
     )
     with pytest.raises(ValueError, match="device_mask"):
         ImageFFT(extractor, device='cpu', storage='host', fill='lazy')
+
+
+def test_bf_preparer_identity_passes_native_vbf_through():
+    arr = _make_data()
+    extractor = BFExtractor(Dataset4D(arr), _make_geom(), strategy='host_mask')
+    ref = extractor.extract_all()
+
+    preparer = BFPreparer(extractor, upscale=1.0, upscale_method='bilinear', pad_width=None)
+    got = preparer.extract_all()
+
+    assert preparer.raw_shape == Dataset4D(arr).scan_shape
+    assert preparer.upscaled_shape == Dataset4D(arr).scan_shape
+    assert preparer.padded_shape == Dataset4D(arr).scan_shape
+    np.testing.assert_allclose(got, ref, atol=0, rtol=0)
+
+
+@pytest.mark.parametrize("method", ["nearest", "bilinear"])
+def test_bf_preparer_real_space_upscale_shape(method):
+    arr = _make_data(shape=(4, 5, 16, 16))
+    extractor = BFExtractor(Dataset4D(arr), _make_geom(), strategy='host_mask')
+
+    preparer = BFPreparer(extractor, upscale=1.5, upscale_method=method, pad_width=None)
+    got = preparer.extract_chunk(0, 2)
+
+    assert preparer.upscaled_shape == (6, 8)
+    assert preparer.scan_shape == (6, 8)
+    assert got.shape == (2, 6, 8)
+    assert got.dtype == np.float32
+
+
+def test_bf_preparer_nearest_matches_torch_interpolate():
+    arr = _make_data(shape=(3, 3, 16, 16))
+    extractor = BFExtractor(Dataset4D(arr), _make_geom(), strategy='host_mask')
+    native = extractor.extract_chunk(0, 1)
+
+    preparer = BFPreparer(extractor, upscale=2.0, upscale_method='nearest', pad_width=None)
+    got = preparer.extract_chunk(0, 1)
+    expected = torch.nn.functional.interpolate(
+        torch.from_numpy(native).unsqueeze(1),
+        size=(6, 6),
+        mode='nearest',
+    ).squeeze(1).numpy()
+
+    np.testing.assert_allclose(got, expected, atol=0, rtol=0)
+
+
+def test_bf_preparer_padding_is_in_native_pixels_after_upscale():
+    arr = _make_data(shape=(8, 8, 16, 16))
+    extractor = BFExtractor(Dataset4D(arr), _make_geom(), strategy='host_mask')
+
+    preparer = BFPreparer(extractor, upscale=2.0, upscale_method='bilinear', pad_width=2)
+    expected_y = _compute_pad_for_axis(16, 4)
+    expected_x = _compute_pad_for_axis(16, 4)
+
+    assert preparer.upscaled_shape == (16, 16)
+    assert preparer.padded_shape == (expected_y[0], expected_x[0])
+    assert preparer.pad_offsets == (expected_y[1], expected_x[1])
+    assert preparer.extract_chunk(0, 1).shape == (1, expected_y[0], expected_x[0])
