@@ -7,7 +7,7 @@ from .data.geometry import DetectorGeometry, ScanGeometry, CoordinateTransform
 from .data.imagefft import ImageFFT
 from .recon.pipeline import PipelineManager, PipelineResolution
 
-__version__ = "0.4.0" # 2026.05.18
+__version__ = "0.5.0" # 2026.05.22
 
 __all__ = [
     "BFSolver",

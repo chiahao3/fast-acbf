@@ -11,16 +11,6 @@
   optionally with `frame` selector. Consolidates the `get_reconstructed_image` + `get_probe`
   + `get_aberrations_dict` pattern used in notebooks.
 
-- **Revisit scan-coordinate resampling approaches** — future affine/coordinate-transform
-  correction still needs literature review: compare real-space interpolation (`grid_sample`
-  / `tv_rotate`) with Fourier-space phase-ramp shifting for sub-pixel accuracy, aliasing
-  behavior, and differentiability. Real-space vBF upscaling is already handled in
-  `BFPreparer`; this item is about geometric correction quality, not enabling upscale.
-
-
-## Tests
-- Test the `complex_inversion` reweighting with more simulated datasets, check for the phase shift values
-
 
 ## Research / Experiments
 - Experiment with Optuna for more comprehensive BO-based optimization for 1st and 2nd order aberrations estimation, see if it's fast enough for real-time pipeline
