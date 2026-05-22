@@ -8,6 +8,7 @@ from typing import TYPE_CHECKING
 import torch
 
 from fast_acbf.data.bf_extractor import BFExtractor
+from fast_acbf.data.bf_preparer import BFPreparer, _prepared_shapes
 from fast_acbf.data.imagefft import ImageFFT
 
 if TYPE_CHECKING:
@@ -56,6 +57,8 @@ class PipelineManager:
         vram_margin: float = 0.60,
         ram_margin: float = 0.80,
         pad_width: int | None = None,
+        upscale: float = 1.0,
+        upscale_method: str = 'bilinear',
     ) -> None:
         self.dataset = dataset
         self.detector_geom = detector_geom
@@ -71,24 +74,33 @@ class PipelineManager:
         self.fft_batch_size = int(fft_batch_size)
         self.vram_margin = float(vram_margin)
         self.ram_margin = float(ram_margin)
-        if pad_width is not None and int(pad_width) < 0:
-            raise ValueError(f"pad_width must be non-negative, got {pad_width}.")
-        self.pad_width = int(pad_width) if (pad_width is not None and int(pad_width) > 0) else None
-
-        # Compute padded scan shape for memory estimates before _resolve()
-        if self.pad_width is not None:
-            from fast_acbf.data.bf_preparer import _compute_pad_for_axis
-            Ry, Rx = dataset.scan_shape
-            Ry_p, _, _ = _compute_pad_for_axis(Ry, self.pad_width)
-            Rx_p, _, _ = _compute_pad_for_axis(Rx, self.pad_width)
-            self._effective_scan_shape = (Ry_p, Rx_p)
-        else:
-            self._effective_scan_shape = None
+        self.upscale = 1.0
+        self.upscale_method = 'bilinear'
+        self.pad_width = None
+        self._effective_scan_shape = dataset.scan_shape
+        self.set_preparation(upscale=upscale, upscale_method=upscale_method, pad_width=pad_width)
 
         self.resolution = self._resolve()
         self.extractor: BFExtractor | None = None
-        self.preparer = None  # BFPreparer | None
+        self.preparer: BFPreparer | None = None
         self.imagefft: ImageFFT | None = None
+
+    def set_preparation(
+        self,
+        *,
+        upscale: float,
+        upscale_method: str,
+        pad_width: int | None,
+    ) -> None:
+        if pad_width is not None and int(pad_width) < 0:
+            raise ValueError(f"pad_width must be non-negative, got {pad_width}.")
+        self.upscale = float(upscale)
+        self.upscale_method = str(upscale_method).strip().lower()
+        self.pad_width = int(pad_width) if (pad_width is not None and int(pad_width) > 0) else None
+        _, padded_shape, _, _, _ = _prepared_shapes(
+            self.dataset.scan_shape, self.upscale, self.pad_width
+        )
+        self._effective_scan_shape = padded_shape
 
     @staticmethod
     def _validate(name: str, value: str, valid: tuple[str, ...]) -> str:
@@ -110,28 +122,47 @@ class PipelineManager:
     def imagefft_bytes(self) -> int:
         return int(self.vbf_bytes * 2)  # complex64 = 2 x float32 bytes
 
-    def build_imagefft(self) -> ImageFFT:
+    def build_full_pipeline(self) -> tuple[BFPreparer, ImageFFT]:
         self.extractor = BFExtractor(
             self.dataset,
             self.detector_geom,
             device=self.device,
             strategy=self.resolution.extractor_strategy,
         )
-        if self.pad_width is not None:
-            from fast_acbf.data.bf_preparer import BFPreparer
-            self.preparer = BFPreparer(self.extractor, pad_width=self.pad_width)
-            provider = self.preparer
-        else:
-            self.preparer = None
-            provider = self.extractor
+        self.preparer = BFPreparer(
+            self.extractor,
+            upscale=self.upscale,
+            upscale_method=self.upscale_method,
+            pad_width=self.pad_width,
+        )
         self.imagefft = ImageFFT(
-            provider,
+            self.preparer,
             device=self.device,
             storage=self.resolution.imagefft_storage,
             fill=self.resolution.imagefft_fill,
             batch_size=self.fft_batch_size,
         )
-        return self.imagefft
+        return self.preparer, self.imagefft
+
+    def build_imagefft(self) -> ImageFFT:
+        """Backward-compatible alias returning only ImageFFT."""
+        _, imagefft = self.build_full_pipeline()
+        return imagefft
+
+    def rebuild_prepared_pipeline(
+        self,
+        *,
+        upscale: float,
+        upscale_method: str,
+        pad_width: int | None,
+    ) -> tuple[BFPreparer, ImageFFT]:
+        self.set_preparation(
+            upscale=upscale,
+            upscale_method=upscale_method,
+            pad_width=pad_width,
+        )
+        self.resolution = self._resolve()
+        return self.build_full_pipeline()
 
     def _resolve(self) -> PipelineResolution:
         raw_bytes = self.dataset.nbytes_float32

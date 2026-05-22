@@ -19,11 +19,13 @@ from fast_acbf.core.aberrations import AberrationState
 from fast_acbf.core.acbf import reconstruct_acbf_complex_inversion
 from fast_acbf.core.functional import generate_aberration_basis, generate_shift_basis, make_probe_from_chi
 from fast_acbf.data.dataset4d import Dataset4D
+from fast_acbf.data.bf_preparer import _normalize_upscale_method, _prepared_shapes
 from fast_acbf.data.geometry import CoordinateTransform, DetectorGeometry, ScanGeometry
 from fast_acbf.recon.pipeline import PipelineManager
 from fast_acbf.recon.reconstructor import BFReconstructor, _crop_to_original, _VALID_FOV
 
 logger = logging.getLogger(__name__)
+_PREP_SENTINEL = object()
 
 
 def _build_c10_axis(
@@ -88,6 +90,28 @@ def _build_c10_axis(
     )
 
 
+def _make_prep_key(
+    raw_shape: tuple[int, int],
+    upscale: float,
+    upscale_method: str,
+    pad_width: int | None,
+) -> tuple:
+    upscaled_shape, padded_shape, pad_offsets, _, has_pad = _prepared_shapes(
+        raw_shape, float(upscale), pad_width
+    )
+    normalized_method = _normalize_upscale_method(upscale_method)
+    method = 'none' if upscaled_shape == raw_shape else normalized_method
+    return (
+        method,
+        float(upscale),
+        int(pad_width) if pad_width is not None and int(pad_width) > 0 else None,
+        tuple(upscaled_shape),
+        tuple(padded_shape),
+        tuple(pad_offsets),
+        bool(has_pad),
+    )
+
+
 class BFSolver:
     """Offline/notebook facade for tcBF and acBF reconstruction."""
 
@@ -113,6 +137,7 @@ class BFSolver:
         pad_width: int | None = None,
         fov: str = 'original',
         upscale: float = 1.0,
+        upscale_method: str = 'bilinear',
     ) -> None:
         if aberrations is None:
             aberrations = {}
@@ -178,19 +203,19 @@ class BFSolver:
             extractor_strategy=extractor_strategy,
             fft_batch_size=fft_batch_size,
             pad_width=pad_width,
+            upscale=upscale,
+            upscale_method=upscale_method,
         )
-        imagefft = pipeline_manager.build_imagefft()
+        preparer, imagefft = pipeline_manager.build_full_pipeline()
 
         # Read padding metadata from the preparer (single source of truth)
-        if pipeline_manager.preparer is not None:
-            p = pipeline_manager.preparer
-            crop_shape = p.upscaled_shape
-            pad_offsets = p.pad_offsets if p._has_pad else None
-            scan_geom = ScanGeometry.from_params(p.padded_shape, scan_step_size, device=device)
-        else:
-            crop_shape = None
-            pad_offsets = None
-            scan_geom = ScanGeometry.from_params((Ry, Rx), scan_step_size, device=device)
+        crop_shape = preparer.upscaled_shape if preparer._has_pad else None
+        pad_offsets = preparer.pad_offsets if preparer._has_pad else None
+        scan_geom = ScanGeometry.from_params(
+            preparer.padded_shape,
+            scan_step_size / float(upscale),
+            device=device,
+        )
 
         Nb = imagefft.nb
         print(
@@ -213,9 +238,14 @@ class BFSolver:
         self._dataset = ds
         self._pipeline_manager = pipeline_manager
         self._recon = recon
-        self._orig_scan_shape = (Ry, Rx)  # always raw scan dims
+        self._raw_scan_shape = (Ry, Rx)
+        self._raw_scan_step_size = float(scan_step_size)
         self._upscale = float(upscale)
+        self._upscale_method = str(upscale_method).strip().lower()
         self._fov = str(fov)
+        self._active_prep_key = _make_prep_key(
+            self._raw_scan_shape, self._upscale, self._upscale_method, self.pad_width
+        )
         self.reconstructed_image: torch.Tensor | None = None
         self.last_c10_stack_axis: torch.Tensor | None = None
         self.tolerance_factors = tolerance_factors
@@ -230,12 +260,15 @@ class BFSolver:
 
     @property
     def vbf_images(self) -> torch.Tensor:
-        """Return (Nb, Ry, Rx) float32 BF image stack.
+        """Return the active prepared vBF stack before FFT caching."""
+        vbf = self._pipeline_manager.preparer.extract_all()
+        if isinstance(vbf, torch.Tensor):
+            return vbf.detach().cpu()
+        return torch.from_numpy(vbf)
 
-        vBF is not the persistent pipeline product, so this extracts it from
-        the current BFExtractor each time.  With ``extractor_strategy='device_mask'``
-        this uploads the full 4D dataset to the compute device on every access.
-        """
+    @property
+    def raw_vbf_images(self) -> torch.Tensor:
+        """Return native extracted vBF images before preparation."""
         vbf = self._pipeline_manager.extractor.extract_all()
         if isinstance(vbf, torch.Tensor):
             return vbf.detach().cpu()
@@ -282,12 +315,32 @@ class BFSolver:
         return self._recon.scan_geom.scan_step_size
 
     @property
+    def raw_scan_step_size(self) -> float:
+        return self._raw_scan_step_size
+
+    @property
     def Ry(self) -> int:
-        return self._orig_scan_shape[0]
+        return self.scan_shape[0]
 
     @property
     def Rx(self) -> int:
-        return self._orig_scan_shape[1]
+        return self.scan_shape[1]
+
+    @property
+    def scan_shape(self) -> tuple[int, int]:
+        return self._pipeline_manager.preparer.upscaled_shape
+
+    @property
+    def raw_Ry(self) -> int:
+        return self._raw_scan_shape[0]
+
+    @property
+    def raw_Rx(self) -> int:
+        return self._raw_scan_shape[1]
+
+    @property
+    def raw_scan_shape(self) -> tuple[int, int]:
+        return self._raw_scan_shape
 
     @property
     def max_order(self) -> int:
@@ -303,9 +356,8 @@ class BFSolver:
 
     @property
     def padded_scan_shape(self) -> tuple[int, int]:
-        """Scan shape after mirror-padding, or original shape when pad_width is None."""
-        p = self._pipeline_manager.preparer
-        return p.padded_shape if p is not None else self._orig_scan_shape
+        """Active prepared scan shape after optional padding."""
+        return self._pipeline_manager.preparer.padded_shape
 
     @property
     def fov(self) -> str:
@@ -315,18 +367,17 @@ class BFSolver:
     def upscale(self) -> float:
         return self._upscale
 
+    @property
+    def upscale_method(self) -> str:
+        return self._upscale_method
+
     def get_pixel_size(self, upscale: float | None = None) -> float:
         """Physical size of one output pixel in Angstroms.
-
-        For fov='original' outputs the shape is (round(Ry*U), round(Rx*U)) and
-        each pixel represents scan_step_size/U Angstroms.  The continuous-space
-        boundary of the original FOV may drift by up to one pixel relative to the
-        exact padded-grid boundary; use padded_scan_shape to compute exact extents.
         """
         u = float(upscale) if upscale is not None else self._upscale
         if u < 1.0:
             raise ValueError(f"upscale must be >= 1.0, got {upscale}.")
-        return self.scan_step_size / u
+        return self._raw_scan_step_size / u
 
     @property
     def pipeline(self) -> str:
@@ -398,9 +449,55 @@ class BFSolver:
         return self
 
     def set_upscale(self, value: float) -> BFSolver:
-        if value < 1.0:
-            raise ValueError(f"upscale must be >= 1.0, got {value}.")
-        self._upscale = float(value)
+        return self.prepare_vbf(upscale=value)
+
+    def prepare_vbf(
+        self,
+        *,
+        upscale: float | None = None,
+        upscale_method: str | None = None,
+        pad_width=_PREP_SENTINEL,
+    ) -> BFSolver:
+        """Switch the active prepared vBF grid, rebuilding ImageFFT when needed."""
+        new_upscale = float(upscale) if upscale is not None else self._upscale
+        new_method = (
+            str(upscale_method).strip().lower()
+            if upscale_method is not None
+            else self._upscale_method
+        )
+        new_pad_width = self.pad_width if pad_width is _PREP_SENTINEL else pad_width
+        if new_pad_width is not None and int(new_pad_width) <= 0:
+            new_pad_width = None
+
+        new_key = _make_prep_key(
+            self._raw_scan_shape,
+            new_upscale,
+            new_method,
+            new_pad_width,
+        )
+        if new_key == self._active_prep_key:
+            return self
+
+        preparer, imagefft = self._pipeline_manager.rebuild_prepared_pipeline(
+            upscale=new_upscale,
+            upscale_method=new_method,
+            pad_width=new_pad_width,
+        )
+        scan_geom = ScanGeometry.from_params(
+            preparer.padded_shape,
+            self._raw_scan_step_size / new_upscale,
+            device=self.device,
+        )
+        self._recon.replace_prepared_data(
+            imagefft,
+            scan_geom,
+            crop_shape=preparer.upscaled_shape if preparer._has_pad else None,
+            pad_offsets=preparer.pad_offsets if preparer._has_pad else None,
+        )
+        self._upscale = new_upscale
+        self._upscale_method = new_method
+        self._active_prep_key = new_key
+        self.reconstructed_image = None
         return self
 
     # ------------------------------------------------------------------
@@ -431,6 +528,12 @@ class BFSolver:
     # ------------------------------------------------------------------
 
     def reconstruct(self, mode: str = 'tcBF', requires_grad: bool = False, **kwargs) -> torch.Tensor:
+        prep_kwargs = {}
+        for key in ('upscale', 'upscale_method', 'pad_width'):
+            if key in kwargs:
+                prep_kwargs[key] = kwargs.pop(key)
+        if prep_kwargs:
+            self.prepare_vbf(**prep_kwargs)
         return self._recon.reconstruct(mode=mode, requires_grad=requires_grad, **kwargs)
 
     def _build_c10_stack_axis(
@@ -517,10 +620,9 @@ class BFSolver:
         return torch.stack([shift_y_ang, shift_x_ang], dim=-1)
 
     def get_yx_shifts_px(self, frame: str = 'detector', upscale=None) -> torch.Tensor:
-        u = float(upscale) if upscale is not None else self._upscale
-        if u < 1.0:
-            raise ValueError(f"upscale must be >= 1.0, got {upscale}.")
-        return self.get_yx_shifts_ang(frame=frame) / self.scan_step_size * u
+        if upscale is not None:
+            self.prepare_vbf(upscale=upscale)
+        return self.get_yx_shifts_ang(frame=frame) / self.scan_step_size
 
     def get_probe(self, frame: str = 'detector', upscale=None) -> torch.Tensor:
         u = float(upscale) if upscale is not None else self._upscale
@@ -564,36 +666,49 @@ class BFSolver:
         ).squeeze(0)
 
     def get_reconstructed_image(
-        self, mode: str = 'tcBF', frame: str = 'scan', upscale=None, fov=None, **kwargs,
+        self, mode: str = 'tcBF', frame: str = 'scan', upscale=None,
+        upscale_method=None, pad_width=_PREP_SENTINEL, fov=None, **kwargs,
     ) -> torch.Tensor:
-        u = upscale if upscale is not None else self._upscale
         f = fov if fov is not None else self._fov
         frame = self._validate_frame(frame)
-        img = self.reconstruct(mode=mode.lower(), requires_grad=False, upscale=u, fov=f, **kwargs)
+        if upscale is not None or upscale_method is not None or pad_width is not _PREP_SENTINEL:
+            self.prepare_vbf(upscale=upscale, upscale_method=upscale_method, pad_width=pad_width)
+        img = self.reconstruct(mode=mode.lower(), requires_grad=False, fov=f, **kwargs)
         self.reconstructed_image = img.detach()
         if frame == 'detector':
             img = self.rotate_scan_image_to_detector(img)
         return img
 
-    def get_tcBF(self, frame: str = 'scan', upscale=None, fov=None, **kwargs) -> torch.Tensor:
-        return self.get_reconstructed_image(mode='tcBF', frame=frame, upscale=upscale, fov=fov, **kwargs)
+    def get_tcBF(
+        self, frame: str = 'scan', upscale=None, upscale_method=None,
+        pad_width=_PREP_SENTINEL, fov=None, **kwargs,
+    ) -> torch.Tensor:
+        return self.get_reconstructed_image(
+            mode='tcBF', frame=frame, upscale=upscale, upscale_method=upscale_method,
+            pad_width=pad_width, fov=fov, **kwargs,
+        )
 
-    def get_acBF(self, frame: str = 'scan', upscale=None, fov=None, **kwargs) -> torch.Tensor:
-        return self.get_reconstructed_image(mode='acBF', frame=frame, upscale=upscale, fov=fov, **kwargs)
+    def get_acBF(
+        self, frame: str = 'scan', upscale=None, upscale_method=None,
+        pad_width=_PREP_SENTINEL, fov=None, **kwargs,
+    ) -> torch.Tensor:
+        return self.get_reconstructed_image(
+            mode='acBF', frame=frame, upscale=upscale, upscale_method=upscale_method,
+            pad_width=pad_width, fov=fov, **kwargs,
+        )
 
-    def get_acBF_diagnostics(self, upscale=None, fov=None, **kwargs) -> dict:
-        u = float(upscale) if upscale is not None else self._upscale
+    def get_acBF_diagnostics(
+        self, upscale=None, upscale_method=None, pad_width=_PREP_SENTINEL, fov=None, **kwargs,
+    ) -> dict:
+        if upscale is not None or upscale_method is not None or pad_width is not _PREP_SENTINEL:
+            self.prepare_vbf(upscale=upscale, upscale_method=upscale_method, pad_width=pad_width)
         f = fov if fov is not None else self._fov
-        if u < 1.0:
-            raise ValueError(f"upscale must be >= 1.0, got {upscale}.")
         if f not in _VALID_FOV:
             raise ValueError(f"fov must be one of {_VALID_FOV}, got {f!r}.")
         rolloff = kwargs.get('rolloff', 0)
         chunk_size = kwargs.get('chunk_size', 64)
         with torch.no_grad():
             geometry, optics = self._recon._get_acbf_cache(rolloff=rolloff, chunk_size=chunk_size)
-            if u != 1.0:
-                optics = None
             qx_grid, qy_grid = self._recon._get_recon_grids()
             result = reconstruct_acbf_complex_inversion(
                 self._recon.imagefft,
@@ -624,17 +739,20 @@ class BFSolver:
         z_bottom=None,
         slice_thickness=None,
         upscale=None,
+        upscale_method=None,
+        pad_width=_PREP_SENTINEL,
         fov=None,
         **kwargs,
     ) -> torch.Tensor:
         """Return a defocus stack (Nz, Ny, Nx). C10 axis stored in last_c10_stack_axis."""
-        u = upscale if upscale is not None else self._upscale
+        if upscale is not None or upscale_method is not None or pad_width is not _PREP_SENTINEL:
+            self.prepare_vbf(upscale=upscale, upscale_method=upscale_method, pad_width=pad_width)
         f = fov if fov is not None else self._fov
         c10_axis = self._build_c10_stack_axis(
             n_layers=n_layers, z_top=z_top, z_bottom=z_bottom, slice_thickness=slice_thickness,
         )
         _, stack = self._sweep_c10_stack(c10_axis, mode=mode.lower(), frame=frame,
-                                          upscale=u, fov=f, **kwargs)
+                                          fov=f, **kwargs)
         return stack
 
     # ------------------------------------------------------------------

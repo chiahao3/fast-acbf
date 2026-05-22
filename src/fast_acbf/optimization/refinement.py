@@ -60,7 +60,7 @@ def _build_roi_solver(solver, scan_roi):
     return BFSolver(
         dataset=roi_dataset,
         max_alpha=solver.max_alpha,
-        scan_step_size=solver.scan_step_size,
+        scan_step_size=solver.raw_scan_step_size,
         dk=solver.dk,
         wavelength=solver.wavelength,
         max_order=solver.max_order,
@@ -73,6 +73,10 @@ def _build_roi_solver(solver, scan_roi):
         imagefft_fill=solver.imagefft_fill,
         extractor_strategy=solver.extractor_strategy,
         basis_mode=solver.basis_mode,
+        pad_width=solver.pad_width,
+        fov=solver.fov,
+        upscale=solver.upscale,
+        upscale_method=solver.upscale_method,
     )
 
 
