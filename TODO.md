@@ -47,7 +47,7 @@
 # Existing features
 - tcBF and acBF reconstructions
 - acBF can optionally use 'complex_inversion' algorithm to reweight the spatial frequencies
-- Native-resolution reconstruction only; upscaling is temporarily unsupported pending a dedicated Fourier-padding implementation
+- Real-space vBF upscaling (`nearest`/`bilinear`) is handled in `BFPreparer` before ImageFFT caching
 - Object, aberrations, and probe can be exported in either 'scan' or 'detector' frame. The 'detector' frame is the coordinate system used for PtyRAD.
 - brute-force defocus line search (`refine_defocus`): C10 sweep + optional parabola fit; no AD
 - scan rotation line search (`refine_scan_rotation`): sweep over rotation_deg with cache invalidation

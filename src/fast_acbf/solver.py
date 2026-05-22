@@ -633,8 +633,7 @@ class BFSolver:
         if u == 1.0:
             return make_probe_from_chi(chi, mask)
 
-        # Extend k-grid by u: same dk, larger (Ky_ext, Kx_ext) grid.
-        # Zero-pads the aperture function in k-space → finer real-space probe sampling.
+        # Extend detector k-grid by u for finer real-space probe sampling.
         det = self._recon.detector_geom
         Ky, Kx = det.detector_shape
         det_ext = DetectorGeometry.from_params(
