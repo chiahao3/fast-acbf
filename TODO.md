@@ -11,15 +11,11 @@
   optionally with `frame` selector. Consolidates the `get_reconstructed_image` + `get_probe`
   + `get_aberrations_dict` pattern used in notebooks.
 
-- **Revisit resampling approaches** — two separate questions that need literature before
-  implementing:
-  (1) *Method*: real-space bilinear (`tv_rotate`) vs. Fourier-space phase-ramp shifting for
-  sub-pixel accuracy and aliasing behavior; read Desheng's and Yue's papers for guidance.
-  (2) *Timing*: when to apply the resampling — directly to raw vBF images before caching
-  (simpler, paid once) vs. around the FFT operations in the reconstruction hot path (more
-  flexible, can defer). The right answer likely depends on whether the resampling is for
-  coord-transform correction or for upscaling, and whether it needs to be differentiable.
-  Required before re-enabling `upscale > 1`.
+- **Revisit scan-coordinate resampling approaches** — future affine/coordinate-transform
+  correction still needs literature review: compare real-space interpolation (`grid_sample`
+  / `tv_rotate`) with Fourier-space phase-ramp shifting for sub-pixel accuracy, aliasing
+  behavior, and differentiability. Real-space vBF upscaling is already handled in
+  `BFPreparer`; this item is about geometric correction quality, not enabling upscale.
 
 
 ## Tests

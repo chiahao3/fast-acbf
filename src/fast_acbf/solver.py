@@ -625,6 +625,7 @@ class BFSolver:
         return self.get_yx_shifts_ang(frame=frame) / self.scan_step_size
 
     def get_probe(self, frame: str = 'detector', upscale=None) -> torch.Tensor:
+        """Return the probe; ``upscale`` only refines detector-grid sampling."""
         u = float(upscale) if upscale is not None else self._upscale
         if u < 1.0:
             raise ValueError(f"upscale must be >= 1.0, got {upscale}.")
@@ -633,7 +634,7 @@ class BFSolver:
         if u == 1.0:
             return make_probe_from_chi(chi, mask)
 
-        # Extend detector k-grid by u for finer real-space probe sampling.
+        # Probe upscaling is independent from prepared-vBF/ImageFFT state.
         det = self._recon.detector_geom
         Ky, Kx = det.detector_shape
         det_ext = DetectorGeometry.from_params(

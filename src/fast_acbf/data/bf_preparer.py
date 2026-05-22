@@ -139,7 +139,6 @@ class BFPreparer:
         self.pad_width = None if pad_width is None or int(pad_width) == 0 else int(pad_width)
 
         self.raw_shape = tuple(extractor.scan_shape)
-        self.orig_shape = self.raw_shape  # compatibility alias for older callers
         (
             self.upscaled_shape,
             self.padded_shape,

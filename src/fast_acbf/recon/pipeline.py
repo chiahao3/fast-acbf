@@ -144,11 +144,6 @@ class PipelineManager:
         )
         return self.preparer, self.imagefft
 
-    def build_imagefft(self) -> ImageFFT:
-        """Backward-compatible alias returning only ImageFFT."""
-        _, imagefft = self.build_full_pipeline()
-        return imagefft
-
     def rebuild_prepared_pipeline(
         self,
         *,

@@ -71,6 +71,8 @@ class TestBFSolverInit:
         assert solver.upscale_method == "nearest"
         assert solver.scan_shape == (round(p["Ny"] * 2), round(p["Nx"] * 2))
 
+    def test_deprecated_defer_upscale_constructor_arg_raises(self, synth_dataset, synth_params, device):
+        p = synth_params
         with pytest.raises(TypeError, match="defer_upscale"):
             BFSolver(
                 dataset=synth_dataset,
@@ -167,6 +169,14 @@ class TestGetProbe:
         probe = solver_nonzero_ab.get_probe()
         norm = (probe.abs() ** 2).sum().item()
         assert norm == pytest.approx(1.0, abs=1e-5)
+
+    def test_probe_upscale_does_not_rebuild_prepared_state(self, solver_zero_ab, synth_params):
+        p = synth_params
+        probe = solver_zero_ab.get_probe(upscale=2.0)
+
+        assert probe.shape == (round(p["Npix"] * 2), round(p["Npix"] * 2))
+        assert solver_zero_ab.upscale == pytest.approx(1.0)
+        assert solver_zero_ab.scan_shape == solver_zero_ab.raw_scan_shape
 
 
 # ── get_yx_shifts_px / get_yx_shifts_ang ─────────────────────────────────────
