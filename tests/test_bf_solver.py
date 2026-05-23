@@ -934,6 +934,23 @@ class TestQualityMetrics:
         img = torch.randn(16, 16) + 5.0
         assert QualityMetrics.evaluate(img, metric='normalized_std').item() >= 0.0
 
+    def test_center_crop_default_ignores_border(self):
+        img = torch.ones(8, 8)
+        img[0, :] = 10.0
+        img[-1, :] = 20.0
+        img[:, 0] = 30.0
+        img[:, -1] = 40.0
+
+        cropped_score = QualityMetrics.evaluate(img, metric='normalized_std')
+        full_score = QualityMetrics.evaluate(img, metric='normalized_std', center_crop=False)
+
+        assert cropped_score.item() == pytest.approx(0.0)
+        assert full_score.item() > cropped_score.item()
+
+    def test_center_crop_fraction_validation(self):
+        with pytest.raises(ValueError, match="crop_fraction"):
+            QualityMetrics.evaluate(torch.randn(8, 8), crop_fraction=0)
+
     def test_unknown_metric_raises(self):
         with pytest.raises(ValueError, match="Unknown metric"):
             QualityMetrics.evaluate(torch.randn(8, 8), metric='nonexistent')
