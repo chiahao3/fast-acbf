@@ -113,6 +113,7 @@ def refine_defocus(
     search_range: tuple | None = None,
     num_points: int = 5,
     metric: str = 'laplacian',
+    metric_kwargs: dict | None = None,
     method: str = 'max',
     blur: bool = True,
     blur_kernel_size: int = 5,
@@ -136,6 +137,7 @@ def refine_defocus(
                           uses search_halfwidth or defocus_range_tolerance_factor.
         num_points:       Number of C10 values to sample.
         metric:           Focus metric for QualityMetrics.evaluate.
+        metric_kwargs:    Extra keyword arguments for QualityMetrics.evaluate.
         method:           'fit_parabola' or 'max'. Default is 'max'.
         blur:             Pre-blur images before scoring.
         blur_kernel_size: Kernel size for Gaussian blur.
@@ -150,6 +152,7 @@ def refine_defocus(
                           nor search_halfwidth is provided.
     """
     mode = mode.lower()
+    metric_kwargs = dict(metric_kwargs or {})
     if search_range is not None and search_halfwidth is not None:
         raise ValueError("Provide either search_range or search_halfwidth, not both.")
 
@@ -175,10 +178,14 @@ def refine_defocus(
                                dtype=torch.float32, device=device)
 
     c10_axis, scan_stack = _sweep_c10(solver, c10_axis, mode=mode, **kwargs)
-    quality_scores = QualityMetrics.evaluate(
-        scan_stack, metric=metric, blur=blur,
-        blur_kernel_size=blur_kernel_size, blur_sigma=blur_sigma,
-    ).detach().cpu().numpy()
+    metric_eval_kwargs = {
+        "metric": metric,
+        "blur": blur,
+        "blur_kernel_size": blur_kernel_size,
+        "blur_sigma": blur_sigma,
+    }
+    metric_eval_kwargs.update(metric_kwargs)
+    quality_scores = QualityMetrics.evaluate(scan_stack, **metric_eval_kwargs).detach().cpu().numpy()
     c10_axis_np = c10_axis.detach().cpu().numpy()
 
     method = method.lower()
@@ -228,6 +235,7 @@ def refine_aberrations(
     lr_scales=None,
     iters: int = 50,
     metric: str = 'normalized_std',
+    metric_kwargs: dict | None = None,
     plot_recon_every_n_iter=None,
     save_dir=None,
     mode: str = 'tcBF',
@@ -246,12 +254,14 @@ def refine_aberrations(
         lr_scales:               Per-order LR multipliers, length max_order.
         iters:                   Number of gradient steps.
         metric:                  Focus metric to maximize.
+        metric_kwargs:           Extra keyword arguments for QualityMetrics.evaluate.
         plot_recon_every_n_iter: Show reconstruction every N iterations if set.
         save_dir:                Directory to save per-iteration figures if set.
         mode:                    Reconstruction mode.
         scan_roi:                Optional (y0, y1, x0, x1) scan crop for AD refinement.
     """
     mode = mode.lower()
+    metric_kwargs = dict(metric_kwargs or {})
 
     if scan_roi is not None:
         roi_solver = _build_roi_solver(solver, scan_roi)
@@ -261,6 +271,7 @@ def refine_aberrations(
             lr_scales=lr_scales,
             iters=iters,
             metric=metric,
+            metric_kwargs=metric_kwargs,
             plot_recon_every_n_iter=plot_recon_every_n_iter,
             save_dir=save_dir,
             mode=mode,
@@ -302,7 +313,7 @@ def refine_aberrations(
         optimizer.zero_grad()
         summed_img = solver.reconstruct(mode=mode, requires_grad=True, **kwargs)
         solver.reconstructed_image = summed_img.detach()
-        loss = -1 * QualityMetrics.evaluate(summed_img, metric=metric)
+        loss = -1 * QualityMetrics.evaluate(summed_img, metric=metric, **metric_kwargs)
         loss.backward()
         optimizer.step()
 
@@ -330,6 +341,7 @@ def refine_scan_rotation(
     search_range: tuple | None = None,
     num_points: int = 9,
     metric: str = 'laplacian',
+    metric_kwargs: dict | None = None,
     plot_search: bool = True,
     mode: str = 'tcBF',
     search_halfwidth: float | None = None,
@@ -348,6 +360,8 @@ def refine_scan_rotation(
                       Defaults to (-45°, +45°).
         num_points:   Number of angles to sample.
         metric:       Focus metric for QualityMetrics.evaluate.
+        metric_kwargs:
+                      Extra keyword arguments for QualityMetrics.evaluate.
         plot_search:  Show matplotlib line-search summary.
         mode:         Reconstruction mode.
         search_halfwidth:
@@ -355,6 +369,7 @@ def refine_scan_rotation(
                       exclusive with search_range.
     """
     mode = mode.lower()
+    metric_kwargs = dict(metric_kwargs or {})
     if search_range is not None and search_halfwidth is not None:
         raise ValueError("Provide either search_range or search_halfwidth, not both.")
 
@@ -383,7 +398,7 @@ def refine_scan_rotation(
                 # needed at a time.
                 solver.set_rotation_deg(float(angle), clear_basis=True)
                 img = solver.reconstruct(mode=mode, **kwargs)
-                score = QualityMetrics.evaluate(img, metric=metric).item()
+                score = QualityMetrics.evaluate(img, metric=metric, **metric_kwargs).item()
                 scores.append(score)
                 if score > best_score:
                     best_score = score
@@ -413,6 +428,7 @@ def refine_scan_rotation(
 def refine_flips(
     solver,
     metric: str = 'laplacian',
+    metric_kwargs: dict | None = None,
     plot_search: bool = True,
     mode: str = 'tcBF',
     **kwargs,
@@ -427,6 +443,7 @@ def refine_flips(
     Args:
         solver: Solver-like object.
         metric: Focus metric for QualityMetrics.evaluate.
+        metric_kwargs: Extra keyword arguments for QualityMetrics.evaluate.
         plot_search: Show 2×4 reconstruction panel summary.
         mode:   Reconstruction mode.
 
@@ -435,6 +452,7 @@ def refine_flips(
         with 'best' key indicating the winning combination.
     """
     mode = mode.lower()
+    metric_kwargs = dict(metric_kwargs or {})
     combos = [
         (flipud, fliplr, transpose)
         for flipud    in (False, True)
@@ -457,7 +475,7 @@ def refine_flips(
             for (flipud, fliplr, transpose) in combos:
                 solver.set_flips(flipud, fliplr, transpose)
                 img = solver.reconstruct(mode=mode, **kwargs)
-                score = QualityMetrics.evaluate(img, metric=metric).item()
+                score = QualityMetrics.evaluate(img, metric=metric, **metric_kwargs).item()
                 results[(flipud, fliplr, transpose)] = score
                 if score > best_score:
                     best_score = score
@@ -544,6 +562,7 @@ def _orientation_grid_search(
     rotation_num_points: int,
     defocus_num_points: int,
     metric: str,
+    metric_kwargs: dict | None,
     mode: str,
     **kwargs,
 ) -> None:
@@ -556,6 +575,7 @@ def _orientation_grid_search(
     calls set_rotation_deg(..., clear_basis=True) so only one basis cache entry exists at
     a time. Defocus sweeps reuse the same cache entry since C_1_0 is not part of the key.
     """
+    metric_kwargs = dict(metric_kwargs or {})
     angles = np.linspace(0.0, 360.0, rotation_num_points, endpoint=False)
     c10_values = np.linspace(defocus_range[0], defocus_range[1], defocus_num_points)
     total = 2 * rotation_num_points * defocus_num_points
@@ -590,7 +610,7 @@ def _orientation_grid_search(
                     for c10 in c10_values:
                         solver.ab_state.set_physical('C_1_0', float(c10))
                         img = solver.reconstruct(mode=mode, **kwargs)
-                        score = QualityMetrics.evaluate(img, metric=metric).item()
+                        score = QualityMetrics.evaluate(img, metric=metric, **metric_kwargs).item()
                         if score > best_score:
                             best_score = score
                             best_if_transposed = if_transposed
@@ -621,6 +641,7 @@ def refine_all_params(
     solver,
     targets=('orientation_defocus', 'coarse_aberrations', 'fine_rotation', 'fine_aberrations'),
     metric: str = 'normalized_std',
+    metric_kwargs: dict | None = None,
     mode: str = 'tcBF',
     defocus_range=None,
     defocus_range_tolerance_factor: float = 24.0,
@@ -647,6 +668,7 @@ def refine_all_params(
         solver:                         Solver-like object.
         targets:                        Ordered sequence of step names to run.
         metric:                         Focus metric shared across all steps.
+        metric_kwargs:                  Extra keyword arguments for QualityMetrics.evaluate.
         mode:                           Reconstruction mode ('tcBF' or 'acBF').
         defocus_range:                  (min_c10, max_c10) in Å for Step 1. If None,
                                         auto-computed as current_C10 ± defocus_range_tolerance_factor × T₁.
@@ -662,6 +684,7 @@ def refine_all_params(
     """
     mode = mode.lower()
     targets = tuple(targets)
+    metric_kwargs = dict(metric_kwargs or {})
 
     if 'orientation_defocus' in targets and defocus_range is None:
         c10 = solver.ab_state.get_physical('C_1_0')
@@ -678,6 +701,7 @@ def refine_all_params(
             rotation_num_points=rotation_num_points,
             defocus_num_points=defocus_num_points,
             metric=metric,
+            metric_kwargs=metric_kwargs,
             mode=mode,
             **kwargs,
         )
@@ -691,6 +715,7 @@ def refine_all_params(
             lr_scales=coarse_lr_scales,
             iters=aberration_iters,
             metric=metric,
+            metric_kwargs=metric_kwargs,
             mode=mode,
             scan_roi=refinement_scan_roi,
             **kwargs,
@@ -702,6 +727,7 @@ def refine_all_params(
             search_halfwidth=fine_rotation_halfwidth,
             num_points=fine_rotation_num_points,
             metric=metric,
+            metric_kwargs=metric_kwargs,
             plot_search=False,
             mode=mode,
             **kwargs,
@@ -713,6 +739,7 @@ def refine_all_params(
             lr=aberration_lr,
             iters=aberration_iters,
             metric=metric,
+            metric_kwargs=metric_kwargs,
             mode=mode,
             scan_roi=refinement_scan_roi,
             **kwargs,

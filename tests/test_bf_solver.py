@@ -485,6 +485,32 @@ class TestAutogradBoundary:
         assert captured["metric"] == "laplacian"
         assert captured["mode"] == "tcbf"
 
+    def test_refine_scan_rotation_forwards_metric_kwargs(self, synth_dataset, synth_params, device, monkeypatch):
+        from fast_acbf.optimization import refinement
+
+        solver = self._make_solver(synth_dataset, synth_params, device)
+        captured = []
+
+        def fake_evaluate(img, **kwargs):
+            captured.append(kwargs)
+            return img.mean()
+
+        monkeypatch.setattr(refinement.QualityMetrics, "evaluate", fake_evaluate)
+
+        solver.refine_scan_rotation(
+            search_range=(-1.0, 1.0),
+            num_points=3,
+            metric="sobel",
+            metric_kwargs={"center_crop": False, "crop_fraction": 0.75},
+            plot_search=False,
+            chunk_size=8,
+        )
+
+        assert captured
+        assert all(kwargs["metric"] == "sobel" for kwargs in captured)
+        assert all(kwargs["center_crop"] is False for kwargs in captured)
+        assert all(kwargs["crop_fraction"] == pytest.approx(0.75) for kwargs in captured)
+
     def test_refine_flips_plot_receives_eight_panels(self, synth_dataset, synth_params, device, monkeypatch):
         from fast_acbf.vis import plotting
 
@@ -552,6 +578,33 @@ class TestAutogradBoundary:
             atol=1e-6,
             rtol=1e-6,
         )
+
+    def test_refine_all_params_forwards_metric_kwargs(self, synth_dataset, synth_params, device, monkeypatch):
+        from fast_acbf.optimization import refinement
+
+        solver = self._make_solver(synth_dataset, synth_params, device)
+        captured = []
+
+        def fake_evaluate(img, **kwargs):
+            captured.append(kwargs)
+            return img.mean()
+
+        monkeypatch.setattr(refinement.QualityMetrics, "evaluate", fake_evaluate)
+
+        solver.refine_all_params(
+            targets=('orientation_defocus',),
+            defocus_range=(40.0, 60.0),
+            rotation_num_points=2,
+            defocus_num_points=2,
+            metric='laplacian',
+            metric_kwargs={"center_crop": False},
+            mode='tcBF',
+            chunk_size=8,
+        )
+
+        assert captured
+        assert all(kwargs["metric"] == "laplacian" for kwargs in captured)
+        assert all(kwargs["center_crop"] is False for kwargs in captured)
 
     def test_refine_defocus_accepts_upscaled_preparation(self, synth_dataset, synth_params, device):
         solver = self._make_solver(synth_dataset, synth_params, device)
