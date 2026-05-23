@@ -482,7 +482,7 @@ class TestAutogradBoundary:
         assert captured["angles_deg"].shape == (3,)
         assert captured["quality_scores"].shape == (3,)
         assert captured["optimal_rotation"] in captured["angles_deg"]
-        assert captured["metric"] == "laplacian"
+        assert captured["metric"] == "sobel"
         assert captured["mode"] == "tcbf"
 
     def test_refine_scan_rotation_forwards_metric_kwargs(self, synth_dataset, synth_params, device, monkeypatch):

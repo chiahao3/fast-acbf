@@ -785,7 +785,7 @@ class BFSolver:
     def refine_all_params(
         self,
         targets=('orientation_defocus', 'coarse_aberrations', 'fine_rotation', 'fine_aberrations'),
-        metric: str = 'normalized_std',
+        metric: str = 'sobel',
         metric_kwargs: dict | None = None,
         mode: str = 'tcBF',
         defocus_range=None,

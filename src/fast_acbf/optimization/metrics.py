@@ -28,7 +28,7 @@ class QualityMetrics:
     def evaluate(
         cls,
         img: torch.Tensor,
-        metric='laplacian',
+        metric='sobel',
         blur=False,
         blur_kernel_size=5,
         blur_sigma=1,
