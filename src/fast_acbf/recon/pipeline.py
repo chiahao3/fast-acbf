@@ -8,7 +8,7 @@ from typing import TYPE_CHECKING
 import torch
 
 from fast_acbf.data.bf_extractor import BFExtractor
-from fast_acbf.data.bf_preparer import BFPreparer, _prepared_shapes
+from fast_acbf.data.bf_preparer import BFPreparer, _check_zero_insert_compat, _prepared_shapes
 from fast_acbf.data.imagefft import ImageFFT
 
 if TYPE_CHECKING:
@@ -94,6 +94,7 @@ class PipelineManager:
     ) -> None:
         if pad_width is not None and int(pad_width) < 0:
             raise ValueError(f"pad_width must be non-negative, got {pad_width}.")
+        _check_zero_insert_compat(str(upscale_method).strip().lower(), float(upscale))
         self.upscale = float(upscale)
         self.upscale_method = str(upscale_method).strip().lower()
         self.pad_width = int(pad_width) if (pad_width is not None and int(pad_width) > 0) else None
