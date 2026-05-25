@@ -178,6 +178,70 @@ class TestGetProbe:
         assert solver_zero_ab.upscale == pytest.approx(1.0)
         assert solver_zero_ab.scan_shape == solver_zero_ab.raw_scan_shape
 
+    def test_zero_insert_constructor_stores_method(self, synth_dataset, synth_params, device):
+        p = synth_params
+        with pytest.warns(UserWarning, match="zero_insert"):
+            solver = BFSolver(
+                dataset=synth_dataset,
+                max_alpha=p["max_alpha"],
+                scan_step_size=p["scan_step_size"],
+                dk=p["dk"],
+                wavelength=p["wavelength"],
+                max_order=2,
+                aberrations={"C10": 0.0},
+                device=device,
+                upscale=2,
+                upscale_method="zero_insert",
+            )
+        assert solver.upscale == pytest.approx(2.0)
+        assert solver.upscale_method == "zero_insert"
+        assert solver.scan_shape == (round(p["Ny"] * 2), round(p["Nx"] * 2))
+
+    def test_zero_insert_fractional_upscale_raises_without_partial_state(
+        self, synth_dataset, synth_params, device
+    ):
+        p = synth_params
+        with pytest.raises(ValueError, match="zero_insert"):
+            BFSolver(
+                dataset=synth_dataset,
+                max_alpha=p["max_alpha"],
+                scan_step_size=p["scan_step_size"],
+                dk=p["dk"],
+                wavelength=p["wavelength"],
+                max_order=2,
+                aberrations={"C10": 0.0},
+                device=device,
+                upscale=1.5,
+                upscale_method="zero_insert",
+            )
+
+    def test_zero_insert_get_tcBF_shape(self, synth_dataset, synth_params, device):
+        p = synth_params
+        with pytest.warns(UserWarning, match="zero_insert"):
+            solver = BFSolver(
+                dataset=synth_dataset,
+                max_alpha=p["max_alpha"],
+                scan_step_size=p["scan_step_size"],
+                dk=p["dk"],
+                wavelength=p["wavelength"],
+                max_order=2,
+                aberrations={"C10": 0.0},
+                device=device,
+                upscale=2,
+                upscale_method="zero_insert",
+            )
+        img = solver.get_tcBF()
+        assert img.shape == (round(p["Ny"] * 2), round(p["Nx"] * 2))
+        assert img.dtype == torch.float32
+
+    def test_zero_insert_prepare_vbf_in_one_step(self, solver_zero_ab, synth_params):
+        """prepare_vbf with upscale+method together avoids _make_prep_key collapsing to 'none'."""
+        p = synth_params
+        with pytest.warns(UserWarning, match="zero_insert"):
+            solver_zero_ab.prepare_vbf(upscale=2, upscale_method="zero_insert")
+        assert solver_zero_ab.upscale_method == "zero_insert"
+        assert solver_zero_ab.scan_shape == (round(p["Ny"] * 2), round(p["Nx"] * 2))
+
 
 # ── get_yx_shifts_px / get_yx_shifts_ang ─────────────────────────────────────
 
