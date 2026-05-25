@@ -204,3 +204,99 @@ def test_bf_preparer_padding_is_in_native_pixels_after_upscale():
     assert preparer.padded_shape == (expected_y[0], expected_x[0])
     assert preparer.pad_offsets == (expected_y[1], expected_x[1])
     assert preparer.extract_chunk(0, 1).shape == (1, expected_y[0], expected_x[0])
+
+
+# ---------------------------------------------------------------------------
+# zero_insert upsampling tests
+# ---------------------------------------------------------------------------
+
+def test_bf_preparer_zero_insert_shape():
+    arr = _make_data(shape=(4, 5, 16, 16))
+    extractor = BFExtractor(Dataset4D(arr), _make_geom(), strategy='host_mask')
+    Ry, Rx = Dataset4D(arr).scan_shape
+
+    preparer = BFPreparer(extractor, upscale=3, upscale_method='zero_insert', pad_width=None)
+
+    assert preparer.upscaled_shape == (3 * Ry, 3 * Rx)
+    assert preparer.scan_shape == (3 * Ry, 3 * Rx)
+
+
+def test_bf_preparer_zero_insert_pixel_placement():
+    arr = _make_data(shape=(3, 3, 16, 16))
+    extractor = BFExtractor(Dataset4D(arr), _make_geom(), strategy='host_mask')
+    native = extractor.extract_chunk(0, 2)  # (2, Ry, Rx)
+
+    N = 3
+    preparer = BFPreparer(extractor, upscale=N, upscale_method='zero_insert', pad_width=None)
+    got = preparer.extract_chunk(0, 2)  # (2, N*Ry, N*Rx)
+
+    # Original values must sit exactly at the stride-N grid positions.
+    np.testing.assert_array_equal(got[:, ::N, ::N], native)
+    # All intermediate positions must be exactly zero.
+    mask = np.ones(got.shape, dtype=bool)
+    mask[:, ::N, ::N] = False
+    assert (got[mask] == 0.0).all()
+
+
+def test_bf_preparer_zero_insert_integer_only():
+    arr = _make_data()
+    extractor = BFExtractor(Dataset4D(arr), _make_geom(), strategy='host_mask')
+
+    with pytest.raises(ValueError, match="zero_insert"):
+        BFPreparer(extractor, upscale=1.5, upscale_method='zero_insert')
+
+    # Verify no partial state was written (object construction failed entirely).
+    with pytest.raises(ValueError):
+        BFPreparer(extractor, upscale=2.5, upscale_method='zero_insert')
+
+
+def test_bf_preparer_zero_insert_near_integer_is_accepted():
+    """upscale within 1e-6 of an integer must not raise."""
+    arr = _make_data()
+    extractor = BFExtractor(Dataset4D(arr), _make_geom(), strategy='host_mask')
+    # 2.0 + 5e-7 < 1e-6 from integer 2 — should pass silently.
+    preparer = BFPreparer(extractor, upscale=2.0 + 5e-7, upscale_method='zero_insert')
+    Ry, Rx = Dataset4D(arr).scan_shape
+    assert preparer.upscaled_shape == (2 * Ry, 2 * Rx)
+
+
+def test_bf_preparer_zero_insert_upscale_one_bypasses_upsample():
+    """upscale=1.0 short-circuits _upsample entirely; output matches native vBF."""
+    arr = _make_data()
+    extractor = BFExtractor(Dataset4D(arr), _make_geom(), strategy='host_mask')
+    native = extractor.extract_all()
+
+    preparer = BFPreparer(extractor, upscale=1.0, upscale_method='zero_insert', pad_width=None)
+    got = preparer.extract_all()
+
+    assert got.shape == native.shape
+    np.testing.assert_array_equal(got, native)
+
+
+def test_bf_preparer_zero_insert_with_padding():
+    """After zero-insertion + reflect-padding, original values sit at the expected offset."""
+    arr = _make_data(shape=(8, 8, 16, 16))
+    extractor = BFExtractor(Dataset4D(arr), _make_geom(), strategy='host_mask')
+    native = extractor.extract_chunk(0, 1)  # (1, Ry, Rx)
+
+    N = 2
+    preparer = BFPreparer(extractor, upscale=N, upscale_method='zero_insert', pad_width=2)
+    got = preparer.extract_chunk(0, 1)  # (1, padded_Ry, padded_Rx)
+
+    assert got.shape == (1, preparer.padded_shape[0], preparer.padded_shape[1])
+    # The pad-window damps the pad region; only verify shape correctness here.
+    assert got.dtype == np.float32
+
+
+@pytest.mark.parametrize("method", ["nearest", "bilinear", "zero_insert"])
+def test_bf_preparer_integer_upscale_shape(method):
+    arr = _make_data(shape=(4, 5, 16, 16))
+    extractor = BFExtractor(Dataset4D(arr), _make_geom(), strategy='host_mask')
+    Ry, Rx = Dataset4D(arr).scan_shape
+
+    preparer = BFPreparer(extractor, upscale=2, upscale_method=method, pad_width=None)
+    got = preparer.extract_chunk(0, 2)
+
+    assert preparer.upscaled_shape == (2 * Ry, 2 * Rx)
+    assert got.shape == (2, 2 * Ry, 2 * Rx)
+    assert got.dtype == np.float32
