@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import warnings
 from typing import TYPE_CHECKING
 
 import numpy as np
@@ -12,7 +13,7 @@ if TYPE_CHECKING:
     from fast_acbf.data.bf_extractor import BFExtractor
 
 
-_VALID_UPSCALE_METHODS = ("nearest", "bilinear")
+_VALID_UPSCALE_METHODS = ("nearest", "bilinear", "zero_insert")
 
 
 def _ceil_5smooth(n: int) -> int:
@@ -62,6 +63,15 @@ def _make_tukey_2d(
     wy = _make_tukey_1d(Ry, pad_top, pad_bottom)
     wx = _make_tukey_1d(Rx, pad_left, pad_right)
     return np.outer(wy, wx).astype(np.float32)
+
+
+def _check_zero_insert_compat(method: str, upscale: float) -> None:
+    """Raise before any state mutation if zero_insert is paired with a non-integer upscale."""
+    if method == "zero_insert" and abs(upscale - round(upscale)) > 1e-6:
+        raise ValueError(
+            f"upscale_method='zero_insert' requires an integer upscale factor, "
+            f"got upscale={upscale!r}. Use 'nearest' or 'bilinear' for fractional upscale."
+        )
 
 
 def _normalize_upscale_method(method: str) -> str:
@@ -133,9 +143,18 @@ class BFPreparer:
         upscale_method: str = "bilinear",
         pad_width: int | None = None,
     ) -> None:
+        _check_zero_insert_compat(str(upscale_method).strip().lower(), float(upscale))
         self._extractor = extractor
         self.upscale = float(upscale)
         self.upscale_method = _normalize_upscale_method(upscale_method)
+        if self.upscale_method == "zero_insert" and self.upscale != 1.0:
+            warnings.warn(
+                "upscale_method='zero_insert' is experimental: reconstruction intensity is not "
+                "normalized for non-uniform coverage from sub-pixel shifts. Divide by a "
+                "reweighting map before interpreting intensities.",
+                UserWarning,
+                stacklevel=2,
+            )
         self.pad_width = None if pad_width is None or int(pad_width) == 0 else int(pad_width)
 
         self.raw_shape = tuple(extractor.scan_shape)
@@ -203,8 +222,15 @@ class BFPreparer:
             src = torch.from_numpy(np.asarray(vbf, dtype=np.float32))
             device = torch.device("cpu")
 
-        inp = src.to(device).unsqueeze(1)
-        if self.upscale_method == "nearest":
+        inp = src.to(device).unsqueeze(1)  # (Nb, 1, Ry, Rx)
+        if self.upscale_method == "zero_insert":
+            # Insert zeros between native pixels — no convolution kernel applied.
+            # Values sit at [0, N, 2N, …, (Ry-1)*N]; trailing N-1 rows/cols are zero.
+            N = round(self.upscale)
+            Ry_up, Rx_up = self.upscaled_shape
+            out = torch.zeros(inp.shape[0], 1, Ry_up, Rx_up, dtype=inp.dtype, device=inp.device)
+            out[:, :, ::N, ::N] = inp
+        elif self.upscale_method == "nearest":
             out = F.interpolate(inp, size=self.upscaled_shape, mode="nearest")
         else:
             out = F.interpolate(
@@ -239,6 +265,7 @@ class BFPreparer:
 
 __all__ = [
     "BFPreparer",
+    "_check_zero_insert_compat",
     "_compute_pad_for_axis",
     "_prepared_shapes",
 ]
