@@ -242,6 +242,62 @@ class TestGetProbe:
         assert solver_zero_ab.upscale_method == "zero_insert"
         assert solver_zero_ab.scan_shape == (round(p["Ny"] * 2), round(p["Nx"] * 2))
 
+    def test_zero_insert_reweight_tcBF_is_finite(self, synth_dataset, synth_params, device):
+        p = synth_params
+        with pytest.warns(UserWarning, match="zero_insert"):
+            solver = BFSolver(
+                dataset=synth_dataset,
+                max_alpha=p["max_alpha"],
+                scan_step_size=p["scan_step_size"],
+                dk=p["dk"],
+                wavelength=p["wavelength"],
+                max_order=2,
+                aberrations={"C10": 0.0},
+                device=device,
+                upscale=2,
+                upscale_method="zero_insert",
+            )
+        img = solver.get_tcBF()
+        assert torch.all(torch.isfinite(img)), "zero_insert reweighted tcBF contains non-finite values"
+
+    def test_zero_insert_reweight_acBF_is_finite(self, synth_dataset, synth_params, device):
+        p = synth_params
+        with pytest.warns(UserWarning, match="zero_insert"):
+            solver = BFSolver(
+                dataset=synth_dataset,
+                max_alpha=p["max_alpha"],
+                scan_step_size=p["scan_step_size"],
+                dk=p["dk"],
+                wavelength=p["wavelength"],
+                max_order=2,
+                aberrations={"C10": 0.0},
+                device=device,
+                upscale=2,
+                upscale_method="zero_insert",
+            )
+        img = solver.get_acBF()
+        assert torch.all(torch.isfinite(img)), "zero_insert reweighted acBF contains non-finite values"
+
+    def test_zero_insert_reweight_does_not_fire_for_interpolation_methods(
+        self, synth_dataset, synth_params, device
+    ):
+        """Reweighting must not alter nearest/bilinear results."""
+        p = synth_params
+        solver_nearest = BFSolver(
+            dataset=synth_dataset,
+            max_alpha=p["max_alpha"],
+            scan_step_size=p["scan_step_size"],
+            dk=p["dk"],
+            wavelength=p["wavelength"],
+            max_order=2,
+            aberrations={"C10": 0.0},
+            device=device,
+            upscale=2,
+            upscale_method="nearest",
+        )
+        img = solver_nearest.get_tcBF()
+        assert torch.all(torch.isfinite(img))
+
 
 # ── get_yx_shifts_px / get_yx_shifts_ang ─────────────────────────────────────
 
