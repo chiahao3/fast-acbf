@@ -244,6 +244,18 @@ class BFPreparer:
             return out
         return out.cpu().numpy().astype(np.float32, copy=False)
 
+    def make_ones_fft(self, device: str) -> torch.Tensor:
+        """Return fft2 of a prepared ones vBF used to build the zero_insert reweighting map.
+
+        Runs a single all-ones image through the same _prepare pipeline (zero-insertion,
+        reflect-padding, Tukey windowing) so the resulting FFT accounts for all spatial
+        modulations. Returns shape (1, padded_Ry, padded_Rx) complex64 on `device`.
+        """
+        ones = np.ones((1, *self.raw_shape), dtype=np.float32)
+        prepared = self._prepare(ones)  # (1, padded_Ry, padded_Rx)
+        t = torch.from_numpy(np.asarray(prepared, dtype=np.float32)).to(device)
+        return torch.fft.fft2(t)
+
     def _pad_and_window(self, vbf):
         """vBF shape: (B, Ry, Rx). Returns same array/tensor type."""
         if isinstance(vbf, torch.Tensor):

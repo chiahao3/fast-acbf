@@ -34,6 +34,20 @@ _VALID_BASIS_MODES = ('on_the_fly', 'precompute')
 _VALID_FOV = ('original', 'full')
 
 
+class _ConstFFTProvider:
+    """Serves a single precomputed FFT for every detector pixel.
+
+    Used to build the zero_insert reweighting map: run the same reconstruction
+    operator over a constant (ones-derived) input to measure per-pixel coverage.
+    """
+
+    def __init__(self, fft_single: torch.Tensor) -> None:
+        self._fft = fft_single  # (1, Ry, Rx) complex64
+
+    def get_chunk(self, b_start: int, b_end: int) -> torch.Tensor:
+        return self._fft.expand(b_end - b_start, -1, -1)
+
+
 def _crop_to_original(
     image: torch.Tensor,
     pad_offsets: tuple[int, int],
@@ -256,6 +270,27 @@ class BFReconstructor:
 
         else:
             raise ValueError(f"Unsupported mode {mode!r}. Choose 'tcBF' or 'acBF'.")
+
+        # zero_insert reweighting — normalize for non-uniform sub-pixel coverage
+        extractor = self.imagefft.extractor
+        if (
+            hasattr(extractor, 'upscale_method')
+            and extractor.upscale_method == 'zero_insert'
+            and extractor.upscale != 1.0
+            and not (mode_key == 'acbf' and acbf_algorithm == 'complex_inversion')
+        ):
+            ones_provider = _ConstFFTProvider(extractor.make_ones_fft(self.device))
+            if mode_key == 'tcbf':
+                weight_map = reconstruct_tcbf(
+                    ones_provider, qx_grid, qy_grid, cache, coeffs, self.device,
+                )
+            else:  # acbf phase_only
+                weight_map = reconstruct_acbf(
+                    ones_provider, qx_grid, qy_grid, geometry, optics,
+                    coeffs, self.eps, self.device,
+                )
+            peak = weight_map.abs().max().clamp(min=1e-9)
+            result = result / weight_map.clamp(min=1e-3 * peak)
 
         # fov crop — only when padding was used
         if self._pad_offsets is not None and fov == 'original':
