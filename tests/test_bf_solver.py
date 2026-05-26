@@ -180,19 +180,18 @@ class TestGetProbe:
 
     def test_zero_insert_constructor_stores_method(self, synth_dataset, synth_params, device):
         p = synth_params
-        with pytest.warns(UserWarning, match="zero_insert"):
-            solver = BFSolver(
-                dataset=synth_dataset,
-                max_alpha=p["max_alpha"],
-                scan_step_size=p["scan_step_size"],
-                dk=p["dk"],
-                wavelength=p["wavelength"],
-                max_order=2,
-                aberrations={"C10": 0.0},
-                device=device,
-                upscale=2,
-                upscale_method="zero_insert",
-            )
+        solver = BFSolver(
+            dataset=synth_dataset,
+            max_alpha=p["max_alpha"],
+            scan_step_size=p["scan_step_size"],
+            dk=p["dk"],
+            wavelength=p["wavelength"],
+            max_order=2,
+            aberrations={"C10": 0.0},
+            device=device,
+            upscale=2,
+            upscale_method="zero_insert",
+        )
         assert solver.upscale == pytest.approx(2.0)
         assert solver.upscale_method == "zero_insert"
         assert solver.scan_shape == (round(p["Ny"] * 2), round(p["Nx"] * 2))
@@ -217,19 +216,18 @@ class TestGetProbe:
 
     def test_zero_insert_get_tcBF_shape(self, synth_dataset, synth_params, device):
         p = synth_params
-        with pytest.warns(UserWarning, match="zero_insert"):
-            solver = BFSolver(
-                dataset=synth_dataset,
-                max_alpha=p["max_alpha"],
-                scan_step_size=p["scan_step_size"],
-                dk=p["dk"],
-                wavelength=p["wavelength"],
-                max_order=2,
-                aberrations={"C10": 0.0},
-                device=device,
-                upscale=2,
-                upscale_method="zero_insert",
-            )
+        solver = BFSolver(
+            dataset=synth_dataset,
+            max_alpha=p["max_alpha"],
+            scan_step_size=p["scan_step_size"],
+            dk=p["dk"],
+            wavelength=p["wavelength"],
+            max_order=2,
+            aberrations={"C10": 0.0},
+            device=device,
+            upscale=2,
+            upscale_method="zero_insert",
+        )
         img = solver.get_tcBF()
         assert img.shape == (round(p["Ny"] * 2), round(p["Nx"] * 2))
         assert img.dtype == torch.float32
@@ -237,46 +235,44 @@ class TestGetProbe:
     def test_zero_insert_prepare_vbf_in_one_step(self, solver_zero_ab, synth_params):
         """prepare_vbf with upscale+method together avoids _make_prep_key collapsing to 'none'."""
         p = synth_params
-        with pytest.warns(UserWarning, match="zero_insert"):
-            solver_zero_ab.prepare_vbf(upscale=2, upscale_method="zero_insert")
+        solver_zero_ab.prepare_vbf(upscale=2, upscale_method="zero_insert")
         assert solver_zero_ab.upscale_method == "zero_insert"
         assert solver_zero_ab.scan_shape == (round(p["Ny"] * 2), round(p["Nx"] * 2))
 
     def test_zero_insert_reweight_tcBF_is_finite(self, synth_dataset, synth_params, device):
         p = synth_params
-        with pytest.warns(UserWarning, match="zero_insert"):
-            solver = BFSolver(
-                dataset=synth_dataset,
-                max_alpha=p["max_alpha"],
-                scan_step_size=p["scan_step_size"],
-                dk=p["dk"],
-                wavelength=p["wavelength"],
-                max_order=2,
-                aberrations={"C10": 0.0},
-                device=device,
-                upscale=2,
-                upscale_method="zero_insert",
-            )
+        solver = BFSolver(
+            dataset=synth_dataset,
+            max_alpha=p["max_alpha"],
+            scan_step_size=p["scan_step_size"],
+            dk=p["dk"],
+            wavelength=p["wavelength"],
+            max_order=2,
+            aberrations={"C10": 0.0},
+            device=device,
+            upscale=2,
+            upscale_method="zero_insert",
+        )
         img = solver.get_tcBF()
         assert torch.all(torch.isfinite(img)), "zero_insert reweighted tcBF contains non-finite values"
 
-    def test_zero_insert_reweight_acBF_is_finite(self, synth_dataset, synth_params, device):
+    def test_zero_insert_acBF_raises_with_informative_message(self, synth_dataset, synth_params, device):
+        """zero_insert + acBF must raise a clear ValueError suggesting alternative methods."""
         p = synth_params
-        with pytest.warns(UserWarning, match="zero_insert"):
-            solver = BFSolver(
-                dataset=synth_dataset,
-                max_alpha=p["max_alpha"],
-                scan_step_size=p["scan_step_size"],
-                dk=p["dk"],
-                wavelength=p["wavelength"],
-                max_order=2,
-                aberrations={"C10": 0.0},
-                device=device,
-                upscale=2,
-                upscale_method="zero_insert",
-            )
-        img = solver.get_acBF()
-        assert torch.all(torch.isfinite(img)), "zero_insert reweighted acBF contains non-finite values"
+        solver = BFSolver(
+            dataset=synth_dataset,
+            max_alpha=p["max_alpha"],
+            scan_step_size=p["scan_step_size"],
+            dk=p["dk"],
+            wavelength=p["wavelength"],
+            max_order=2,
+            aberrations={"C10": 0.0},
+            device=device,
+            upscale=2,
+            upscale_method="zero_insert",
+        )
+        with pytest.raises(ValueError, match="zero_insert.*acBF|acBF.*zero_insert"):
+            solver.get_acBF(upscale_method="zero_insert")
 
     def test_zero_insert_reweight_does_not_fire_for_interpolation_methods(
         self, synth_dataset, synth_params, device
@@ -998,9 +994,9 @@ class TestFrameCacheBehavior:
             imagefft_fill='lazy',
         )
 
-        solver.get_tcBF(upscale=2.0, chunk_size=8)
+        solver.get_tcBF(upscale=2.0, upscale_method='nearest', chunk_size=8)
         imagefft = solver._recon.imagefft
-        solver.get_acBF(upscale=2.0, chunk_size=8)
+        solver.get_acBF(upscale=2.0, upscale_method='nearest', chunk_size=8)
 
         assert solver._recon.imagefft is imagefft
 
