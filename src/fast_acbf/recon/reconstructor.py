@@ -245,6 +245,17 @@ class BFReconstructor:
             )
 
         elif mode_key == 'acbf':
+            extractor = self.imagefft.extractor
+            if (
+                hasattr(extractor, 'upscale_method')
+                and extractor.upscale_method == 'zero_insert'
+                and extractor.upscale != 1.0
+            ):
+                raise ValueError(
+                    "upscale_method='zero_insert' is not supported for acBF reconstruction "
+                    "because the phase-alignment transfer function is not sparse-grid compatible. "
+                    "Use upscale_method='nearest' or 'bilinear' instead."
+                )
             rolloff = kwargs.get('rolloff', 0)
             chunk_size = kwargs.get('chunk_size', 64)
             acbf_algorithm = self._normalize_acbf_algorithm(kwargs.get('acbf_algorithm'))
@@ -271,26 +282,20 @@ class BFReconstructor:
         else:
             raise ValueError(f"Unsupported mode {mode!r}. Choose 'tcBF' or 'acBF'.")
 
-        # zero_insert reweighting — normalize for non-uniform sub-pixel coverage
-        extractor = self.imagefft.extractor
-        if (
-            hasattr(extractor, 'upscale_method')
-            and extractor.upscale_method == 'zero_insert'
-            and extractor.upscale != 1.0
-            and not (mode_key == 'acbf' and acbf_algorithm == 'complex_inversion')
-        ):
-            ones_provider = _ConstFFTProvider(extractor.make_ones_fft(self.device))
-            if mode_key == 'tcbf':
+        # zero_insert reweighting — normalize for non-uniform sub-pixel coverage (tcBF only)
+        if mode_key == 'tcbf':
+            extractor = self.imagefft.extractor
+            if (
+                hasattr(extractor, 'upscale_method')
+                and extractor.upscale_method == 'zero_insert'
+                and extractor.upscale != 1.0
+            ):
+                ones_provider = _ConstFFTProvider(extractor.make_ones_fft(self.device))
                 weight_map = reconstruct_tcbf(
                     ones_provider, qx_grid, qy_grid, cache, coeffs, self.device,
                 )
-            else:  # acbf phase_only
-                weight_map = reconstruct_acbf(
-                    ones_provider, qx_grid, qy_grid, geometry, optics,
-                    coeffs, self.eps, self.device,
-                )
-            peak = weight_map.abs().max().clamp(min=1e-9)
-            result = result / weight_map.clamp(min=1e-3 * peak)
+                peak = weight_map.abs().max().clamp(min=1e-9)
+                result = result / weight_map.clamp(min=1e-3 * peak)
 
         # fov crop — only when padding was used
         if self._pad_offsets is not None and fov == 'original':
