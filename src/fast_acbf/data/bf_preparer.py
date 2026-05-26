@@ -140,21 +140,13 @@ class BFPreparer:
         self,
         extractor: BFExtractor,
         upscale: float = 1.0,
-        upscale_method: str = "bilinear",
+        upscale_method: str = "zero_insert",
         pad_width: int | None = None,
     ) -> None:
         _check_zero_insert_compat(str(upscale_method).strip().lower(), float(upscale))
         self._extractor = extractor
         self.upscale = float(upscale)
         self.upscale_method = _normalize_upscale_method(upscale_method)
-        if self.upscale_method == "zero_insert" and self.upscale != 1.0:
-            warnings.warn(
-                "upscale_method='zero_insert' is experimental: reconstruction intensity is not "
-                "normalized for non-uniform coverage from sub-pixel shifts. Divide by a "
-                "reweighting map before interpreting intensities.",
-                UserWarning,
-                stacklevel=2,
-            )
         self.pad_width = None if pad_width is None or int(pad_width) == 0 else int(pad_width)
 
         self.raw_shape = tuple(extractor.scan_shape)

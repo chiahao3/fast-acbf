@@ -137,7 +137,7 @@ class BFSolver:
         pad_width: int | None = None,
         fov: str = 'original',
         upscale: float = 1.0,
-        upscale_method: str = 'bilinear',
+        upscale_method: str = 'zero_insert',
     ) -> None:
         if aberrations is None:
             aberrations = {}
@@ -680,7 +680,7 @@ class BFSolver:
         return img
 
     def get_tcBF(
-        self, frame: str = 'scan', upscale=None, upscale_method=None,
+        self, frame: str = 'scan', upscale=None, upscale_method: str = 'zero_insert',
         pad_width=_PREP_SENTINEL, fov=None, **kwargs,
     ) -> torch.Tensor:
         return self.get_reconstructed_image(
@@ -689,7 +689,7 @@ class BFSolver:
         )
 
     def get_acBF(
-        self, frame: str = 'scan', upscale=None, upscale_method=None,
+        self, frame: str = 'scan', upscale=None, upscale_method: str = 'nearest',
         pad_width=_PREP_SENTINEL, fov=None, **kwargs,
     ) -> torch.Tensor:
         return self.get_reconstructed_image(

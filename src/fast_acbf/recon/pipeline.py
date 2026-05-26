@@ -58,7 +58,7 @@ class PipelineManager:
         ram_margin: float = 0.80,
         pad_width: int | None = None,
         upscale: float = 1.0,
-        upscale_method: str = 'bilinear',
+        upscale_method: str = 'zero_insert',
     ) -> None:
         self.dataset = dataset
         self.detector_geom = detector_geom
