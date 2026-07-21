@@ -23,6 +23,7 @@ import os
 
 import numpy as np
 import torch
+from scipy.optimize import minimize_scalar
 
 from fast_acbf.optimization.metrics import QualityMetrics
 
@@ -103,6 +104,91 @@ def _sweep_c10(solver, c10_axis: torch.Tensor, mode: str, **kwargs):
     return c10_axis, stack
 
 
+def _refine_defocus_brent(
+    solver,
+    *,
+    search_range: tuple,
+    metric: str,
+    metric_kwargs: dict,
+    blur: bool,
+    blur_kernel_size: int,
+    blur_sigma: float,
+    plot_search: bool,
+    mode: str,
+    xatol: float,
+    **kwargs,
+) -> None:
+    """Bounded Brent search for C10, adaptively sampling instead of a fixed grid.
+
+    Only reliable when search_range is already narrow/unimodal (see
+    refine_defocus's docstring). Restores C10 to its pre-call value if the
+    search itself raises, then always commits the best point found.
+    """
+    print(f"Starting defocus line search (brent): bounded to "
+          f"[{search_range[0]:.1f}, {search_range[1]:.1f}] Ang")
+
+    metric_eval_kwargs = {
+        "metric": metric,
+        "blur": blur,
+        "blur_kernel_size": blur_kernel_size,
+        "blur_sigma": blur_sigma,
+    }
+    metric_eval_kwargs.update(metric_kwargs)
+
+    original_c10 = solver.ab_state.get_physical('C_1_0')
+    evaluated_c10: list[float] = []
+    evaluated_scores: list[float] = []
+    best_score = -np.inf
+    best_image = None
+
+    def _score_at(c10: float) -> float:
+        nonlocal best_score, best_image
+        with torch.no_grad():
+            solver.ab_state.set_physical('C_1_0', float(c10))
+            img = solver.reconstruct(mode=mode, **kwargs)
+            score = QualityMetrics.evaluate(img, **metric_eval_kwargs).item()
+        evaluated_c10.append(float(c10))
+        evaluated_scores.append(score)
+        if score > best_score:
+            best_score = score
+            best_image = img.detach().clone()
+        return score
+
+    try:
+        result = minimize_scalar(
+            lambda c10: -_score_at(c10),
+            bounds=search_range,
+            method='bounded',
+            options={'xatol': xatol},
+        )
+        optimal_c10 = float(result.x)
+        _score_at(optimal_c10)  # ensure solver state / cached image land exactly on it
+    finally:
+        solver.ab_state.set_physical('C_1_0', original_c10)
+
+    print(f"Optimal C10 found at {optimal_c10:.2f} Ang (brent, "
+          f"{len(evaluated_c10)} evaluations)")
+
+    with torch.no_grad():
+        solver.ab_state.set_physical('C_1_0', optimal_c10)
+    solver.reconstructed_image = best_image
+
+    if plot_search:
+        from fast_acbf.vis.plotting import plot_defocus_line_search
+        order = np.argsort(evaluated_c10)
+        plot_defocus_line_search(
+            c10_axis_np=np.asarray(evaluated_c10)[order],
+            quality_scores=np.asarray(evaluated_scores)[order],
+            optimal_c10=optimal_c10,
+            search_range=search_range,
+            metric=metric,
+            method='brent',
+            mode=mode,
+            fit_coeffs=None,
+            fit_type=None,
+        )
+
+
 # ---------------------------------------------------------------------------
 # Public refinement functions
 # ---------------------------------------------------------------------------
@@ -122,23 +208,36 @@ def refine_defocus(
     mode: str = 'tcBF',
     search_halfwidth: float | None = None,
     defocus_range_tolerance_factor: float = 24.0,
+    xatol: float = 0.5,
     **kwargs,
 ) -> None:
     """
-    Brute-force line search for defocus (C10) with optional parabolic refinement.
+    Line search for defocus (C10), brute-force (grid) or adaptive (Brent).
 
-    Sweeps C10 over search_range, scores each slice with QualityMetrics, then
-    fits a parabola (or picks max) to find the optimal C10. Updates solver.ab_state
-    in-place and caches the best reconstruction in solver.reconstructed_image.
+    'max'/'fit_parabola' sweep num_points evenly-spaced C10 values, score each
+    slice with QualityMetrics, then pick the max (or fit a parabola to the
+    sampled scores). 'brent' instead runs SciPy's bounded Brent search, which
+    adaptively concentrates evaluations near the optimum instead of spending a
+    fixed budget uniformly — typically far fewer reconstructions for equal or
+    better precision, but only reliable when search_range is already narrow
+    enough that the score-vs-defocus curve is close to unimodal (e.g. once
+    focus_sign has constrained the range to one side of through-focus). A wide
+    or sign-unconstrained range is more likely to have secondary local peaks
+    from residual aberrations, where 'max'/'fit_parabola' are safer since they
+    can't get stuck in the wrong one.
+
+    Updates solver.ab_state in-place and caches the best reconstruction in
+    solver.reconstructed_image.
 
     Args:
         solver:           Solver-like object (see module docstring).
         search_range:     Literal (min_c10, max_c10) bounds in Angstroms. If None,
                           uses search_halfwidth or defocus_range_tolerance_factor.
-        num_points:       Number of C10 values to sample.
+        num_points:       Number of C10 values to sample. Only used for
+                          method='max'/'fit_parabola'.
         metric:           Focus metric for QualityMetrics.evaluate.
         metric_kwargs:    Extra keyword arguments for QualityMetrics.evaluate.
-        method:           'fit_parabola' or 'max'. Default is 'max'.
+        method:           'max' (default), 'fit_parabola', or 'brent'.
         blur:             Pre-blur images before scoring.
         blur_kernel_size: Kernel size for Gaussian blur.
         blur_sigma:       Sigma for Gaussian blur.
@@ -150,9 +249,14 @@ def refine_defocus(
                           Multiplier on the 1st-order Kirkland tolerance T₁
                           for the auto defocus range when neither search_range
                           nor search_halfwidth is provided.
+        xatol:            Absolute C10 convergence tolerance in Angstroms, only
+                          used for method='brent'.
     """
     mode = mode.lower()
     metric_kwargs = dict(metric_kwargs or {})
+    method = method.lower()
+    if method not in ('max', 'fit_parabola', 'brent'):
+        raise ValueError(f"Unsupported method: {method!r}. Choose 'max', 'fit_parabola', or 'brent'.")
     if search_range is not None and search_halfwidth is not None:
         raise ValueError("Provide either search_range or search_halfwidth, not both.")
 
@@ -171,6 +275,23 @@ def refine_defocus(
 
     min_def, max_def = min(search_range), max(search_range)
     search_range = (min_def, max_def)
+
+    if method == 'brent':
+        _refine_defocus_brent(
+            solver,
+            search_range=search_range,
+            metric=metric,
+            metric_kwargs=metric_kwargs,
+            blur=blur,
+            blur_kernel_size=blur_kernel_size,
+            blur_sigma=blur_sigma,
+            plot_search=plot_search,
+            mode=mode,
+            xatol=xatol,
+            **kwargs,
+        )
+        return
+
     print(f"Starting defocus line search: {num_points} points between {search_range[0]} and {search_range[1]} Ang")
 
     device = next(iter(solver.ab_state.coeffs.values())).device
@@ -188,7 +309,6 @@ def refine_defocus(
     quality_scores = QualityMetrics.evaluate(scan_stack, **metric_eval_kwargs).detach().cpu().numpy()
     c10_axis_np = c10_axis.detach().cpu().numpy()
 
-    method = method.lower()
     if method == 'fit_parabola':
         fit_coeffs = np.polyfit(c10_axis_np, quality_scores, 2)
         a, b, _ = fit_coeffs
@@ -201,12 +321,10 @@ def refine_defocus(
             optimal_index = int(np.argmax(quality_scores))
             optimal_c10 = c10_axis_np[optimal_index]
             fit_type = "Discrete max (fit inverted)"
-    elif method == 'max':
+    else:  # method == 'max', the only other value reachable here
         optimal_index = int(np.argmax(quality_scores))
         optimal_c10 = c10_axis_np[optimal_index]
         fit_coeffs = None
-    else:
-        raise ValueError(f"Unsupported method: {method!r}. Choose 'fit_parabola' or 'max'.")
 
     print(f"Optimal C10 found at {optimal_c10:.2f} Ang ({method})")
 
@@ -345,20 +463,21 @@ def refine_scan_rotation(
     plot_search: bool = True,
     mode: str = 'tcBF',
     search_halfwidth: float | None = None,
+    method: str = 'grid',
+    xatol: float = 0.05,
     **kwargs,
 ) -> None:
     """
-    Line search for optimal scan rotation angle.
+    Search for the optimal scan rotation angle, brute-force (grid) or adaptive (Brent).
 
-    Sweeps rotation_deg over search_range, scores each reconstruction, and
-    sets the optimal rotation via solver.set_rotation_deg() (which triggers
-    cache invalidation automatically).
+    Scores reconstructions over search_range and sets the optimal rotation via
+    solver.set_rotation_deg() (which triggers cache invalidation automatically).
 
     Args:
         solver:       Solver-like object.
         search_range: Literal (min_deg, max_deg) rotation bounds to search.
                       Defaults to (-45°, +45°).
-        num_points:   Number of angles to sample.
+        num_points:   Number of angles to sample. Only used for method='grid'.
         metric:       Focus metric for QualityMetrics.evaluate.
         metric_kwargs:
                       Extra keyword arguments for QualityMetrics.evaluate.
@@ -367,9 +486,24 @@ def refine_scan_rotation(
         search_halfwidth:
                       Current-centered rotation half-width in degrees. Mutually
                       exclusive with search_range.
+        method:       'grid' (default): brute-force evenly-spaced sweep over
+                      num_points angles. Robust to a possibly-multimodal range
+                      (e.g. the wide default ±45° window) since it samples the
+                      whole interval rather than assuming a single peak.
+                      'brent': bounded Brent search (SciPy's method='bounded').
+                      Adaptively concentrates evaluations near the optimum —
+                      typically far fewer reconstructions than 'grid' for equal
+                      or better precision — but only reliable on an already
+                      narrow, near-unimodal window, e.g. a tight post-grid-search
+                      refinement step.
+        xatol:        Absolute angular convergence tolerance in degrees, only
+                      used for method='brent'.
     """
     mode = mode.lower()
     metric_kwargs = dict(metric_kwargs or {})
+    method = method.lower()
+    if method not in ('grid', 'brent'):
+        raise ValueError(f"Unsupported method: {method!r}. Choose 'grid' or 'brent'.")
     if search_range is not None and search_halfwidth is not None:
         raise ValueError("Provide either search_range or search_halfwidth, not both.")
 
@@ -381,44 +515,62 @@ def refine_scan_rotation(
             search_range = (solver.rotation_deg - half, solver.rotation_deg + half)
 
     min_rot, max_rot = min(search_range), max(search_range)
-    angles = np.linspace(min_rot, max_rot, num_points)
-    print(f"Starting rotation line search: {num_points} points between {min_rot:.1f} and {max_rot:.1f} deg")
 
     original_rotation = solver.rotation_deg
-    scores = []
+    evaluated_angles: list[float] = []
+    evaluated_scores: list[float] = []
     best_score = -np.inf
     best_image = None
 
-    try:
+    def _score_at(angle_deg: float) -> float:
+        nonlocal best_score, best_image
+        # clear_basis=True: each angle produces a distinct cache key; without
+        # clearing, entries accumulate in _basis_cache simultaneously. Angles
+        # are never revisited within one search, so only one entry is needed
+        # at a time.
         with torch.no_grad():
-            for angle in angles:
-                # clear_basis=True: each angle produces a distinct cache key; without
-                # clearing, all num_points entries accumulate in _basis_cache simultaneously.
-                # This sweep is sequential and never revisits angles, so only one entry is
-                # needed at a time.
-                solver.set_rotation_deg(float(angle), clear_basis=True)
-                img = solver.reconstruct(mode=mode, **kwargs)
-                score = QualityMetrics.evaluate(img, metric=metric, **metric_kwargs).item()
-                scores.append(score)
-                if score > best_score:
-                    best_score = score
-                    best_image = img.detach().clone()
+            solver.set_rotation_deg(float(angle_deg), clear_basis=True)
+            img = solver.reconstruct(mode=mode, **kwargs)
+            score = QualityMetrics.evaluate(img, metric=metric, **metric_kwargs).item()
+        evaluated_angles.append(float(angle_deg))
+        evaluated_scores.append(score)
+        if score > best_score:
+            best_score = score
+            best_image = img.detach().clone()
+        return score
+
+    try:
+        if method == 'grid':
+            print(f"Starting rotation line search (grid): {num_points} points between "
+                  f"{min_rot:.1f} and {max_rot:.1f} deg")
+            for angle in np.linspace(min_rot, max_rot, num_points):
+                _score_at(angle)
+            optimal_rotation = evaluated_angles[int(np.argmax(evaluated_scores))]
+        else:
+            print(f"Starting rotation line search (brent): bounded to "
+                  f"[{min_rot:.1f}, {max_rot:.1f}] deg")
+            result = minimize_scalar(
+                lambda angle: -_score_at(angle),
+                bounds=(min_rot, max_rot),
+                method='bounded',
+                options={'xatol': xatol},
+            )
+            optimal_rotation = float(result.x)
+            _score_at(optimal_rotation)  # ensure solver state / cached image land exactly on it
     finally:
         solver.set_rotation_deg(original_rotation)
 
-    scores = np.array(scores)
-    optimal_index = int(np.argmax(scores))
-    optimal_rotation = float(angles[optimal_index])
-
-    print(f"Optimal rotation found at {optimal_rotation:.2f} deg")
+    print(f"Optimal rotation found at {optimal_rotation:.2f} deg "
+          f"({len(evaluated_angles)} evaluations, method={method})")
     solver.set_rotation_deg(optimal_rotation, clear_basis=True)
     solver.reconstructed_image = best_image
 
     if plot_search:
         from fast_acbf.vis.plotting import plot_rotation_line_search
+        order = np.argsort(evaluated_angles)
         plot_rotation_line_search(
-            angles_deg=angles,
-            quality_scores=scores,
+            angles_deg=np.asarray(evaluated_angles)[order],
+            quality_scores=np.asarray(evaluated_scores)[order],
             optimal_rotation=optimal_rotation,
             metric=metric,
             mode=mode,
@@ -649,6 +801,7 @@ def refine_all_params(
     defocus_num_points: int = 11,
     fine_rotation_halfwidth: float = 5.0,
     fine_rotation_num_points: int = 11,
+    fine_rotation_xatol: float = 0.05,
     aberration_lr: float = 1.0,
     aberration_iters: int = 50,
     refinement_scan_roi=None,
@@ -661,8 +814,18 @@ def refine_all_params(
 
       'orientation_defocus'         — Joint 2-chirality × rotation × defocus grid search (Step 1).
       'coarse_aberrations'  — Adam optimisation restricted to 1st + 2nd order (Step 2).
-      'fine_rotation'       — Tight ±fine_rotation_halfwidth° line search (Step 3).
+      'fine_rotation'       — Tight ±fine_rotation_halfwidth° bounded Brent search (Step 3).
       'fine_aberrations'    — Full-order Adam optimisation (Step 4).
+
+    Step 3 uses refine_scan_rotation(method='brent') rather than a grid: Step 1
+    has already bracketed the correct rotation basin, so the ±fine_rotation_halfwidth°
+    window is expected to be near-unimodal, which is exactly where an adaptive
+    bounded search converges in far fewer evaluations than a fixed-point sweep.
+    Brent has no notion of "how many points" — it adaptively decides how many
+    evaluations to spend based on fine_rotation_xatol (the convergence
+    tolerance) and how smooth the score-vs-angle curve looks locally, so that
+    parameter (not fine_rotation_num_points) is what now controls Step 3's
+    precision/effort tradeoff.
 
     Args:
         solver:                         Solver-like object.
@@ -677,7 +840,11 @@ def refine_all_params(
         rotation_num_points:            Rotation angles sampled in [0°, 360°) for Step 1.
         defocus_num_points:             Defocus samples in defocus_range for Step 1.
         fine_rotation_halfwidth:        Half-width in degrees for Step 3 search range.
-        fine_rotation_num_points:       Number of angles for Step 3.
+        fine_rotation_num_points:       Unused — Step 3 is now an adaptive Brent search,
+                                        not a fixed-point sweep. Kept for signature
+                                        back-compat.
+        fine_rotation_xatol:            Absolute angular convergence tolerance in degrees
+                                        for Step 3's Brent search.
         aberration_lr:                  Base learning rate for Adam steps.
         aberration_iters:               Gradient steps per Adam call.
         refinement_scan_roi:            Optional scan ROI for AD aberration steps.
@@ -725,7 +892,8 @@ def refine_all_params(
         refine_scan_rotation(
             solver,
             search_halfwidth=fine_rotation_halfwidth,
-            num_points=fine_rotation_num_points,
+            method='brent',
+            xatol=fine_rotation_xatol,
             metric=metric,
             metric_kwargs=metric_kwargs,
             plot_search=False,

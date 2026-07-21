@@ -20,6 +20,7 @@ classifiers = [
 dependencies = [
     "matplotlib",
     "numpy",
+    "scipy",
     "torch>=2.4",
     "torchvision",
     "ptyrad"

@@ -511,6 +511,64 @@ class TestAutogradBoundary:
             torch.tensor([40.0, 50.0, 60.0]),
         )
 
+    def test_refine_defocus_brent_stays_within_bounds_and_updates_state(
+        self, synth_dataset, synth_params, device
+    ):
+        solver = self._make_solver(synth_dataset, synth_params, device)
+
+        solver.refine_defocus(
+            search_range=(40.0, 60.0),
+            method='brent',
+            plot_search=False,
+            chunk_size=8,
+        )
+
+        c10 = solver.ab_state.get_physical('C_1_0')
+        assert 40.0 <= c10 <= 60.0
+        assert solver.reconstructed_image is not None
+        assert not solver.reconstructed_image.requires_grad
+        torch.testing.assert_close(
+            solver.reconstructed_image,
+            solver.reconstruct(mode='tcBF', chunk_size=8),
+            atol=1e-6,
+            rtol=1e-6,
+        )
+
+    def test_refine_defocus_brent_plot_receives_scores(
+        self, synth_dataset, synth_params, device, monkeypatch
+    ):
+        from fast_acbf.vis import plotting
+
+        solver = self._make_solver(synth_dataset, synth_params, device)
+        captured = {}
+
+        def fake_plot(**kwargs):
+            captured.update(kwargs)
+
+        monkeypatch.setattr(plotting, "plot_defocus_line_search", fake_plot)
+
+        solver.refine_defocus(
+            search_range=(40.0, 60.0),
+            method='brent',
+            chunk_size=8,
+        )
+
+        assert captured["c10_axis_np"].size > 1
+        assert captured["quality_scores"].size == captured["c10_axis_np"].size
+        assert 40.0 <= captured["optimal_c10"] <= 60.0
+        assert captured["method"] == "brent"
+
+    def test_refine_defocus_rejects_unknown_method(self, synth_dataset, synth_params, device):
+        solver = self._make_solver(synth_dataset, synth_params, device)
+
+        with pytest.raises(ValueError, match="Unsupported method"):
+            solver.refine_defocus(
+                search_range=(40.0, 60.0),
+                method='not_a_method',
+                plot_search=False,
+                chunk_size=8,
+            )
+
     def test_refine_wrappers_reject_positional_options(self, synth_dataset, synth_params, device):
         solver = self._make_solver(synth_dataset, synth_params, device)
 
@@ -627,6 +685,62 @@ class TestAutogradBoundary:
         assert all(kwargs["center_crop"] is False for kwargs in captured)
         assert all(kwargs["crop_fraction"] == pytest.approx(0.75) for kwargs in captured)
 
+    def test_refine_scan_rotation_brent_stays_within_bounds_and_updates_state(
+        self, synth_dataset, synth_params, device
+    ):
+        solver = self._make_solver(synth_dataset, synth_params, device)
+
+        solver.refine_scan_rotation(
+            search_range=(-5.0, 5.0),
+            method='brent',
+            plot_search=False,
+            chunk_size=8,
+        )
+
+        assert -5.0 <= solver.rotation_deg <= 5.0
+        assert solver.reconstructed_image is not None
+        assert not solver.reconstructed_image.requires_grad
+        torch.testing.assert_close(
+            solver.reconstructed_image,
+            solver.reconstruct(mode='tcBF', chunk_size=8),
+            atol=1e-6,
+            rtol=1e-6,
+        )
+
+    def test_refine_scan_rotation_brent_plot_receives_scores(
+        self, synth_dataset, synth_params, device, monkeypatch
+    ):
+        from fast_acbf.vis import plotting
+
+        solver = self._make_solver(synth_dataset, synth_params, device)
+        captured = {}
+
+        def fake_plot(**kwargs):
+            captured.update(kwargs)
+
+        monkeypatch.setattr(plotting, "plot_rotation_line_search", fake_plot)
+
+        solver.refine_scan_rotation(
+            search_range=(-5.0, 5.0),
+            method='brent',
+            chunk_size=8,
+        )
+
+        assert captured["angles_deg"].size > 1
+        assert captured["quality_scores"].size == captured["angles_deg"].size
+        assert -5.0 <= captured["optimal_rotation"] <= 5.0
+
+    def test_refine_scan_rotation_rejects_unknown_method(self, synth_dataset, synth_params, device):
+        solver = self._make_solver(synth_dataset, synth_params, device)
+
+        with pytest.raises(ValueError, match="Unsupported method"):
+            solver.refine_scan_rotation(
+                search_range=(-5.0, 5.0),
+                method='not_a_method',
+                plot_search=False,
+                chunk_size=8,
+            )
+
     def test_refine_flips_plot_receives_eight_panels(self, synth_dataset, synth_params, device, monkeypatch):
         from fast_acbf.vis import plotting
 
@@ -721,6 +835,31 @@ class TestAutogradBoundary:
         assert captured
         assert all(kwargs["metric"] == "laplacian" for kwargs in captured)
         assert all(kwargs["center_crop"] is False for kwargs in captured)
+
+    def test_refine_all_params_forwards_fine_rotation_xatol(
+        self, synth_dataset, synth_params, device, monkeypatch
+    ):
+        from fast_acbf.optimization import refinement
+
+        solver = self._make_solver(synth_dataset, synth_params, device)
+        captured = {}
+        real_minimize_scalar = refinement.minimize_scalar
+
+        def spy_minimize_scalar(fn, **kwargs):
+            captured.update(kwargs)
+            return real_minimize_scalar(fn, **kwargs)
+
+        monkeypatch.setattr(refinement, "minimize_scalar", spy_minimize_scalar)
+
+        solver.refine_all_params(
+            targets=('fine_rotation',),
+            fine_rotation_halfwidth=2.0,
+            fine_rotation_xatol=0.2,
+            mode='tcBF',
+            chunk_size=8,
+        )
+
+        assert captured["options"]["xatol"] == pytest.approx(0.2)
 
     def test_refine_defocus_accepts_upscaled_preparation(self, synth_dataset, synth_params, device):
         solver = self._make_solver(synth_dataset, synth_params, device)
