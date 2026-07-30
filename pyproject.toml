@@ -20,8 +20,10 @@ classifiers = [
     "Operating System :: OS Independent",
 ]
 dependencies = [
+    "h5py",
     "matplotlib",
     "numpy",
+    "psutil",
     "scipy",
     "torch>=2.4",
     "torchvision",
