@@ -760,8 +760,7 @@ class BFSolver:
     # ------------------------------------------------------------------
 
     def refine_register(self, max_shifts=None) -> BFSolver:
-        print("Executed: Rigid Registration Refinement")
-        return self
+        raise NotImplementedError("Rigid registration refinement is not implemented yet.")
 
     def refine_defocus(self, *, search_range=None, **kwargs) -> BFSolver:
         from fast_acbf.optimization import refinement
