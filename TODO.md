@@ -28,6 +28,13 @@
   or RAM, but reconstruction can still stall while waiting for each disk read.
 - Decide whether benchmark result files should be versioned as historical
   artifacts or regenerated after the pipeline rewrite.
+- Regression fixtures under `tests/fixtures/` (`tcbf.npy`, `acbf.npy`,
+  `defocus_stack.npy`) were generated on `fast_acbf_version: 0.2.0` and predate
+  the v2 pipeline rewrite (0.3.0+) and the `zero_insert` default (0.6.0). The
+  source zarr dataset (`tests/generate_fixtures.py`'s `DEFAULT_ZARR_PATH`) no
+  longer exists on the maintainer's machine, so they can't currently be
+  refreshed. Regenerate once the source dataset is recreated, ideally before
+  relying on `@pytest.mark.regression` results against current numerics.
 
 
 # Existing features
