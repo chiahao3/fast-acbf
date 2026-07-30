@@ -56,4 +56,5 @@ filterwarnings = ["ignore::UserWarning"]
 
 [project.urls]
 Repository = "https://github.com/chiahao3/fast-acbf"
+Changelog = "https://github.com/chiahao3/fast-acbf/blob/main/CHANGELOG.md"
 "PtyRAD" = "https://github.com/chiahao3/ptyrad"
