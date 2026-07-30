@@ -2,11 +2,14 @@
 """
 generate_fixtures.py — Run ONCE before refactoring to save regression ground truth.
 
+Requires a real experimental 4D-STEM dataset that is NOT distributed with
+this repo. DEFAULT_ZARR_PATH below is only valid on the maintainer's
+machine — external users must set FAST_ACBF_REGRESSION_ZARR to point at
+their own `cbed.zarr` before running this script.
+
 Usage:
     conda activate fast-acbf
-    python tests/generate_fixtures.py
-
-Set FAST_ACBF_REGRESSION_ZARR to override the default input zarr path.
+    FAST_ACBF_REGRESSION_ZARR=/path/to/your/cbed.zarr python tests/generate_fixtures.py
 
 Outputs (in tests/fixtures/):
     tcbf.npy            — tcBF reconstruction, shape (64, 64)

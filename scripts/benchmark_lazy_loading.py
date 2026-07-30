@@ -18,6 +18,11 @@ Two loading strategies:
 The benchmark also runs through BFExtractor disk strategies on the 1 GiB file
 so the single-call vs chunked-loop trade-offs remain visible.
 
+This is an internal dev/benchmarking script, not runnable out of the box:
+SRC_FILE and SCRATCH below point at the maintainer's local `~/scratch/`
+data (including the "Figure 4" dataset the README links from Zenodo).
+Pass --file to point at your own data, or adjust the paths below.
+
 Usage
 -----
     conda run -n fast-acbf python scripts/benchmark_lazy_loading.py

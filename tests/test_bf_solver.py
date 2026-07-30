@@ -1279,6 +1279,15 @@ class TestQualityMetrics:
 
 
 # ── Regression tests ──────────────────────────────────────────────────────────
+#
+# These tests (marked `@pytest.mark.regression`) compare against a real
+# experimental 4D-STEM dataset that is NOT distributed with this repo. The
+# DEFAULT_REAL_ZARR path below is only valid on the maintainer's machine, so
+# by default `real_solver` will skip (not fail) for every other user/CI run.
+# To run these tests, set FAST_ACBF_REGRESSION_ZARR to point at your own
+# `cbed.zarr` (same shape/geometry as documented below), or generate one via
+# tests/generate_fixtures.py. Run the non-regression suite with:
+#     pytest -m "not regression"
 
 FIXTURE_DIR = os.path.join(os.path.dirname(__file__), "fixtures")
 DEFAULT_REAL_ZARR = (

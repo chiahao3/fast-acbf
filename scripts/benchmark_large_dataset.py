@@ -15,6 +15,11 @@ Times reported per step:
 Physics parameters (80 kV, 25 mrad convergence):
   wavelength = 0.04176 Å, max_alpha = 25 mrad, dk = 0.04 Å⁻¹/px, scan_step = 0.43 Å
 
+This is an internal dev/benchmarking script, not runnable out of the box:
+it requires 48-64 GiB HDF5 files that are not distributed with this repo
+and reads/writes under the maintainer's local `~/scratch/` directory.
+Adjust SCRATCH below (or generate matching files yourself) before running.
+
 Usage
 -----
     # Generate the large files first (see tile_hdf5.py).
