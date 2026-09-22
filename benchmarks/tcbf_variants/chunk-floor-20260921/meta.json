@@ -1,0 +1,9 @@
+{
+  "device_name": "NVIDIA RTX 5000 Ada Generation",
+  "torch_version": "2.7.1+cu126",
+  "platform": "Linux-6.8.0-138-generic-x86_64-with-glibc2.35",
+  "baseline_ref": "e1e8ab4",
+  "head_ref": "1ff6031",
+  "nb": 797,
+  "copy_bandwidth_gib_s": 449.71853724345726
+}
