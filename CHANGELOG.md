@@ -5,6 +5,16 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.8.0] - 2026-09-21
+### Added
+- Add `scripts/benchmark_tcbf_variants.py`, which sweeps scan size and upscale over the baseline implementation and each change in isolation, plus artifacts and a report under `benchmarks/`
+### Changed
+- **tcBF reconstruction is up to 4.9x faster and uses 3.4x less transient VRAM.** Measured against 0.7.0 at N_BF=797, `chunk_size=64`, device-resident FFT store, RTX 5000 Ada: 3.3x at `R=256`, 4.9x at `R=512`, 4.7x at `R=1024`. Reconstructions at `R<=128` are unchanged, being kernel-launch bound rather than bandwidth bound
+- Accumulate tcBF and acBF reconstructions in Fourier space and inverse-transform once, instead of inverse-transforming every shifted virtual image before summing over the detector axis (`ifft2` and `Re(.)` are linear in that axis), turning `N_BF` inverse FFTs into one
+- Build the tcBF shift operator as two 1D phase factors rather than a full 2D grid, and apply both factors plus the detector sum as a single `einsum`, so no `(chunk_size, Ry, Rx)` intermediate is materialized
+- acBF keeps only the Fourier accumulation, worth ~1.05x since `compute_transfer` dominates its runtime, but it drops the inverse-FFT buffer from peak VRAM
+- Outputs match the previous implementation to float32 roundoff in both the image (6.1e-07 relative) and `d(loss)/d(coeffs)` (2.5e-07), the gradient mattering because `reconstruct_tcbf` is the AD forward pass behind `refine_aberrations`
+
 ## [0.7.0] - 2026-07-30
 ### Added
 - Add LGPL-3.0 `LICENSE` and PyPI packaging metadata (license, missing dependencies, GitHub Actions release workflow) in preparation for the public PyPI release
