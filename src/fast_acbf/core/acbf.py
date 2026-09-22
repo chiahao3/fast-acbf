@@ -114,6 +114,18 @@ def reconstruct_acbf(
 
     Aligns detector contributions by their phase before summation.
 
+    Like tcBF, this accumulates in Fourier space and inverse-transforms once, since
+    ``ifft2`` and ``Re(.)`` are linear in the detector index b:
+
+        sum_b Re(ifft2(I_b * P_b))  ==  Re(ifft2(sum_b I_b * P_b))
+
+    Unlike tcBF this is not a meaningful speedup — compute_transfer dominates so
+    heavily that removing the per-image inverse FFTs only buys ~1.05x on CUDA (both
+    with and without a precomputed optics cache).  It is kept because it costs
+    nothing, drops the (chunk_size, Ry, Rx) inverse-FFT buffer from peak VRAM, and
+    matches reconstruct_acbf_complex_inversion below, which already accumulates this
+    way.  Speeding acBF up means attacking compute_transfer, not the FFT.
+
     Args:
         provider:  ImageFFT serving (chunk_size, Ry, Rx) complex64 chunks.
         qx_grid:   Scan-frame frequency grid, shape (1, 1, Rx).
@@ -129,13 +141,13 @@ def reconstruct_acbf(
     """
     Ry_out = qy_grid.shape[-2]
     Rx_out = qx_grid.shape[-1]
-    acBF_total = torch.zeros((Ry_out, Rx_out), dtype=torch.float32, device=device)
+    spectrum = torch.zeros((Ry_out, Rx_out), dtype=torch.complex64, device=device)
     for geom_chunk, optics_chunk in _iter_chunks(geometry, optics):
         img_fft_chunk = provider.get_chunk(geom_chunk['start'], geom_chunk['end'])
         transfer = compute_transfer(geom_chunk, optics_chunk, coeffs, qx_grid, qy_grid, geometry, device)
         phasor = transfer / (transfer.abs() + eps)
-        acBF_total += torch.sum(torch.fft.ifft2(img_fft_chunk * phasor, dim=(-2, -1)).real, dim=0)
-    return acBF_total
+        spectrum += torch.sum(img_fft_chunk * phasor, dim=0)
+    return torch.fft.ifft2(spectrum, dim=(-2, -1)).real
 
 
 def reconstruct_acbf_complex_inversion(
