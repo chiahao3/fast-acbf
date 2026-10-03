@@ -5,13 +5,14 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.9.0] - 2026-10-03
 ### Changed
-- **No PtyRAD dependency.** fast-acbf is now a standalone library. The pieces it used from
-  PtyRAD are ported from PtyRAD v1.0.0 and must be kept in sync with it: `Aberrations` in
-  `fast_acbf.core.ptyrad_aberrations` (verbatim copy of `ptyrad.optics.aberrations`),
-  `fftshift2` / `ifftshift2` / `torch_phasor` in `fast_acbf.core.functional` and `mfft2` in
-  `fast_acbf.vis.plotting`, and `get_wavelength_ang` / `guess_radius_of_bright_field_disk`
+- **No PtyRAD dependency.** fast-acbf is now a standalone library; `ptyrad` is no longer
+  installed with it, so code that imports `ptyrad` needs `pip install ptyrad` separately.
+  The pieces it used from PtyRAD are ported from PtyRAD v1.0.0 and must be kept in sync
+  with it: `Aberrations` in `fast_acbf.core.ptyrad_aberrations` (verbatim copy of
+  `ptyrad.optics.aberrations`), `fftshift2` / `ifftshift2` / `torch_phasor` in
+  `fast_acbf.core.functional` and `mfft2` in `fast_acbf.vis.plotting`, and `get_wavelength_ang` / `guess_radius_of_bright_field_disk`
   (with the physical constants) in `fast_acbf.core.calibration`. Aberration notation, units
   and output frames are unchanged
 - `get_acBF.ipynb` no longer imports PtyRAD: it loads data with `Dataset4D.from_raw` and

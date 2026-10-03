@@ -19,7 +19,8 @@ This implementation (**fast-acBF**) was developed independently focusing on GPU 
 
 fast-acbf is a standalone library and does not need PtyRAD. Its aberration notation
 (`Aberrations`, ported from PtyRAD and kept in sync with it) and output frames match
-PtyRAD's, so exported aberrations and probes can be passed to PtyRAD unchanged.
+PtyRAD's, so exported aberrations and probes can be passed to PtyRAD unchanged. To use
+both, install PtyRAD separately (`pip install ptyrad`); fast-acbf does not pull it in.
 
 ### 1. Get the fast-acBF code from GitHub
 You can either download the repository as a .zip file and extract it, or use the following command if you have `git` installed.
