@@ -57,6 +57,8 @@ If you prefer a legacy version of PyTorch, or a different version of CUDA runtim
 from fast_acbf import BFSolver, Dataset4D
 
 dataset = Dataset4D.from_hdf5("scan.h5", key="array")  # lazy by default
+# EMPAD .raw has no shape metadata, so pass it (gap=0 for gapless raw files):
+# dataset = Dataset4D.from_raw("scan.raw", scan_shape=(128, 128), detector_shape=(128, 128), gap=1024)
 
 solver = BFSolver(
     dataset=dataset,

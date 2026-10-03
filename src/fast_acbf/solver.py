@@ -159,6 +159,11 @@ class BFSolver:
             suffix = path.suffix.lower()
             if suffix in ('.h5', '.hdf5'):
                 ds = Dataset4D.from_hdf5(path, normalize=normalize)
+            elif suffix == '.raw':
+                raise ValueError(
+                    "A .raw file has no shape metadata; open it with "
+                    "Dataset4D.from_raw(path, scan_shape, detector_shape) and pass that instead."
+                )
             else:
                 ds = Dataset4D.from_zarr(path, normalize=normalize)
         else:

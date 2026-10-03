@@ -14,7 +14,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `fast_acbf.vis.plotting`, and `get_wavelength_ang` / `guess_radius_of_bright_field_disk`
   (with the physical constants) in `fast_acbf.core.calibration`. Aberration notation, units
   and output frames are unchanged
+- `BFSolver` raises a clear error when given a `.raw` path (it needs the shape; use
+  `Dataset4D.from_raw`) instead of failing inside the Zarr loader
 ### Added
+- `Dataset4D.from_raw(path, scan_shape, detector_shape, *, dtype, offset, gap)` opens
+  headerless frame files such as EMPAD `.raw` (1024-byte gap per frame by default) as a lazy
+  memory map, with a file-size check; same `materialize` / `normalize` options as `from_hdf5`
 - `get_wavelength_ang` and `guess_radius_of_bright_field_disk` are exported from `fast_acbf`
 - `tests/test_ptyrad_port.py` compares the ported code with the installed PtyRAD (source and
   behaviour); skipped when PtyRAD is not installed

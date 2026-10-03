@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 from collections.abc import Iterator
 from typing import Any
 
@@ -14,7 +15,7 @@ class Dataset4D:
 
     ``Dataset4D`` deliberately has no BF-aperture or FFT policy.  It is either
     materialized as a contiguous float32 numpy array in host RAM, or it wraps a
-    lazy HDF5/Zarr backend and exposes generic raw reads for higher pipeline
+    lazy HDF5/Zarr/memory-mapped raw backend and exposes generic raw reads for higher pipeline
     layers.
 
     Normalization invariant:
@@ -101,6 +102,51 @@ class Dataset4D:
             except Exception:
                 obj.close()
                 raise
+        return obj
+
+    @classmethod
+    def from_raw(
+        cls,
+        path,
+        scan_shape: tuple[int, int],
+        detector_shape: tuple[int, int],
+        *,
+        dtype=np.float32,
+        offset: int = 0,
+        gap: int = 1024,
+        materialize: bool = False,
+        normalize: bool = False,
+    ) -> Dataset4D:
+        """Open a headerless binary file of frames, e.g. EMPAD ``.raw``.
+
+        The file holds ``Ry * Rx`` frames of ``(Ky, Kx)`` pixels in scan order, with
+        ``gap`` bytes after each frame (EMPAD stores 1024 bytes of metadata per frame;
+        use ``gap=0`` for gapless data) and ``offset`` bytes before the first frame.
+        The file is memory-mapped, so it stays lazy until ``materialize()``.
+        """
+        Ry, Rx = (int(v) for v in scan_shape)
+        Ky, Kx = (int(v) for v in detector_shape)
+        frame = np.dtype([('data', dtype, (Ky, Kx)), ('gap', np.uint8, (gap,))])
+        expected = offset + Ry * Rx * frame.itemsize
+        actual = os.path.getsize(path)
+        if actual != expected:
+            raise ValueError(
+                f"Raw file {str(path)!r} is {actual} bytes, expected {expected} = offset "
+                f"{offset} + {Ry}*{Rx} frames * ({Ky}*{Kx}*{np.dtype(dtype).itemsize} + gap "
+                f"{gap}). Check scan_shape, detector_shape, dtype, offset, and gap."
+            )
+
+        obj = cls.__new__(cls)
+        obj._array = None
+        obj._h5_file = None
+        frames = np.memmap(path, dtype=frame, mode='r', offset=offset, shape=(Ry * Rx,))
+        obj._handle = frames['data'].reshape(Ry, Rx, Ky, Kx)
+        obj._norm_factor = None
+
+        if materialize:
+            obj.materialize()
+        if normalize:
+            obj._apply_normalization()
         return obj
 
     @staticmethod
