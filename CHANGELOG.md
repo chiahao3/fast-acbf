@@ -11,8 +11,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   PtyRAD are ported from PtyRAD v1.0.0 and must be kept in sync with it: `Aberrations` in
   `fast_acbf.core.ptyrad_aberrations` (verbatim copy of `ptyrad.optics.aberrations`),
   `fftshift2` / `ifftshift2` / `torch_phasor` in `fast_acbf.core.functional` and `mfft2` in
-  `fast_acbf.vis.plotting`. Aberration notation, units and output frames are unchanged
+  `fast_acbf.vis.plotting`, and `get_wavelength_ang` / `guess_radius_of_bright_field_disk`
+  (with the physical constants) in `fast_acbf.core.calibration`. Aberration notation, units
+  and output frames are unchanged
 ### Added
+- `get_wavelength_ang` and `guess_radius_of_bright_field_disk` are exported from `fast_acbf`
 - `tests/test_ptyrad_port.py` compares the ported code with the installed PtyRAD (source and
   behaviour); skipped when PtyRAD is not installed
 

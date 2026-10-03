@@ -29,8 +29,9 @@ dependencies = [
     "torchvision",
 ]
 # No PtyRAD dependency: the few PtyRAD pieces fast-acbf needs are ported
-# (fast_acbf.core.ptyrad_aberrations and the marked blocks in core/functional.py and
-# vis/plotting.py); tests/test_ptyrad_port.py checks them against PtyRAD when installed.
+# (fast_acbf.core.ptyrad_aberrations and the marked blocks in core/functional.py,
+# core/calibration.py and vis/plotting.py); tests/test_ptyrad_port.py checks them
+# against PtyRAD when installed.
 
 [tool.setuptools]
 package-dir = {"" = "src"}

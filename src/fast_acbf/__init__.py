@@ -1,5 +1,6 @@
 from .solver import BFSolver
 from .core.aberrations import AberrationState
+from .core.calibration import get_wavelength_ang, guess_radius_of_bright_field_disk
 from .optimization.metrics import QualityMetrics
 from .data.dataset4d import Dataset4D
 from .data.bf_extractor import BFExtractor
@@ -21,4 +22,6 @@ __all__ = [
     "ImageFFT",
     "PipelineManager",
     "PipelineResolution",
+    "get_wavelength_ang",
+    "guess_radius_of_bright_field_disk",
 ]

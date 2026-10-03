@@ -1,10 +1,12 @@
 """The code ported from PtyRAD must stay in sync with PtyRAD.
 
 fast-acbf does not depend on PtyRAD, but ``Aberrations`` (``fast_acbf.core.ptyrad_aberrations``),
-``fftshift2`` / ``ifftshift2`` / ``torch_phasor`` (``fast_acbf.core.functional``) and ``mfft2``
-(``fast_acbf.vis.plotting``) are copies of PtyRAD's. These tests compare them with the
-installed PtyRAD and are skipped when PtyRAD is not installed. A failure means PtyRAD
-changed: copy its version over (see the module docstring of ``ptyrad_aberrations``).
+``fftshift2`` / ``ifftshift2`` / ``torch_phasor`` (``fast_acbf.core.functional``), ``mfft2``
+(``fast_acbf.vis.plotting``), and ``get_wavelength_ang`` / ``guess_radius_of_bright_field_disk``
+with the physical constants (``fast_acbf.core.calibration``) are copies of PtyRAD's. These
+tests compare them with the installed PtyRAD and are skipped when PtyRAD is not installed.
+A failure means PtyRAD changed: copy its version over (see the module docstring of
+``ptyrad_aberrations``).
 """
 from __future__ import annotations
 
@@ -16,10 +18,11 @@ import pytest
 import torch
 
 ptyrad_aberrations = pytest.importorskip("ptyrad.optics.aberrations")
+ptyrad_constants = pytest.importorskip("ptyrad.optics.constants")
 ptyrad_functional = pytest.importorskip("ptyrad.core.functional")
 ptyrad_image_proc = pytest.importorskip("ptyrad.utils.image_proc")
 
-from fast_acbf.core import functional, ptyrad_aberrations as port  # noqa: E402
+from fast_acbf.core import calibration, functional, ptyrad_aberrations as port  # noqa: E402
 from fast_acbf.vis import plotting  # noqa: E402
 
 MARKER = "# ---- verbatim from PtyRAD ----\n"
@@ -47,9 +50,18 @@ def test_aberrations_module_is_verbatim_copy():
     (functional.ifftshift2, ptyrad_functional.ifftshift2),
     (functional.torch_phasor, ptyrad_functional.torch_phasor),
     (plotting.mfft2, ptyrad_image_proc.mfft2),
-], ids=["fftshift2", "ifftshift2", "torch_phasor", "mfft2"])
+    (calibration.get_wavelength_ang, ptyrad_constants.get_wavelength_ang),
+    (calibration.guess_radius_of_bright_field_disk, ptyrad_image_proc.guess_radius_of_bright_field_disk),
+], ids=["fftshift2", "ifftshift2", "torch_phasor", "mfft2", "get_wavelength_ang",
+        "guess_radius_of_bright_field_disk"])
 def test_functions_are_verbatim_copies(ours, theirs):
     assert inspect.getsource(ours) == inspect.getsource(theirs)
+
+
+@pytest.mark.parametrize("name", ["PLANCKS", "REST_MASS_E", "CHARGE_E", "SPEED_OF_LIGHT", "HC",
+                                  "REST_ENERGY_E"])
+def test_constants_match(name):
+    assert getattr(calibration, name) == getattr(ptyrad_constants, name)
 
 
 AB = {"C10": -52.0, "C12": 7.5, "phi12": 30.0, "C21": 120.0, "phi21": -45.0, "C30": 1.2e4}
@@ -78,3 +90,8 @@ def test_functions_behave_the_same():
     im = np.random.default_rng(0).random((12, 10))
     for a, b in zip(plotting.mfft2(im), ptyrad_image_proc.mfft2(im), strict=True):
         np.testing.assert_array_equal(a, b)
+    for kv in (60, 80, 200, 300):
+        assert calibration.get_wavelength_ang(kv) == ptyrad_constants.get_wavelength_ang(kv)
+    dp = np.random.default_rng(1).random((32, 32))
+    assert (calibration.guess_radius_of_bright_field_disk(dp, thresh=0.3)
+            == ptyrad_image_proc.guess_radius_of_bright_field_disk(dp, thresh=0.3))
