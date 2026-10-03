@@ -5,7 +5,34 @@ from __future__ import annotations
 import torch
 import torch.nn.functional as F
 
-from ptyrad.core.functional import fftshift2, ifftshift2, torch_phasor
+
+# ---- Ported from PtyRAD (ptyrad.core.functional, v1.0.0); keep in sync ----------------
+# Identical to PtyRAD's functions (tests/test_ptyrad_port.py checks when PtyRAD is installed).
+
+def fftshift2(x):
+    """ A wrapper over torch.fft.fftshift for the last 2 dims """
+    # Note that fftshift and ifftshift are only equivalent when N = even 
+    return torch.fft.fftshift(x, dim=(-2,-1))  
+
+def ifftshift2(x):
+    """ A wrapper over torch.fft.ifftshift for the last 2 dims"""
+    # Note that fftshift and ifftshift are only equivalent when N = even 
+    return torch.fft.ifftshift(x, dim=(-2,-1))  
+
+def torch_phasor(phase):
+    """
+    Creates a complex tensor with unit magnitude using the phase.
+
+    Args:
+        phase (torch.Tensor): phase angle for the exp(i*theta)
+        
+    Note:
+        This util function is created so torch.compile can properly handle complex tensors,
+        because torch.exp(1j*phase) involves the 1j which is actually a Python built-in that can't be traced.
+    """
+    return torch.polar(torch.ones_like(phase), phase)
+
+# ---- end of the PtyRAD port ------------------------------------------------------------
 
 
 def imshift_with_batch(imgs, shifts, grid, batch_size=None):

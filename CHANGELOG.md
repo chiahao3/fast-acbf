@@ -5,6 +5,17 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+### Changed
+- **No PtyRAD dependency.** fast-acbf is now a standalone library. The pieces it used from
+  PtyRAD are ported from PtyRAD v1.0.0 and must be kept in sync with it: `Aberrations` in
+  `fast_acbf.core.ptyrad_aberrations` (verbatim copy of `ptyrad.optics.aberrations`),
+  `fftshift2` / `ifftshift2` / `torch_phasor` in `fast_acbf.core.functional` and `mfft2` in
+  `fast_acbf.vis.plotting`. Aberration notation, units and output frames are unchanged
+### Added
+- `tests/test_ptyrad_port.py` compares the ported code with the installed PtyRAD (source and
+  behaviour); skipped when PtyRAD is not installed
+
 ## [0.8.0] - 2026-09-21
 ### Added
 - Add `scripts/benchmark_tcbf_variants.py`, which sweeps scan size and upscale over the baseline implementation and each change in isolation, plus artifacts and a report under `benchmarks/`

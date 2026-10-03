@@ -6,6 +6,36 @@ import numpy as np
 import matplotlib.pyplot as plt
 
 
+# ---- Ported from PtyRAD (ptyrad.utils.image_proc.mfft2, v1.0.0); keep in sync ---------
+# Identical to PtyRAD's function (tests/test_ptyrad_port.py checks when PtyRAD is installed).
+
+def mfft2(im):
+    # Periodic Artifact Reduction in Fourier Transforms of Full Field Atomic Resolution Images
+    # https://doi.org/10.1017/S1431927614014639
+    rows, cols = im.shape
+    
+    # Compute boundary conditions
+    s = np.zeros_like(im)
+    s[0, :] = im[0, :] - im[rows-1, :]
+    s[rows-1, :] = -s[0, :]
+    s[:, 0] += im[:, 0] - im[:, cols-1]
+    s[:, cols-1] -= im[:, 0] - im[:, cols-1]
+
+    # q[n] = 2π·n/N: DFT angular spatial frequency (rad/sample) used in discrete Laplacian eigenvalue
+    q_y, q_x = np.meshgrid(2 * np.pi * np.arange(rows) / rows,
+                            2 * np.pi * np.arange(cols) / cols, indexing='ij')
+
+    # Generate smooth component from Poisson Eq with boundary condition
+    D = 2 * (2 - np.cos(q_y) - np.cos(q_x))
+    D[0, 0] = np.inf  # Enforce zero mean & handle division by zero
+    S = np.fft.fft2(s) / D
+
+    P = np.fft.fft2(im) - S  # FFT of periodic component
+    return P, S
+
+# ---- end of the PtyRAD port ------------------------------------------------------------
+
+
 def plot_reconstruction(
     img: np.ndarray,
     fft: np.ndarray,

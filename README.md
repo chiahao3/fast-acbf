@@ -16,7 +16,10 @@ This implementation (**fast-acBF**) was developed independently focusing on GPU 
 **Major Dependencies:**
 - python >=3.10
 - pytorch >=2.4
-- ptyrad
+
+fast-acbf is a standalone library and does not need PtyRAD. Its aberration notation
+(`Aberrations`, ported from PtyRAD and kept in sync with it) and output frames match
+PtyRAD's, so exported aberrations and probes can be passed to PtyRAD unchanged.
 
 ### 1. Get the fast-acBF code from GitHub
 You can either download the repository as a .zip file and extract it, or use the following command if you have `git` installed.
@@ -42,7 +45,8 @@ If you prefer a legacy version of PyTorch, or a different version of CUDA runtim
 ## Get Started
 
 1. Download the demo tBL-WSe2 data "Figure 4.zip" from the [Zenodo link](https://doi.org/10.5281/zenodo.15283331)
-2. Run the `get_acBF.ipynb` Jupyter notebook to reconstruct tcBF / acBF images
+2. Run the `get_acBF.ipynb` Jupyter notebook to reconstruct tcBF / acBF images (the notebook
+   also uses a few PtyRAD helpers for loading and printing: `pip install ptyrad`)
 
 ## Data Pipeline Defaults
 

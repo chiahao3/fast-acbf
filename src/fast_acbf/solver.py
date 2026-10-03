@@ -12,12 +12,10 @@ import torch
 from torchvision.transforms.functional import rotate as tv_rotate
 from torchvision.transforms import InterpolationMode
 
-from ptyrad.optics.aberrations import Aberrations
-from ptyrad.utils.image_proc import mfft2
-
 from fast_acbf.core.aberrations import AberrationState
 from fast_acbf.core.acbf import reconstruct_acbf_complex_inversion
 from fast_acbf.core.functional import generate_aberration_basis, generate_shift_basis, make_probe_from_chi
+from fast_acbf.core.ptyrad_aberrations import Aberrations  # ported from PtyRAD; keep in sync
 from fast_acbf.data.dataset4d import Dataset4D
 from fast_acbf.data.bf_preparer import _normalize_upscale_method, _prepared_shapes
 from fast_acbf.data.geometry import CoordinateTransform, DetectorGeometry, ScanGeometry
@@ -849,7 +847,7 @@ class BFSolver:
         upscale = kwargs.get('upscale', None)
         with torch.no_grad():
             img = self.get_reconstructed_image(mode=mode, frame=frame, **kwargs).detach().cpu().numpy()
-            fft = np.log(np.abs(np.fft.fftshift(mfft2(img)[0])))
+            fft = np.log(np.abs(np.fft.fftshift(plotting.mfft2(img)[0])))
             probe = self.get_probe(frame=frame, upscale=upscale).abs().detach().cpu().numpy()
 
         plotting.plot_reconstruction(

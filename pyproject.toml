@@ -8,7 +8,7 @@ dynamic = ["version"]
 authors = [
   { name="Chia-Hao Lee", email="cl2696@cornell.edu" },
 ]
-description = "GPU-based Bright-field Ptychography Solver for tcBF and acBF built on PtyRAD"
+description = "GPU-based Bright-field Ptychography Solver for tcBF and acBF, compatible with PtyRAD"
 keywords = ["Ptychography"]
 readme = "README.md"
 license = "LGPL-3.0"
@@ -27,8 +27,10 @@ dependencies = [
     "scipy",
     "torch>=2.4",
     "torchvision",
-    "ptyrad"
 ]
+# No PtyRAD dependency: the few PtyRAD pieces fast-acbf needs are ported
+# (fast_acbf.core.ptyrad_aberrations and the marked blocks in core/functional.py and
+# vis/plotting.py); tests/test_ptyrad_port.py checks them against PtyRAD when installed.
 
 [tool.setuptools]
 package-dir = {"" = "src"}
