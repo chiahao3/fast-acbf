@@ -14,6 +14,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `fast_acbf.vis.plotting`, and `get_wavelength_ang` / `guess_radius_of_bright_field_disk`
   (with the physical constants) in `fast_acbf.core.calibration`. Aberration notation, units
   and output frames are unchanged
+- `get_acBF.ipynb` no longer imports PtyRAD: it loads data with `Dataset4D.from_raw` and
+  prints versions and the GPU with torch instead of `print_system_info`
 - `BFSolver` raises a clear error when given a `.raw` path (it needs the shape; use
   `Dataset4D.from_raw`) instead of failing inside the Zarr loader
 ### Added

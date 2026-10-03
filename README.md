@@ -45,8 +45,7 @@ If you prefer a legacy version of PyTorch, or a different version of CUDA runtim
 ## Get Started
 
 1. Download the demo tBL-WSe2 data "Figure 4.zip" from the [Zenodo link](https://doi.org/10.5281/zenodo.15283331)
-2. Run the `get_acBF.ipynb` Jupyter notebook to reconstruct tcBF / acBF images (the notebook
-   also uses a few PtyRAD helpers for loading and printing: `pip install ptyrad`)
+2. Run the `get_acBF.ipynb` Jupyter notebook to reconstruct tcBF / acBF images
 
 ## Data Pipeline Defaults
 
