@@ -5,6 +5,14 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+### Fixed
+- `get_probe(frame="scan", upscale > 1)` returned the detector-frame probe when
+  `rotation_deg` was not 0: the upscaled path rotated the k grid as well as the
+  coefficients, and the two rotations cancelled. It now uses the flipped, unrotated grid,
+  as `get_chi_surface` and the `upscale = 1` path do. The detector frame, χ, the shifts,
+  the coefficients and the reconstructions were not affected
+
 ## [0.9.0] - 2026-10-03
 ### Changed
 - **No PtyRAD dependency.** fast-acbf is now a standalone library; `ptyrad` is no longer
