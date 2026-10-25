@@ -178,6 +178,44 @@ class TestGetProbe:
         assert solver_zero_ab.upscale == pytest.approx(1.0)
         assert solver_zero_ab.scan_shape == solver_zero_ab.raw_scan_shape
 
+    @pytest.mark.parametrize("frame", ["detector", "scan"])
+    @pytest.mark.parametrize("flips", [(False, False, False), (True, False, True), (False, True, False)],
+                             ids=["000", "101", "010"])
+    def test_probe_upscale_keeps_the_aperture_function(self, synth_dataset, synth_params, device,
+                                                        frame, flips):
+        """Upscaling only widens the k grid (same dk), so on the k pixels both grids share,
+        the upscaled probe's aperture function must equal the upscale-1 probe's, in either
+        frame and with a scan rotation (the scan frame's rotation lives in the coefficients)."""
+        p = synth_params
+        flipud, fliplr, transpose = flips
+        solver = BFSolver(
+            dataset=synth_dataset,
+            max_alpha=p["max_alpha"],
+            scan_step_size=p["scan_step_size"],
+            dk=p["dk"],
+            wavelength=p["wavelength"],
+            max_order=2,
+            aberrations={"C10": 50.0, "C12a": 50.0, "C12b": -20.0, "C21a": 2000.0,
+                         "C21b": 800.0, "C23a": 3000.0, "C23b": -1500.0},
+            device=device,
+            coord_transform={"flipud": flipud, "fliplr": fliplr, "transpose": transpose,
+                             "rotation_deg": 30.0},
+        )
+        n = p["Npix"]
+
+        def kspace(probe):
+            return np.fft.fftshift(np.fft.fft2(np.fft.ifftshift(probe.detach().cpu().numpy())))
+
+        with torch.no_grad():
+            k1 = kspace(solver.get_probe(frame=frame))
+            k2 = kspace(solver.get_probe(frame=frame, upscale=2.0))
+        c = (2 * n) // 2 - n // 2  # k = 0 sits at index N // 2 on both grids
+        k2 = k2[c:c + n, c:c + n]
+        inside = (np.abs(k1) > 0.5 * np.abs(k1).max()) & (np.abs(k2) > 0.5 * np.abs(k2).max())
+        d = k2[inside] * np.conj(k1[inside])
+        phase_err = np.abs(np.angle(d * np.exp(-1j * np.angle(d.sum()))))
+        assert phase_err.max() < 1e-3, phase_err.max()
+
     def test_zero_insert_constructor_stores_method(self, synth_dataset, synth_params, device):
         p = synth_params
         solver = BFSolver(

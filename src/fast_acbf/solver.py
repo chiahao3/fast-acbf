@@ -648,8 +648,10 @@ class BFSolver:
             device=self.device,
         )
         in_scan = (self._validate_frame(frame) == 'scan')
+        # Flips only, as in get_chi_surface: the scan-frame coefficients already carry the
+        # rotation, and rotating the grid as well would cancel it.
         kX_ext, kY_ext = self._recon.coord_transform.apply_to_grids(
-            det_ext.kY_grid, det_ext.kX_grid, in_scan_frame=in_scan
+            det_ext.kY_grid, det_ext.kX_grid, in_scan_frame=False
         )
         chi_basis_ext = generate_aberration_basis(
             self.max_order, self.ab_state.order_keys, kX_ext, kY_ext, self.wavelength
